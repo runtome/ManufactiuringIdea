@@ -1,0 +1,3048 @@
+openapi: 3.1.0
+
+info:
+  title: FactoryBrain AI Platform API
+  version: 1.0.0
+  summary: On-premise manufacturing intelligence platform
+  description: |
+    REST API for the FactoryBrain AI platform.
+
+    Companion documents:
+      * [SRS-00](../SRS-FactoryBrain-AI-Platform.md) — requirements
+      * [SAD-00](../docs/SAD-FactoryBrain-Software-Architecture.md) — architecture
+      * [DDS-00](../docs/DDS-FactoryBrain-Database-Design.md) — data model
+      * [API-Specification.md](./API-Specification.md) — conventions, error catalogue
+      * [SEC-00](../docs/SEC-FactoryBrain-Security-Requirements.md) — security
+
+    ## Three rules that shape this API
+
+    1. **The LLM never computes numbers.** Agent responses carry a `sources`
+       array; every figure in `answer` traces to a tool result in that array.
+       An ungrounded answer is withheld, not returned with a caveat.
+    2. **Offline-first.** Edge and mobile clients create records with
+       client-generated UUIDv7 identifiers and push them in batches. Delivery
+       is at-least-once; the server deduplicates, making the effect
+       exactly-once.
+    3. **Human-in-the-loop for consequences.** Write-capable agent tools,
+       AI-drafted quality artifacts, and ERP postings all require an explicit
+       approval carrying a named user.
+
+    All errors use RFC 7807 `application/problem+json`.
+  contact:
+    name: Platform owner
+    email: platform@factorybrain.local
+  license:
+    name: Proprietary — internal use
+
+servers:
+  - url: https://factorybrain.local/api/v1
+    description: On-premise production (factory LAN)
+  - url: http://localhost:8000/api/v1
+    description: Local development
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: auth
+    description: Authentication and session management
+  - name: ingest
+    description: Production data ingestion (SRS-02)
+  - name: inspections
+    description: Vision inspection records and review queue (SRS-01)
+  - name: edge
+    description: Edge node sync and fleet management (SRS-03)
+  - name: mobile
+    description: Mobile inspector sync (SRS-05)
+  - name: quality
+    description: SPC, capability, cases and artifacts (SRS-09, SRS-11)
+  - name: telemetry
+    description: Machine signals, health and predictive alerts (SRS-06)
+  - name: agent
+    description: Grounded question answering and briefs (SRS-10, SRS-13)
+  - name: knowledge
+    description: Document memory, retrieval and translation (SRS-14, SRS-15)
+  - name: docflow
+    description: Business documents to ERP (SRS-08)
+  - name: reports
+    description: Report generation and export
+  - name: admin
+    description: Master data, configuration and audit
+
+paths:
+
+  # ------------------------------------------------------------------
+  # AUTH
+  # ------------------------------------------------------------------
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Exchange credentials for an access token
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: Exchange a refresh token for a new access token
+      operationId: refreshToken
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+      responses:
+        '200':
+          description: Refreshed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: Current user, role and effective line scope
+      operationId: getCurrentUser
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ------------------------------------------------------------------
+  # INGEST
+  # ------------------------------------------------------------------
+  /ingest/production:
+    post:
+      tags: [ingest]
+      summary: Upload a production data file
+      description: |
+        Accepts CSV or XLSX. Validation runs before commit; a batch whose
+        invalid-row share exceeds 5 % is **rejected in full** and nothing is
+        written (SRS §6.3). Re-uploading an identical file is idempotent —
+        the existing batch is returned rather than a duplicate created.
+      operationId: ingestProductionFile
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                source:
+                  type: string
+                  description: Logical source name selecting the column mapping
+                  default: default
+      responses:
+        '202':
+          description: Accepted for processing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestBatch'
+        '409':
+          description: Identical file already ingested; existing batch returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestBatch'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /ingest/batches/{batchId}:
+    get:
+      tags: [ingest]
+      summary: Batch status including quarantined rows
+      operationId: getIngestBatch
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+      responses:
+        '200':
+          description: Batch detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestBatchDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ------------------------------------------------------------------
+  # KPI / DASHBOARD
+  # ------------------------------------------------------------------
+  /kpi:
+    get:
+      tags: [quality]
+      summary: Aggregate KPI over a date range
+      operationId: getKpi
+      parameters:
+        - $ref: '#/components/parameters/DateFrom'
+        - $ref: '#/components/parameters/DateTo'
+        - $ref: '#/components/parameters/LineFilter'
+        - $ref: '#/components/parameters/SkuFilter'
+        - $ref: '#/components/parameters/ShiftFilter'
+      responses:
+        '200':
+          description: KPI aggregate
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KpiResponse'
+              examples:
+                lineThree:
+                  summary: Line 3, single day
+                  value:
+                    period: { from: '2026-09-09', to: '2026-09-09' }
+                    qty_produced: 6420
+                    qty_ng: 374
+                    defect_rate_pct: 5.8255
+                    baseline_7d_pct: 2.41
+                    change_pct: 141.7
+                    significant: true
+                    p_value: 0.0004
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /kpi/pareto:
+    get:
+      tags: [quality]
+      summary: Defect Pareto with cumulative share
+      operationId: getDefectPareto
+      parameters:
+        - $ref: '#/components/parameters/DateFrom'
+        - $ref: '#/components/parameters/DateTo'
+        - $ref: '#/components/parameters/LineFilter'
+        - name: top_n
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+      responses:
+        '200':
+          description: Pareto rows ordered by quantity descending
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ParetoItem'
+
+  # ------------------------------------------------------------------
+  # INSPECTIONS
+  # ------------------------------------------------------------------
+  /inspections:
+    get:
+      tags: [inspections]
+      summary: Query inspection records
+      operationId: listInspections
+      parameters:
+        - $ref: '#/components/parameters/DateFrom'
+        - $ref: '#/components/parameters/DateTo'
+        - $ref: '#/components/parameters/LineFilter'
+        - $ref: '#/components/parameters/SkuFilter'
+        - name: verdict
+          in: query
+          schema:
+            $ref: '#/components/schemas/Verdict'
+        - name: lot
+          in: query
+          schema: { type: string }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of inspections
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InspectionPage'
+    post:
+      tags: [inspections]
+      summary: Record a single inspection result
+      description: |
+        Used by server-side and manual inspection paths. Edge nodes should use
+        the batch endpoint `/edge/records:batch` instead.
+
+        The `id` is client-generated (UUIDv7). Re-posting the same `id` returns
+        `200` with the existing record rather than creating a duplicate.
+      operationId: createInspection
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InspectionCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Inspection'
+        '200':
+          description: Already existed (idempotent replay)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Inspection'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /inspections/{inspectionId}:
+    get:
+      tags: [inspections]
+      summary: Single inspection with detections, measurements and evidence
+      operationId: getInspection
+      parameters:
+        - $ref: '#/components/parameters/InspectionId'
+      responses:
+        '200':
+          description: Inspection detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InspectionDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /inspections/{inspectionId}/verdict:
+    patch:
+      tags: [inspections]
+      summary: Human override of a verdict
+      description: |
+        Requires role `inspector` or above. The override is recorded with user
+        and timestamp and never overwrites the model's original verdict
+        (SRS FR-V-03).
+      operationId: overrideVerdict
+      parameters:
+        - $ref: '#/components/parameters/InspectionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [verdict]
+              properties:
+                verdict:
+                  $ref: '#/components/schemas/Verdict'
+                reason_code:
+                  type: string
+                note:
+                  type: string
+      responses:
+        '200':
+          description: Override recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Inspection'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: New verdict identical to current verdict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /reviews:
+    get:
+      tags: [inspections]
+      summary: Pending review queue
+      description: Inspections with verdict `REVIEW` that have no override yet.
+      operationId: getReviewQueue
+      parameters:
+        - $ref: '#/components/parameters/LineFilter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Review queue page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InspectionPage'
+
+  # ------------------------------------------------------------------
+  # EDGE
+  # ------------------------------------------------------------------
+  /edge/records:batch:
+    post:
+      tags: [edge]
+      summary: Push a batch of inspection records from an edge node
+      description: |
+        At-least-once delivery. Records already present (by `id`) are reported
+        as `duplicate` and are **not** an error — the node may safely retry an
+        entire batch after a network failure.
+
+        Returns `207 Multi-Status` with a per-record outcome so a partial
+        failure does not force the node to re-send the whole batch.
+      operationId: pushEdgeRecords
+      security:
+        - edgeApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [node_code, records]
+              properties:
+                node_code:
+                  type: string
+                records:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    $ref: '#/components/schemas/InspectionCreate'
+      responses:
+        '207':
+          description: Per-record outcomes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResult'
+              examples:
+                mixed:
+                  summary: Some accepted, one duplicate, one rejected
+                  value:
+                    accepted: 198
+                    duplicate: 1
+                    rejected: 1
+                    items:
+                      - id: 0192f0a1-0000-7000-8000-000000000001
+                        status: accepted
+                      - id: 0192f0a1-0000-7000-8000-000000000002
+                        status: duplicate
+                      - id: 0192f0a1-0000-7000-8000-000000000003
+                        status: rejected
+                        code: VALIDATION_FAILED
+                        detail: unknown sku code RAD-999-Z
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          description: Batch too large
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /edge/images:
+    post:
+      tags: [edge]
+      summary: Upload evidence image for an already-synced record
+      description: |
+        Images sync at lower priority than records so that a bandwidth
+        constraint delays evidence, never the data.
+      operationId: uploadEdgeImage
+      security:
+        - edgeApiKey: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [inspection_id, kind, file]
+              properties:
+                inspection_id:
+                  type: string
+                  format: uuid
+                kind:
+                  type: string
+                  enum: [original, overlay]
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '201':
+          description: Stored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  uri: { type: string }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /edge/config:
+    get:
+      tags: [edge]
+      summary: Pull recipes, thresholds and model manifest for this node
+      operationId: getEdgeConfig
+      security:
+        - edgeApiKey: []
+      parameters:
+        - name: node_code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: If-None-Match
+          in: header
+          schema: { type: string }
+          description: Current config ETag held by the node
+      responses:
+        '200':
+          description: Configuration bundle
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EdgeConfig'
+        '304':
+          description: Unchanged
+
+  /edge/heartbeat:
+    post:
+      tags: [edge]
+      summary: Report node health
+      operationId: edgeHeartbeat
+      security:
+        - edgeApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeHealth'
+      responses:
+        '204':
+          description: Recorded
+
+  /edge/nodes:
+    get:
+      tags: [edge]
+      summary: Fleet status
+      operationId: listEdgeNodes
+      responses:
+        '200':
+          description: Nodes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EdgeNode'
+
+  # ------------------------------------------------------------------
+  # MOBILE
+  # ------------------------------------------------------------------
+  /mobile/bootstrap:
+    get:
+      tags: [mobile]
+      summary: Checklists, SKUs, defect codes and model manifest
+      operationId: mobileBootstrap
+      parameters:
+        - name: If-None-Match
+          in: header
+          schema: { type: string }
+      responses:
+        '200':
+          description: Bootstrap bundle
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MobileBootstrap'
+        '304':
+          description: Unchanged
+
+  /mobile/sessions:batch:
+    post:
+      tags: [mobile]
+      summary: Upload offline inspection sessions
+      description: |
+        Conflict rule: the server wins for master data, the **device wins for
+        inspection records**. The server never silently changes a verdict the
+        inspector recorded.
+      operationId: pushMobileSessions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sessions]
+              properties:
+                sessions:
+                  type: array
+                  maxItems: 200
+                  items:
+                    $ref: '#/components/schemas/MobileSession'
+      responses:
+        '207':
+          description: Per-session outcomes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResult'
+
+  # ------------------------------------------------------------------
+  # QUALITY — SPC
+  # ------------------------------------------------------------------
+  /spc/chart:
+    get:
+      tags: [quality]
+      summary: Control chart data with rule violations
+      operationId: getSpcChart
+      parameters:
+        - name: characteristic
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/LineFilter'
+        - $ref: '#/components/parameters/DateFrom'
+        - $ref: '#/components/parameters/DateTo'
+      responses:
+        '200':
+          description: Chart data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpcChart'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /spc/capability:
+    get:
+      tags: [quality]
+      summary: Process capability (Cp, Cpk, Pp, Ppk)
+      description: |
+        The response always carries `n`, the evaluated period and a normality
+        assessment. When `normality_ok` is `false` the indices are returned but
+        `interpretation_warning` is populated — a Cpk computed on non-normal
+        data must not be presented as valid (SRS-09 C-03).
+      operationId: getCapability
+      parameters:
+        - name: characteristic
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/LineFilter'
+        - $ref: '#/components/parameters/DateFrom'
+        - $ref: '#/components/parameters/DateTo'
+      responses:
+        '200':
+          description: Capability result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilityResult'
+              examples:
+                nonNormal:
+                  summary: Non-normal data — indices returned with a warning
+                  value:
+                    characteristic: fin_pitch
+                    period: { from: '2026-08-12', to: '2026-09-10' }
+                    n: 1250
+                    cp: 1.41
+                    cpk: 1.12
+                    pp: 1.33
+                    ppk: 1.05
+                    normality_p: 0.002
+                    normality_ok: false
+                    interpretation_warning: >-
+                      Anderson-Darling p = 0.002 rejects normality. Cp/Cpk assume a
+                      normal distribution and must not be quoted for this dataset.
+                      Consider a transformation or a non-normal capability method.
+
+  /signals:
+    get:
+      tags: [quality]
+      summary: Open quality signals ranked by severity
+      operationId: listSignals
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [open, triaged, case_opened, dismissed, expired]
+            default: open
+        - $ref: '#/components/parameters/LineFilter'
+      responses:
+        '200':
+          description: Signals
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Signal'
+
+  # ------------------------------------------------------------------
+  # QUALITY — CASES
+  # ------------------------------------------------------------------
+  /cases:
+    get:
+      tags: [quality]
+      summary: List quality cases
+      operationId: listCases
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/CaseStatus'
+        - $ref: '#/components/parameters/LineFilter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Cases
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Case'
+                  next_cursor:
+                    type: [string, 'null']
+    post:
+      tags: [quality]
+      summary: Open a quality case
+      operationId: createCase
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string }
+                signal_id: { type: string, format: uuid }
+                line_id: { type: string, format: uuid }
+                sku_id: { type: string, format: uuid }
+                severity:
+                  $ref: '#/components/schemas/Severity'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Case'
+
+  /cases/{caseId}:
+    get:
+      tags: [quality]
+      summary: Case detail with steps, hypotheses, artifacts and actions
+      operationId: getCase
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      responses:
+        '200':
+          description: Case detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /cases/{caseId}/analyze:
+    post:
+      tags: [quality]
+      summary: Run correlation analysis and generate ranked hypotheses
+      description: |
+        Tests association between the defect and material lot, machine, mould,
+        shift, operator group and recent parameter changes. Returns effect
+        sizes alongside p-values and flags multiple-comparison risk.
+
+        Hypotheses are explicitly **unverified** — each carries a proposed
+        verification step rather than a claimed cause.
+      operationId: analyzeCase
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      responses:
+        '200':
+          description: Ranked hypotheses
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hypotheses:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Hypothesis'
+                  no_association_found:
+                    type: array
+                    items: { type: string }
+                    description: Factors tested that showed no meaningful association
+                  multiple_comparison_note:
+                    type: string
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /cases/{caseId}/artifacts/{kind}:
+    post:
+      tags: [quality]
+      summary: Draft a quality artifact (5-Why, 8D, FMEA, report)
+      description: |
+        The result is always created as a **draft**: `ai_generated = true`,
+        `approved_by = null`. A draft cannot be exported without a watermark
+        and cannot be cited as precedent until approved (SRS FR-A-04).
+      operationId: draftArtifact
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - name: kind
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/ArtifactKind'
+        - name: lang
+          in: query
+          schema:
+            $ref: '#/components/schemas/Language'
+      responses:
+        '201':
+          description: Draft created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '503':
+          $ref: '#/components/responses/ModelUnavailable'
+
+  /artifacts/{artifactId}/approve:
+    post:
+      tags: [quality]
+      summary: Approve an AI-drafted artifact
+      description: |
+        Requires role `engineer` or above. Approval is recorded with the
+        approver and timestamp, is immutable, and is what allows the artifact
+        to be exported clean and indexed as precedent.
+      operationId: approveArtifact
+      parameters:
+        - name: artifactId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string }
+      responses:
+        '200':
+          description: Approved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Already approved
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  # ------------------------------------------------------------------
+  # TELEMETRY
+  # ------------------------------------------------------------------
+  /telemetry/samples:
+    post:
+      tags: [telemetry]
+      summary: Push telemetry samples
+      description: Alternative to MQTT/OPC-UA for gateways that prefer HTTP.
+      operationId: pushTelemetry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [samples]
+              properties:
+                samples:
+                  type: array
+                  maxItems: 5000
+                  items:
+                    $ref: '#/components/schemas/TelemetrySample'
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: { type: integer }
+                  rejected: { type: integer }
+
+  /machines/{machineId}/health:
+    get:
+      tags: [telemetry]
+      summary: Machine health index with component breakdown
+      operationId: getMachineHealth
+      parameters:
+        - name: machineId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Health
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MachineHealth'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /telemetry/series:
+    get:
+      tags: [telemetry]
+      summary: Signal series with baseline band
+      operationId: getTelemetrySeries
+      parameters:
+        - name: machine_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: signal
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/DateFrom'
+        - $ref: '#/components/parameters/DateTo'
+      responses:
+        '200':
+          description: Series
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TelemetrySeries'
+
+  /alerts:
+    get:
+      tags: [telemetry]
+      summary: Predictive maintenance alerts
+      operationId: listAlerts
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [open, acknowledged, snoozed, resolved, dismissed]
+      responses:
+        '200':
+          description: Alerts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MaintenanceAlert'
+
+  /alerts/{alertId}/feedback:
+    post:
+      tags: [telemetry]
+      summary: Record the technician outcome for an alert
+      description: |
+        Required to compute alert precision. An alert programme without outcome
+        feedback cannot be tuned and will eventually be ignored.
+      operationId: recordAlertFeedback
+      parameters:
+        - name: alertId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outcome]
+              properties:
+                outcome:
+                  type: string
+                  enum: [true_positive, false_positive, unknown]
+                actual_finding: { type: string }
+      responses:
+        '204':
+          description: Recorded
+
+  # ------------------------------------------------------------------
+  # AGENT
+  # ------------------------------------------------------------------
+  /agent/ask:
+    post:
+      tags: [agent]
+      summary: Ask a grounded question
+      description: |
+        Runs the tool-calling loop and returns a natural-language answer with
+        its sources.
+
+        **Grounding contract.** Every number in `answer` appears in a tool
+        result listed in `sources`. If the post-check finds an unmatched
+        number, the answer is withheld and `outcome` is `grounding_failed`
+        (HTTP 422) — the caller never receives an ungrounded answer with a
+        warning attached.
+
+        Budgets (max tool calls, wall time) are enforced by the executor. When
+        a budget is hit, `outcome` is `partial` and `partial_reason` explains
+        what was not covered.
+      operationId: askAgent
+      parameters:
+        - name: stream
+          in: query
+          description: Stream the response as Server-Sent Events
+          schema: { type: boolean, default: false }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AskRequest'
+      responses:
+        '200':
+          description: Grounded answer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AskResponse'
+              examples:
+                grounded:
+                  summary: Answer with sources
+                  value:
+                    run_id: 0192f0a1-0000-7000-8000-000000000f01
+                    outcome: ok
+                    lang: en
+                    answer: >-
+                      Line 3 defect rate was 5.80 % on 2026-09-09 against a 7-day
+                      baseline of 2.41 % (p = 0.0004, n = 2140). Missing Component
+                      accounts for 63 % of defects. The change point is
+                      2026-09-08 14:20, coincident with material lot LOT-2609-114
+                      entering production at 14:12. This is a correlation; the root
+                      cause is not verified.
+                    sources:
+                      - kind: tool
+                        tool: query_defects
+                        args: { date_from: '2026-09-09', date_to: '2026-09-09' }
+                        row_count: 5
+                      - kind: tool
+                        tool: query_production
+                        args: { date_from: '2026-09-02', date_to: '2026-09-09', line: L3 }
+                        row_count: 16
+                    grounding:
+                      numbers_found: ['5.80', '2.41', '0.0004', '2140', '63']
+                      all_matched: true
+                insufficientData:
+                  summary: Refusal rather than speculation
+                  value:
+                    run_id: 0192f0a1-0000-7000-8000-000000000f02
+                    outcome: refused
+                    lang: en
+                    answer: >-
+                      I do not have shift C data for 2026-09-09 — it has not been
+                      uploaded yet. I cannot compare shifts for that date. The
+                      shift A and B figures are available if that helps.
+                    sources: []
+          headers:
+            X-Correlation-Id:
+              schema: { type: string }
+        '422':
+          description: |
+            Grounding post-check failed. The answer was withheld.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://factorybrain.local/problems/grounding-failed
+                title: Answer withheld by grounding check
+                status: 422
+                code: GROUNDING_FAILED
+                detail: >-
+                  The generated answer contained the value "4.7" which does not
+                  appear in any tool result for this turn. The answer was not
+                  returned. This has been logged as run 0192f0a1-...
+        '503':
+          $ref: '#/components/responses/ModelUnavailable'
+
+  /agent/brief:
+    post:
+      tags: [agent]
+      summary: Generate the daily or shift brief
+      operationId: generateBrief
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                date: { type: string, format: date }
+                shift:
+                  $ref: '#/components/schemas/Shift'
+                line_id: { type: string, format: uuid }
+                lang:
+                  $ref: '#/components/schemas/Language'
+      responses:
+        '200':
+          description: Brief
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Brief'
+
+  /agent/proposals:
+    get:
+      tags: [agent]
+      summary: Pending write-tool proposals awaiting approval
+      operationId: listProposals
+      responses:
+        '200':
+          description: Proposals
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ActionProposal'
+
+  /agent/proposals/{proposalId}/approve:
+    post:
+      tags: [agent]
+      summary: Approve a proposed write action
+      description: |
+        Approval binds to the exact `args_hash` shown in the proposal and
+        expires. A proposal whose arguments changed, or which has expired,
+        cannot be approved — it must be re-proposed.
+      operationId: approveProposal
+      parameters:
+        - name: proposalId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [args_hash]
+              properties:
+                args_hash:
+                  type: string
+                  description: Must match the hash shown in the proposal
+      responses:
+        '200':
+          description: Approved and executed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionProposal'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Expired, already decided, or argument hash mismatch
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /agent/proposals/{proposalId}/deny:
+    post:
+      tags: [agent]
+      summary: Deny a proposed write action
+      operationId: denyProposal
+      parameters:
+        - name: proposalId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses:
+        '200':
+          description: Denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionProposal'
+
+  /agent/findings:
+    get:
+      tags: [agent]
+      summary: Cross-domain findings blackboard
+      operationId: listFindings
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [new, acknowledged, in_progress, resolved, expired, dismissed]
+        - name: severity
+          in: query
+          schema:
+            $ref: '#/components/schemas/Severity'
+        - name: domain
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Findings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Finding'
+
+  /agent/briefing:
+    get:
+      tags: [agent]
+      summary: Multi-agent shift briefing with ranked risks
+      description: |
+        `partial: true` means at least one specialist agent failed or timed
+        out; `partial_reason` names the domain. A briefing that silently omits
+        a failed domain would be worse than none.
+      operationId: getBriefing
+      parameters:
+        - name: date
+          in: query
+          schema: { type: string, format: date }
+        - name: shift
+          in: query
+          schema:
+            $ref: '#/components/schemas/Shift'
+        - name: lang
+          in: query
+          schema:
+            $ref: '#/components/schemas/Language'
+      responses:
+        '200':
+          description: Briefing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Briefing'
+
+  /agent/runs/{runId}:
+    get:
+      tags: [agent]
+      summary: Full trace of an agent run
+      description: Tool calls, arguments, timings, facts object and grounding result.
+      operationId: getAgentRun
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Run trace
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRunTrace'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /agent/feedback:
+    post:
+      tags: [agent]
+      summary: Rate an agent answer
+      operationId: submitAgentFeedback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [run_id, rating]
+              properties:
+                run_id: { type: string, format: uuid }
+                rating:
+                  type: integer
+                  enum: [-1, 1]
+                reason: { type: string }
+      responses:
+        '204':
+          description: Recorded
+
+  /agent/tools:
+    get:
+      tags: [agent]
+      summary: Tools available to the calling user
+      description: |
+        Filtered by the caller's role. This endpoint is the transparent view of
+        the agent's capability boundary — there is no hidden tool.
+      operationId: listTools
+      responses:
+        '200':
+          description: Tools
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Tool'
+
+  # ------------------------------------------------------------------
+  # KNOWLEDGE
+  # ------------------------------------------------------------------
+  /knowledge/search:
+    post:
+      tags: [knowledge]
+      summary: Hybrid search over documents and past cases
+      description: |
+        Combines lexical (trigram) and vector retrieval with reranking, and
+        supports cross-language retrieval — a Thai query can surface a Japanese
+        8D report.
+
+        Results are filtered by the caller's document ACL at query time, not
+        after retrieval.
+      operationId: searchKnowledge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string }
+                top_k: { type: integer, default: 5, maximum: 50 }
+                filters:
+                  type: object
+                  properties:
+                    machine: { type: string }
+                    line: { type: string }
+                    sku: { type: string }
+                    verified_only:
+                      type: boolean
+                      default: true
+                      description: >-
+                        When true (default) only human-verified case records are
+                        returned. Unverified LLM extractions are never presented
+                        as established fact.
+      responses:
+        '200':
+          description: Ranked results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/KnowledgeHit'
+
+  /knowledge/documents:
+    post:
+      tags: [knowledge]
+      summary: Ingest a document into the knowledge base
+      operationId: ingestDocument
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                kind: { type: string }
+      responses:
+        '202':
+          description: Accepted for processing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document_id: { type: string, format: uuid }
+
+  /knowledge/translate:
+    post:
+      tags: [knowledge]
+      summary: Translate manufacturing text with structured interpretation
+      description: |
+        Returns the translation and, separately, an **inferred** interpretation
+        (process, message type, entities, items to check). The two are never
+        merged: users must be able to tell what was said from what the system
+        inferred.
+      operationId: translate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text, target_lang]
+              properties:
+                text: { type: string }
+                source_lang:
+                  $ref: '#/components/schemas/Language'
+                target_lang:
+                  $ref: '#/components/schemas/Language'
+                register:
+                  type: string
+                  enum: [report, shopfloor, customer]
+                  default: report
+      responses:
+        '200':
+          description: Translation with interpretation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TranslationResult'
+
+  # ------------------------------------------------------------------
+  # DOCFLOW
+  # ------------------------------------------------------------------
+  /docflow/documents:
+    get:
+      tags: [docflow]
+      summary: Document queue
+      operationId: listDocflowDocuments
+      parameters:
+        - name: state
+          in: query
+          schema:
+            $ref: '#/components/schemas/DocState'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Documents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DocflowDocument'
+    post:
+      tags: [docflow]
+      summary: Upload a business document
+      operationId: uploadDocflowDocument
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocflowDocument'
+        '409':
+          description: Duplicate document (same content hash)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocflowDocument'
+
+  /docflow/documents/{documentId}:
+    get:
+      tags: [docflow]
+      summary: Document with extraction, provenance and validation results
+      operationId: getDocflowDocument
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      responses:
+        '200':
+          description: Detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocflowDocumentDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /docflow/documents/{documentId}/approve:
+    post:
+      tags: [docflow]
+      summary: Approve a document for posting
+      description: |
+        Role required depends on the document amount (configurable thresholds).
+        Segregation of duties applies: above the configured amount the approver
+        may not be the user who edited the extracted fields.
+      operationId: approveDocflowDocument
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      responses:
+        '200':
+          description: Approved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocflowDocument'
+        '403':
+          description: Insufficient role, or segregation-of-duties violation
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /docflow/documents/{documentId}/post:
+    post:
+      tags: [docflow]
+      summary: Post an approved document to the ERP
+      description: |
+        Idempotent by `(adapter, idem_key)`. Retrying a failed posting can
+        never create a second ERP transaction — this is enforced by a unique
+        constraint in the database, not only by application logic.
+      operationId: postDocflowDocument
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Posted (or already posted — same ERP reference returned)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Posting'
+        '409':
+          description: Not approved, or approval expired
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '502':
+          description: ERP rejected or was unreachable; safe to retry
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  # ------------------------------------------------------------------
+  # REPORTS
+  # ------------------------------------------------------------------
+  /reports/{type}:
+    post:
+      tags: [reports]
+      summary: Generate a report
+      description: |
+        Unapproved AI-drafted content is always watermarked `DRAFT — AI
+        generated` in the output. There is no parameter to disable this.
+      operationId: generateReport
+      parameters:
+        - name: type
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [daily, shift, case, spc, fleet]
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [pdf, pptx]
+            default: pdf
+        - name: lang
+          in: query
+          schema:
+            $ref: '#/components/schemas/Language'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                date: { type: string, format: date }
+                line_id: { type: string, format: uuid }
+                case_id: { type: string, format: uuid }
+      responses:
+        '202':
+          description: Generation started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+
+  /jobs/{jobId}:
+    get:
+      tags: [reports]
+      summary: Async job status and result
+      operationId: getJob
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ------------------------------------------------------------------
+  # ADMIN
+  # ------------------------------------------------------------------
+  /admin/models:
+    get:
+      tags: [admin]
+      summary: Model registry
+      operationId: listModels
+      responses:
+        '200':
+          description: Models
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Model'
+
+  /admin/models/{modelId}:
+    get:
+      tags: [admin]
+      summary: Model detail including the shadow-run report
+      operationId: getModel
+      parameters:
+        - name: modelId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Model detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/models/{modelId}/shadow:
+    post:
+      tags: [admin]
+      summary: Start a shadow run for a candidate model
+      description: |
+        Runs the candidate alongside the active model on live frames without
+        affecting any verdict. Accumulates a disagreement report that the
+        promotion decision is based on — promotion is refused until a shadow
+        run has completed (SEC-182).
+      operationId: startShadowRun
+      parameters:
+        - name: modelId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                min_frames:
+                  type: integer
+                  default: 200
+                  minimum: 200
+                  description: Minimum live frames before the report is considered valid
+      responses:
+        '202':
+          description: Shadow run started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '409':
+          description: Model is not a candidate, or a shadow run is already active
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /admin/models/{modelId}/promote:
+    post:
+      tags: [admin]
+      summary: Promote a shadow model to active
+      description: |
+        Requires a completed shadow run. The response includes the
+        disagreement report against the currently active model; promotion is a
+        human decision informed by it, never automatic.
+      operationId: promoteModel
+      parameters:
+        - name: modelId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Promoted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '409':
+          description: No shadow run completed, or metrics below the gate
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /admin/config:
+    get:
+      tags: [admin]
+      summary: Runtime configuration
+      operationId: getConfig
+      responses:
+        '200':
+          description: Configuration
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    patch:
+      tags: [admin]
+      summary: Update runtime configuration
+      operationId: updateConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/audit:
+    get:
+      tags: [admin]
+      summary: Query the audit log
+      operationId: queryAudit
+      parameters:
+        - $ref: '#/components/parameters/DateFrom'
+        - $ref: '#/components/parameters/DateTo'
+        - name: entity
+          in: query
+          schema: { type: string }
+        - name: user_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: correlation_id
+          in: query
+          schema: { type: string }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Audit entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AuditEntry'
+                  next_cursor:
+                    type: [string, 'null']
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /healthz:
+    get:
+      tags: [admin]
+      summary: Liveness probe
+      operationId: healthz
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+
+  /readyz:
+    get:
+      tags: [admin]
+      summary: Readiness probe with dependency status
+      description: |
+        Reports each dependency separately. The LLM being unavailable makes the
+        service **degraded, not unready** — dashboards, SPC and the review
+        queue continue to work without it.
+      operationId: readyz
+      security: []
+      responses:
+        '200':
+          description: Ready (possibly degraded)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+        '503':
+          description: Not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Short-lived access token (default 15 min) from `/auth/login`.
+        Refresh via `/auth/refresh`.
+    edgeApiKey:
+      type: apiKey
+      in: header
+      name: X-Edge-Key
+      description: |
+        Per-node key for edge sync endpoints. mTLS client certificates are the
+        preferred alternative where the network supports them; the key exists
+        for devices that cannot manage certificates. An edge credential grants
+        insert-only access to inspection data for its own node and nothing else.
+
+  parameters:
+    DateFrom:
+      name: from
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive start date (plant timezone)
+    DateTo:
+      name: to
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive end date (plant timezone)
+    LineFilter:
+      name: line
+      in: query
+      schema: { type: string }
+      description: Line code. Restricted users only see lines in their scope.
+    SkuFilter:
+      name: sku
+      in: query
+      schema: { type: string }
+    ShiftFilter:
+      name: shift
+      in: query
+      schema:
+        $ref: '#/components/schemas/Shift'
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Opaque cursor from the previous page's `next_cursor`
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      schema: { type: string }
+      description: |
+        Client-generated key. Replaying a request with the same key returns the
+        original result instead of performing the operation twice.
+    InspectionId:
+      name: inspectionId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    CaseId:
+      name: caseId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    BatchId:
+      name: batchId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    DocumentId:
+      name: documentId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: |
+        Authenticated but not permitted. For line-scoped resources the rows are
+        never retrieved in the first place — this is not response filtering.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Resource does not exist
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ValidationFailed:
+      description: Request was well-formed but semantically invalid
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ModelUnavailable:
+      description: |
+        The language model is unavailable. Deterministic features (charts,
+        statistics, queues) remain available.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+
+    Problem:
+      type: object
+      description: RFC 7807 problem details with a stable machine-readable `code`.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          description: Stable error code — see API-Specification.md §7
+        correlation_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+
+    Language:
+      type: string
+      enum: [th, ja, en]
+      default: th
+
+    Shift:
+      type: string
+      enum: [A, B, C, OT]
+
+    Severity:
+      type: string
+      enum: [INFO, LOW, MEDIUM, HIGH, CRITICAL]
+
+    Verdict:
+      type: string
+      enum: [PASS, FAIL, REVIEW, NO_READ]
+      description: |
+        `NO_READ` means the frame failed the quality gate and nothing was
+        judged. It is deliberately distinct from `PASS`.
+
+    CaseStatus:
+      type: string
+      enum: [open, containment, analysis, action, verification, closed, cancelled]
+
+    ArtifactKind:
+      type: string
+      enum: [five_why, eight_d, fmea, report, ocap]
+
+    DocState:
+      type: string
+      enum: [received, classified, extracted, validated, review_required,
+             approved, rejected, posting, posted, posting_failed]
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string, format: password }
+        mfa_code: { type: string }
+
+    TokenPair:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string, enum: [Bearer] }
+        expires_in: { type: integer, description: Seconds until access token expiry }
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+        display_name: { type: string }
+        role:
+          type: string
+          enum: [viewer, inspector, engineer, manager, admin]
+        lang:
+          $ref: '#/components/schemas/Language'
+        line_scope:
+          type: array
+          items: { type: string }
+          description: Empty array means all lines
+
+    IngestBatch:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        source: { type: string }
+        filename: { type: string }
+        sha256: { type: string }
+        status:
+          type: string
+          enum: [running, succeeded, failed, rejected]
+        rows_total: { type: integer }
+        rows_ok: { type: integer }
+        rows_quarantined: { type: integer }
+        reject_reason:
+          type: [string, 'null']
+          description: Populated when status is `rejected` (>5 % invalid rows)
+        started_at: { type: string, format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+
+    IngestBatchDetail:
+      allOf:
+        - $ref: '#/components/schemas/IngestBatch'
+        - type: object
+          properties:
+            quarantined:
+              type: array
+              items:
+                type: object
+                properties:
+                  row_no: { type: integer }
+                  reason:
+                    type: string
+                    description: Human-readable, fixable without reading code
+                  raw: { type: object, additionalProperties: true }
+
+    KpiResponse:
+      type: object
+      properties:
+        period:
+          type: object
+          properties:
+            from: { type: string, format: date }
+            to: { type: string, format: date }
+        qty_produced: { type: integer }
+        qty_ng: { type: integer }
+        defect_rate_pct:
+          type: [number, 'null']
+          description: Null when nothing was produced — never zero, which would falsely claim perfect quality
+        baseline_7d_pct: { type: [number, 'null'] }
+        baseline_30d_pct: { type: [number, 'null'] }
+        change_pct: { type: [number, 'null'] }
+        significant:
+          type: boolean
+          description: Result of a two-proportion z-test at alpha = 0.05
+        p_value: { type: [number, 'null'] }
+        by_line:
+          type: array
+          items:
+            type: object
+            properties:
+              line: { type: string }
+              qty_produced: { type: integer }
+              qty_ng: { type: integer }
+              defect_rate_pct: { type: [number, 'null'] }
+
+    ParetoItem:
+      type: object
+      properties:
+        defect_code: { type: string }
+        name: { type: string }
+        qty: { type: integer }
+        share_pct: { type: number }
+        cumulative_pct: { type: number }
+
+    InspectionCreate:
+      type: object
+      required: [id, ts, line, verdict]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Client-generated UUIDv7. This is the deduplication key.
+        ts: { type: string, format: date-time }
+        line: { type: string }
+        sku: { type: string }
+        station: { type: string }
+        lot: { type: string }
+        verdict:
+          $ref: '#/components/schemas/Verdict'
+        model_version: { type: string }
+        recipe_version: { type: integer }
+        latency_ms: { type: integer }
+        ocr_text: { type: string }
+        detections:
+          type: array
+          items:
+            $ref: '#/components/schemas/DetectionInput'
+        measurements:
+          type: array
+          items:
+            $ref: '#/components/schemas/MeasurementInput'
+
+    DetectionInput:
+      type: object
+      required: [class_name, confidence]
+      properties:
+        class_name: { type: string }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        bbox: { type: object, additionalProperties: true }
+        area_mm2: { type: number }
+
+    MeasurementInput:
+      type: object
+      required: [parameter, value]
+      properties:
+        parameter: { type: string }
+        value: { type: number }
+        unit: { type: string, default: mm }
+        usl: { type: number }
+        lsl: { type: number }
+
+    Inspection:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        line: { type: string }
+        sku: { type: [string, 'null'] }
+        station: { type: [string, 'null'] }
+        lot: { type: [string, 'null'] }
+        verdict:
+          $ref: '#/components/schemas/Verdict'
+        original_verdict:
+          $ref: '#/components/schemas/Verdict'
+        overridden:
+          type: boolean
+          description: True when a human changed the model's verdict
+        model_version: { type: [string, 'null'] }
+        latency_ms: { type: [integer, 'null'] }
+        image_url:
+          type: [string, 'null']
+          description: Signed URL, short-lived
+        overlay_url: { type: [string, 'null'] }
+
+    InspectionDetail:
+      allOf:
+        - $ref: '#/components/schemas/Inspection'
+        - type: object
+          properties:
+            detections:
+              type: array
+              items:
+                type: object
+                properties:
+                  class_name: { type: string }
+                  confidence: { type: number }
+                  bbox: { type: object, additionalProperties: true }
+            measurements:
+              type: array
+              items:
+                type: object
+                properties:
+                  parameter: { type: string }
+                  value: { type: number }
+                  unit: { type: string }
+                  usl: { type: [number, 'null'] }
+                  lsl: { type: [number, 'null'] }
+                  in_spec: { type: boolean }
+            override_history:
+              type: array
+              items:
+                type: object
+                properties:
+                  from: { $ref: '#/components/schemas/Verdict' }
+                  to: { $ref: '#/components/schemas/Verdict' }
+                  user: { type: string }
+                  reason_code: { type: [string, 'null'] }
+                  at: { type: string, format: date-time }
+
+    InspectionPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Inspection'
+        next_cursor: { type: [string, 'null'] }
+        total_estimate:
+          type: [integer, 'null']
+          description: Approximate; exact counts on partitioned tables are expensive
+
+    BatchResult:
+      type: object
+      properties:
+        accepted: { type: integer }
+        duplicate:
+          type: integer
+          description: Already present — not an error, the client may retry freely
+        rejected: { type: integer }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              status:
+                type: string
+                enum: [accepted, duplicate, rejected]
+              code: { type: string }
+              detail: { type: string }
+
+    EdgeConfig:
+      type: object
+      properties:
+        etag: { type: string }
+        recipes:
+          type: array
+          items:
+            type: object
+            properties:
+              sku: { type: string }
+              version: { type: integer }
+              rules: { type: object, additionalProperties: true }
+              review_threshold: { type: number }
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelManifest'
+        thresholds:
+          type: object
+          additionalProperties: true
+
+    ModelManifest:
+      type: object
+      properties:
+        name: { type: string }
+        version: { type: string }
+        sha256:
+          type: string
+          description: Verified before load. A mismatch aborts and alarms.
+        url: { type: string }
+        input_size: { type: integer }
+        class_map: { type: object, additionalProperties: true }
+        expected_metrics: { type: object, additionalProperties: true }
+
+    NodeHealth:
+      type: object
+      required: [node_code]
+      properties:
+        node_code: { type: string }
+        app_version: { type: string }
+        model_versions: { type: object, additionalProperties: true }
+        cpu_pct: { type: number }
+        gpu_pct: { type: number }
+        mem_pct: { type: number }
+        disk_pct: { type: number }
+        temp_c: { type: number }
+        fps: { type: number }
+        buffer_depth:
+          type: integer
+          description: Unsynced records. Rising depth is the earliest failure signal.
+
+    EdgeNode:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        node_code: { type: string }
+        line: { type: [string, 'null'] }
+        state:
+          type: string
+          enum: [provisioning, online, degraded, offline, retired]
+        app_version: { type: [string, 'null'] }
+        model_versions: { type: object, additionalProperties: true }
+        buffer_depth: { type: integer }
+        last_heartbeat: { type: [string, 'null'], format: date-time }
+        heartbeat_stale: { type: boolean }
+
+    MobileBootstrap:
+      type: object
+      properties:
+        etag: { type: string }
+        checklists:
+          type: array
+          items: { type: object, additionalProperties: true }
+        skus:
+          type: array
+          items: { type: object, additionalProperties: true }
+        defect_codes:
+          type: array
+          items: { type: object, additionalProperties: true }
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelManifest'
+
+    MobileSession:
+      type: object
+      required: [id, checklist_id, started_at, verdict]
+      properties:
+        id: { type: string, format: uuid }
+        checklist_id: { type: string }
+        sku: { type: string }
+        lot: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        verdict:
+          $ref: '#/components/schemas/Verdict'
+        steps:
+          type: array
+          items: { type: object, additionalProperties: true }
+
+    SpcChart:
+      type: object
+      properties:
+        characteristic: { type: string }
+        chart_type:
+          type: string
+          enum: [xbar_r, x_mr, p, np, c, u]
+        limits:
+          type: object
+          properties:
+            ucl: { type: number }
+            cl: { type: number }
+            lcl: { type: number }
+            baseline_from: { type: string, format: date-time }
+            baseline_to: { type: string, format: date-time }
+            sample_size: { type: integer }
+            reason:
+              type: string
+              description: Why these limits were set — limits are never recalculated silently
+        points:
+          type: array
+          items:
+            type: object
+            properties:
+              ts: { type: string, format: date-time }
+              value: { type: number }
+              subgroup_n: { type: integer }
+        violations:
+          type: array
+          items:
+            type: object
+            properties:
+              rule:
+                type: integer
+                minimum: 1
+                maximum: 8
+                description: Nelson rule number
+              ts: { type: string, format: date-time }
+              points: { type: array, items: { type: integer } }
+
+    CapabilityResult:
+      type: object
+      properties:
+        characteristic: { type: string }
+        period:
+          type: object
+          properties:
+            from: { type: string, format: date }
+            to: { type: string, format: date }
+        n:
+          type: integer
+          description: Sample size — always returned, so an index is never quoted without context
+        cp: { type: [number, 'null'] }
+        cpk: { type: [number, 'null'] }
+        pp: { type: [number, 'null'] }
+        ppk: { type: [number, 'null'] }
+        normality_p: { type: [number, 'null'] }
+        normality_ok: { type: boolean }
+        interpretation_warning:
+          type: [string, 'null']
+          description: Populated when normality_ok is false
+
+    Signal:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string }
+        line: { type: [string, 'null'] }
+        sku: { type: [string, 'null'] }
+        severity:
+          $ref: '#/components/schemas/Severity'
+        statistic:
+          type: object
+          additionalProperties: true
+          description: p-value, effect size, baseline, n — the agent may only quote values present here
+        status: { type: string }
+        opened_at: { type: string, format: date-time }
+
+    Case:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        status:
+          $ref: '#/components/schemas/CaseStatus'
+        severity:
+          $ref: '#/components/schemas/Severity'
+        line: { type: [string, 'null'] }
+        sku: { type: [string, 'null'] }
+        owner: { type: [string, 'null'] }
+        opened_at: { type: string, format: date-time }
+        closed_at: { type: [string, 'null'], format: date-time }
+
+    CaseDetail:
+      allOf:
+        - $ref: '#/components/schemas/Case'
+        - type: object
+          properties:
+            steps:
+              type: array
+              items:
+                type: object
+                properties:
+                  kind: { type: string }
+                  content: { type: object, additionalProperties: true }
+                  ai_generated: { type: boolean }
+                  approved: { type: boolean }
+                  approved_by: { type: [string, 'null'] }
+            hypotheses:
+              type: array
+              items:
+                $ref: '#/components/schemas/Hypothesis'
+            artifacts:
+              type: array
+              items:
+                $ref: '#/components/schemas/Artifact'
+            actions:
+              type: array
+              items:
+                type: object
+                properties:
+                  kind: { type: string }
+                  description: { type: string }
+                  owner: { type: [string, 'null'] }
+                  due_date: { type: [string, 'null'], format: date }
+                  status: { type: string }
+                  effectiveness: { type: [object, 'null'], additionalProperties: true }
+
+    Hypothesis:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        statement: { type: string }
+        score: { type: number, minimum: 0, maximum: 1 }
+        evidence:
+          type: array
+          items: { type: object, additionalProperties: true }
+        contradicting_evidence:
+          type: array
+          items: { type: object, additionalProperties: true }
+        verify_step:
+          type: string
+          description: How to confirm or reject this hypothesis
+        status:
+          type: string
+          enum: [proposed, verifying, confirmed, rejected]
+
+    Artifact:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind:
+          $ref: '#/components/schemas/ArtifactKind'
+        version: { type: integer }
+        lang:
+          $ref: '#/components/schemas/Language'
+        content: { type: object, additionalProperties: true }
+        ai_generated: { type: boolean }
+        approved: { type: boolean }
+        approved_by: { type: [string, 'null'] }
+        approved_at: { type: [string, 'null'], format: date-time }
+        watermark:
+          type: [string, 'null']
+          description: Present while unapproved. Cannot be suppressed by any parameter.
+
+    TelemetrySample:
+      type: object
+      required: [ts, machine, signal, value]
+      properties:
+        ts: { type: string, format: date-time }
+        machine: { type: string }
+        signal: { type: string }
+        value: { type: number }
+        quality: { type: integer, default: 192 }
+
+    TelemetrySeries:
+      type: object
+      properties:
+        machine: { type: string }
+        signal: { type: string }
+        unit: { type: [string, 'null'] }
+        points:
+          type: array
+          items:
+            type: object
+            properties:
+              ts: { type: string, format: date-time }
+              value: { type: number }
+        baseline:
+          type: [object, 'null']
+          properties:
+            mean: { type: number }
+            std: { type: number }
+            context: { type: string }
+            confirmed_by: { type: [string, 'null'] }
+
+    MachineHealth:
+      type: object
+      properties:
+        machine: { type: string }
+        health_index: { type: number, minimum: 0, maximum: 100 }
+        components:
+          type: object
+          additionalProperties: true
+        open_alerts: { type: integer }
+        computed_at: { type: string, format: date-time }
+
+    MaintenanceAlert:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        machine: { type: string }
+        severity:
+          $ref: '#/components/schemas/Severity'
+        signals:
+          type: array
+          items: { type: string }
+        evidence: { type: object, additionalProperties: true }
+        suspected_component: { type: [string, 'null'] }
+        recommendation: { type: string }
+        rul_days:
+          type: [object, 'null']
+          description: |
+            Prediction interval, never a point estimate. Null means insufficient
+            history — the system says so rather than guessing.
+          properties:
+            low: { type: number }
+            high: { type: number }
+            confidence: { type: number }
+        status: { type: string }
+        opened_at: { type: string, format: date-time }
+
+    AskRequest:
+      type: object
+      required: [question]
+      properties:
+        question: { type: string }
+        conversation_id: { type: string, format: uuid }
+        lang:
+          $ref: '#/components/schemas/Language'
+        scope:
+          type: object
+          properties:
+            line: { type: string }
+            date_from: { type: string, format: date }
+            date_to: { type: string, format: date }
+
+    AskResponse:
+      type: object
+      properties:
+        run_id: { type: string, format: uuid }
+        conversation_id: { type: [string, 'null'], format: uuid }
+        outcome:
+          type: string
+          enum: [ok, partial, refused]
+          description: |
+            `refused` means the data was insufficient and the agent said so
+            rather than speculating. `partial` means a budget was hit.
+        partial_reason: { type: [string, 'null'] }
+        lang:
+          $ref: '#/components/schemas/Language'
+        answer: { type: string }
+        charts:
+          type: array
+          items:
+            type: object
+            properties:
+              kind: { type: string, enum: [trend, pareto, control, histogram] }
+              data: { type: object, additionalProperties: true }
+        sources:
+          type: array
+          description: Every number in `answer` traces to one of these
+          items:
+            $ref: '#/components/schemas/Source'
+        grounding:
+          type: object
+          properties:
+            numbers_found:
+              type: array
+              items: { type: string }
+            all_matched: { type: boolean }
+        latency_ms: { type: integer }
+        model: { type: string }
+
+    Source:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [tool, document, case, chart]
+        tool: { type: string }
+        args: { type: object, additionalProperties: true }
+        row_count: { type: integer }
+        document_id: { type: string, format: uuid }
+        title: { type: string }
+        page: { type: integer }
+        url: { type: string }
+
+    Brief:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        lang:
+          $ref: '#/components/schemas/Language'
+        text: { type: string }
+        facts:
+          type: object
+          additionalProperties: true
+          description: The structured facts object the narrative was written from
+        facts_version: { type: string }
+        prompt_version: { type: string }
+        revised_of: { type: [string, 'null'], format: uuid }
+
+    ActionProposal:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tool_name: { type: string }
+        args: { type: object, additionalProperties: true }
+        args_hash:
+          type: string
+          description: Approval must echo this. Prevents approving one action and executing another.
+        risk:
+          type: string
+          enum: [low, medium, high]
+        status:
+          type: string
+          enum: [pending, approved, denied, expired, executed, failed]
+        expires_at: { type: string, format: date-time }
+        approver: { type: [string, 'null'] }
+        result: { type: [object, 'null'], additionalProperties: true }
+
+    Finding:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        agent: { type: string }
+        domain: { type: string }
+        scope: { type: object, additionalProperties: true }
+        title: { type: string }
+        summary: { type: [string, 'null'] }
+        severity:
+          $ref: '#/components/schemas/Severity'
+        confidence: { type: [number, 'null'] }
+        evidence:
+          type: array
+          minItems: 1
+          description: A finding without evidence is rejected — enforced in the database
+          items: { type: object, additionalProperties: true }
+        recommended_action: { type: [string, 'null'] }
+        status: { type: string }
+        first_seen: { type: string, format: date-time }
+        last_seen: { type: string, format: date-time }
+        occurrences: { type: integer }
+
+    Briefing:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        generated_at: { type: string, format: date-time }
+        lang:
+          $ref: '#/components/schemas/Language'
+        partial:
+          type: boolean
+          description: True when a specialist agent failed or timed out
+        partial_reason: { type: [string, 'null'] }
+        data_freshness:
+          type: object
+          additionalProperties: true
+          description: Age of the data each domain reported on
+        top_risks:
+          type: array
+          items:
+            type: object
+            properties:
+              rank: { type: integer }
+              score: { type: number }
+              severity: { $ref: '#/components/schemas/Severity' }
+              title: { type: string }
+              summary: { type: string }
+              finding_ids:
+                type: array
+                items: { type: string, format: uuid }
+              recommended_action: { type: string }
+              owner: { type: [string, 'null'] }
+        text: { type: string }
+
+    AgentRunTrace:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        correlation_id: { type: [string, 'null'] }
+        question: { type: [string, 'null'] }
+        answer: { type: [string, 'null'] }
+        model: { type: string }
+        prompt_version: { type: [string, 'null'] }
+        outcome:
+          type: string
+          enum: [ok, partial, refused, grounding_failed, error, budget_exceeded]
+        facts: { type: [object, 'null'], additionalProperties: true }
+        grounding: { type: [object, 'null'], additionalProperties: true }
+        tokens_in: { type: [integer, 'null'] }
+        tokens_out: { type: [integer, 'null'] }
+        latency_ms: { type: [integer, 'null'] }
+        tool_calls:
+          type: array
+          items:
+            type: object
+            properties:
+              ordinal: { type: integer }
+              tool_name: { type: string }
+              args: { type: object, additionalProperties: true }
+              row_count: { type: [integer, 'null'] }
+              duration_ms: { type: [integer, 'null'] }
+              ok: { type: boolean }
+              error: { type: [string, 'null'] }
+
+    Tool:
+      type: object
+      properties:
+        name: { type: string }
+        kind: { type: string, enum: [read, write] }
+        risk: { type: string, enum: [low, medium, high] }
+        min_role: { type: string }
+        schema: { type: object, additionalProperties: true }
+        enabled: { type: boolean }
+
+    KnowledgeHit:
+      type: object
+      properties:
+        kind: { type: string, enum: [case, document_chunk] }
+        case_id: { type: [string, 'null'], format: uuid }
+        document_id: { type: [string, 'null'], format: uuid }
+        title: { type: string }
+        snippet: { type: string }
+        lang:
+          $ref: '#/components/schemas/Language'
+        score: { type: number }
+        verified:
+          type: boolean
+          description: False means LLM-extracted and not human-confirmed
+        outcome: { type: [string, 'null'] }
+        matched_on:
+          type: array
+          items: { type: string }
+          description: Why this result matched — shown to the user
+        source_url: { type: [string, 'null'] }
+
+    TranslationResult:
+      type: object
+      properties:
+        source_text: { type: string }
+        source_lang:
+          $ref: '#/components/schemas/Language'
+        translation: { type: string }
+        target_lang:
+          $ref: '#/components/schemas/Language'
+        tm_match:
+          type: [object, 'null']
+          properties:
+            score: { type: number }
+            segment_id: { type: string, format: uuid }
+        glossary_applied:
+          type: array
+          items: { type: string }
+        checks:
+          type: object
+          properties:
+            numbers_preserved: { type: boolean }
+            glossary_compliant: { type: boolean }
+            omission_suspected: { type: boolean }
+        interpretation:
+          type: [object, 'null']
+          description: |
+            INFERRED, and kept separate from the translation itself so a reader
+            can always tell what was said from what the system deduced.
+          properties:
+            inferred: { type: boolean, enum: [true] }
+            confidence: { type: number }
+            process: { type: string }
+            message_type: { type: string }
+            entities: { type: object, additionalProperties: true }
+            suggested_checks:
+              type: array
+              items: { type: string }
+            related_documents:
+              type: array
+              items:
+                type: object
+                properties:
+                  title: { type: string }
+                  document_id: { type: string, format: uuid }
+            possible_readings:
+              type: array
+              items: { type: string }
+              description: Populated when the source is ambiguous, instead of choosing silently
+
+    DocflowDocument:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: [string, 'null'] }
+        lang: { type: [string, 'null'] }
+        source: { type: string }
+        state:
+          $ref: '#/components/schemas/DocState'
+        page_count: { type: [integer, 'null'] }
+        received_at: { type: string, format: date-time }
+
+    DocflowDocumentDetail:
+      allOf:
+        - $ref: '#/components/schemas/DocflowDocument'
+        - type: object
+          properties:
+            header:
+              type: object
+              additionalProperties:
+                $ref: '#/components/schemas/ExtractedField'
+            lines:
+              type: array
+              items: { type: object, additionalProperties: true }
+            validation:
+              type: array
+              items:
+                type: object
+                properties:
+                  rule: { type: string }
+                  status: { type: string, enum: [pass, warning, fail] }
+                  detail: { type: object, additionalProperties: true }
+            gate:
+              type: string
+              enum: [auto_clear, review_required, blocked]
+            page_images:
+              type: array
+              items: { type: string }
+
+    ExtractedField:
+      type: object
+      properties:
+        value: {}
+        raw: { type: [string, 'null'] }
+        confidence: { type: [number, 'null'] }
+        page: { type: [integer, 'null'] }
+        bbox:
+          type: [object, 'null']
+          additionalProperties: true
+          description: |
+            Provenance. A field without page and bbox is treated as low
+            confidence regardless of the model's score.
+        corrected: { type: boolean }
+        corrected_by: { type: [string, 'null'] }
+
+    Posting:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        document_id: { type: string, format: uuid }
+        adapter: { type: string }
+        idem_key: { type: string }
+        erp_ref: { type: [string, 'null'] }
+        status: { type: string, enum: [pending, succeeded, failed] }
+        attempts: { type: integer }
+        last_error: { type: [string, 'null'] }
+
+    Model:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        version: { type: string }
+        sha256: { type: string }
+        task: { type: string }
+        stage:
+          type: string
+          enum: [candidate, shadow, active, retired]
+        metrics: { type: object, additionalProperties: true }
+        promoted_by: { type: [string, 'null'] }
+        promoted_at: { type: [string, 'null'], format: date-time }
+        shadow_report:
+          type: [object, 'null']
+          properties:
+            frames_evaluated: { type: integer }
+            disagreement_pct: { type: number }
+            critical_recall_delta: { type: number }
+
+    Job:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string }
+        status:
+          type: string
+          enum: [queued, running, succeeded, failed]
+        progress_pct: { type: [number, 'null'] }
+        result_url: { type: [string, 'null'] }
+        error: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+
+    AuditEntry:
+      type: object
+      properties:
+        id: { type: integer }
+        ts: { type: string, format: date-time }
+        user: { type: [string, 'null'] }
+        correlation_id: { type: [string, 'null'] }
+        action: { type: string }
+        entity: { type: string }
+        entity_id: { type: [string, 'null'] }
+        before: { type: [object, 'null'], additionalProperties: true }
+        after: { type: [object, 'null'], additionalProperties: true }
+        ip: { type: [string, 'null'] }
+
+    Readiness:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ready, degraded, not_ready]
+        dependencies:
+          type: object
+          properties:
+            database: { type: string, enum: [ok, fail] }
+            object_store: { type: string, enum: [ok, fail] }
+            queue: { type: string, enum: [ok, fail] }
+            llm:
+              type: string
+              enum: [ok, unavailable]
+              description: |
+                `unavailable` yields status `degraded`, not `not_ready` — the
+                platform is useful without the language model.
+        version: { type: string }
+        schema_version: { type: string }
