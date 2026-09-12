@@ -1,0 +1,444 @@
+# =====================================================================
+# VisionOps (AI Factory Inspector Agent) — standalone reference stack
+# Document : OPS-01-VisionOps (see ../docs/OPS-VisionOps-Deployment-Operations.md)
+# Version  : 1.0
+# Date     : 2026-09-11
+#
+# Usage:
+#   cp .env.example .env            # edit; never commit
+#   docker compose up -d            # server stack (edge nodes deployed separately)
+#   docker compose --profile allinone up -d
+#                                   # demo/pilot: capture + inference + HMI on this host
+#
+# Profiles:
+#   allinone   edge containers (capture, inference, rules, sync, hmi) on the server
+#   telemetry  MQTT broker for the optional verdict mirror (IF-04)
+#
+# PLATFORM MODE: do NOT use this file. Deploy only the edge containers
+# (edge image + node.yaml) against the FactoryBrain stack; the API, DB,
+# object store, LLM and web are the platform's (SAD-01 section 9).
+#
+# IMAGE PINNING: production deployments MUST pin by digest (SEC-192).
+# =====================================================================
+
+name: visionops
+
+x-logging: &default-logging
+  driver: json-file
+  options: { max-size: "50m", max-file: "5" }
+
+x-app-common: &app-common
+  image: ${VO_IMAGE_APP:-visionops/app:1.0.0}
+  restart: unless-stopped
+  logging: *default-logging
+  env_file: [.env]
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis:    { condition: service_healthy }
+    minio:    { condition: service_healthy }
+  networks: [backend]
+
+x-edge-common: &edge-common
+  image: ${VO_IMAGE_EDGE:-visionops/edge:1.0.0}
+  restart: unless-stopped
+  logging: *default-logging
+  env_file: [.env]
+  profiles: ["allinone"]
+  networks: [edge, frontend]
+  volumes:
+    - edge_store:/var/lib/visionops
+    - ./edge/node.yaml:/etc/visionops/node.yaml:ro
+    - ./certs/ca.crt:/etc/visionops/ca.crt:ro
+    - ${VO_REPLAY_DIR:-./replay}:/replay:ro
+
+services:
+
+  # ------------------------------------------------------------ data
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-visionops}
+      POSTGRES_USER: ${POSTGRES_USER:-visionops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=4GB
+      - -c
+      - effective_cache_size=12GB
+      - -c
+      - work_mem=64MB
+      - -c
+      - maintenance_work_mem=1GB
+      - -c
+      - max_connections=150
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=test ! -f /wal_archive/%f && cp %p /wal_archive/%f
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - log_min_duration_statement=1000
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - wal_archive:/wal_archive
+      - ../db:/docker-entrypoint-initdb.d:ro     # schema.sql (+ seed) on FIRST start only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-visionops} -d ${POSTGRES_DB:-visionops}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [backend]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [backend]
+
+  minio:
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    restart: unless-stopped
+    logging: *default-logging
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [backend, edge]     # edge nodes upload evidence directly (signed PUT)
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-10-08T09-37-26Z
+    depends_on:
+      minio: { condition: service_healthy }
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set vo http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+      for b in evidence models reports backups; do
+        mc mb --ignore-existing vo/$$b; mc anonymous set none vo/$$b;
+      done &&
+      mc version enable vo/evidence &&
+      mc ilm rule add --expire-days 730 vo/evidence  || true;
+      mc ilm rule add --expire-days 90  vo/backups   || true;
+      echo 'bucket init complete'
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    networks: [backend]
+    restart: "no"
+
+  # ------------------------------------------------------- inference
+  ollama:
+    image: ollama/ollama:0.5.4
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      OLLAMA_HOST: 0.0.0.0
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_NUM_PARALLEL: "1"
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks: [backend]
+
+  # ------------------------------------------------------ application
+  migrate:
+    <<: *app-common
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    <<: *app-common
+    command: ["uvicorn", "visionops.api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      minio:    { condition: service_healthy }
+      migrate:  { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    networks: [backend, frontend, edge]   # edge nodes reach the API over the edge network
+
+  worker:
+    <<: *app-common
+    command: ["rq", "worker", "--with-scheduler", "evidence", "reports", "retention", "datasets", "drift"]
+    healthcheck:
+      test: ["CMD-SHELL", "rq info --url redis://redis:6379 >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      replicas: ${VO_WORKER_REPLICAS:-2}
+
+  narrative:
+    <<: *app-common
+    command: ["python", "-m", "visionops.narrative.runner"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      ollama:   { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8100/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    # Reaches the GPU through Ollama; arbitration is the Redis semaphore
+    # (ADR-011). In allinone mode inference frames have priority (ADR-V01).
+
+  notifier:
+    <<: *app-common
+    command: ["python", "-m", "visionops.notifier.bot"]
+    deploy:
+      replicas: 1          # single Discord gateway session
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8300/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks: [backend, frontend]   # frontend for Discord egress (allow-listed)
+
+  web:
+    image: ${VO_IMAGE_WEB:-visionops/web:1.0.0}
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      NEXT_PUBLIC_API_URL: ${VO_PUBLIC_URL:-https://visionops.local}/api/v1
+      NODE_ENV: production
+    depends_on:
+      api: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [frontend]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "443:443"
+      - "80:80"
+      - "8443:8443"      # edge sync endpoint with mTLS (separate listener)
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/certs:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web: { condition: service_healthy }
+      api: { condition: service_healthy }
+    networks: [frontend, edge]
+
+  # ------------------------------------------- edge (allinone profile)
+  # These are the SAME containers that run on a Jetson in production
+  # (ADR-V01). Here they run on the server for demo/pilot.
+  capture:
+    <<: *edge-common
+    command: ["python", "-m", "visionops.edge.capture"]
+    devices:
+      - "${VO_CAMERA_DEVICE:-/dev/video0}:/dev/video0"   # USB camera; ignored for folder/rtsp
+    environment:
+      CAPTURE_SOURCE: ${CAPTURE_SOURCE:-folder}          # genicam | usb | rtsp | folder
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9001/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  inference:
+    <<: *edge-common
+    command: ["python", "-m", "visionops.edge.inference"]
+    volumes:
+      - edge_store:/var/lib/visionops
+      - model_cache:/models
+      - ./edge/node.yaml:/etc/visionops/node.yaml:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9002/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 120s   # TensorRT engine build on first start
+
+  rules:
+    <<: *edge-common
+    command: ["python", "-m", "visionops.edge.rules"]
+    depends_on:
+      inference: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9003/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  sync:
+    <<: *edge-common
+    command: ["python", "-m", "visionops.edge.sync"]
+    depends_on:
+      rules: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9005/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  hmi:
+    <<: *edge-common
+    command: ["python", "-m", "visionops.edge.hmi"]
+    ports:
+      - "8080:8080"      # kiosk: http://localhost:8080
+    depends_on:
+      rules: { condition: service_healthy }
+
+  # ----------------------------------------------- optional telemetry
+  mqtt:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "8883:8883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/acl:/mosquitto/config/acl:ro
+      - ./certs:/mosquitto/certs:ro
+      - mqttdata:/mosquitto/data
+    networks: [backend, edge]
+    profiles: ["telemetry"]
+
+  # ----------------------------------------------------- observability
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    restart: unless-stopped
+    logging: *default-logging
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=90d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - promdata:/prometheus
+    networks: [backend, edge]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      prometheus: { condition: service_started }
+    networks: [backend, frontend]
+
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    env_file: [.env]
+    volumes:
+      - ./scripts/backup.sh:/backup.sh:ro
+      - backups:/backups
+    entrypoint: ["/bin/sh", "-c", "while true; do sleep 86400; /backup.sh; done"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [backend]
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true       # egress default-deny for data-plane services (SEC-240)
+  edge:
+    driver: bridge       # edge nodes / allinone edge containers reach api + minio only
+
+volumes:
+  pgdata:
+  wal_archive:
+  redisdata:
+  miniodata:
+  ollama_models:
+  model_cache:
+  edge_store:
+  mqttdata:
+  promdata:
+  grafanadata:
+  caddy_data:
+  caddy_config:
+  backups:
+
+# =====================================================================
+# NOTES
+# 1. `backend` is internal: postgres, redis, ollama, worker, narrative have
+#    no internet route. Pre-pull Ollama models into `ollama_models`
+#    (OPS section 5.1). Air-gapped deployments behave identically.
+# 2. `../db` mounts schema.sql and seed_demo.sql into the Postgres init
+#    directory: applied on FIRST start only. Remove seed_demo.sql from the
+#    mount (or the ../db directory) for a production database.
+# 3. `allinone` shares one GPU between `inference` and `ollama`. The
+#    application-level semaphore gives inference frames priority
+#    (ADR-V01); Docker cannot express that.
+# 4. Edge containers under `allinone` are identical to the images shipped
+#    to Jetson nodes. CAPTURE_SOURCE=folder replays ./replay for demos.
+# 5. Only caddy (443/80/8443) and hmi (8080, allinone) publish host ports.
+# =====================================================================

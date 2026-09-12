@@ -1,0 +1,2659 @@
+openapi: 3.1.0
+
+info:
+  title: VisionOps — AI Factory Inspector Agent API
+  version: 1.0.0
+  summary: Camera-to-narrative inspection system
+  description: |
+    REST API for VisionOps (SRS-01): line-speed defect detection and
+    measurement with full evidence, human review, a reproducible retraining
+    loop, and a narrative agent that explains what changed without ever
+    inventing a number.
+
+    Companion documents:
+      * [SRS-01](../SRS-AI-Factory-Inspector-Agent.md)
+      * [SAD-01](../docs/SAD-VisionOps-Software-Architecture.md)
+      * [DDS-01](../docs/DDS-VisionOps-Database-Design.md)
+      * [API-Specification.md](./API-Specification.md) — conventions, error catalogue
+      * [ICD-01](../docs/ICD-VisionOps-Interface-Control.md)
+
+    ## Standalone and platform mode
+    This is the **standalone** surface. In platform mode `/auth/*`, `/edge/*`
+    and `/admin/*` collapse into the FactoryBrain platform's equivalents and
+    the remaining paths are mounted under the platform API unchanged
+    (API-Specification.md §11).
+
+    ## Three guarantees
+    1. **No invented numbers.** Every figure in a narrative or answer appears
+       in a tool result listed in `sources`. An ungrounded narrative is
+       withheld (`422 GROUNDING_FAILED`), never returned with a caveat.
+    2. **Offline-first.** Edge clients create records with client UUIDv7 ids
+       and push batches at-least-once; the server deduplicates.
+    3. **Human-in-the-loop.** Verdict overrides, recipe changes, calibration,
+       model promotion and write-capable agent tools all require a named
+       user with sufficient role, and are audited.
+
+    All errors are RFC 7807 `application/problem+json`.
+  contact:
+    name: VisionOps owner
+    email: visionops@factorybrain.local
+  license:
+    name: Proprietary — internal use
+
+servers:
+  - url: https://visionops.local/api/v1
+    description: Standalone on-premise deployment
+  - url: https://factorybrain.local/api/v1
+    description: Platform mode (mounted under FactoryBrain)
+  - url: http://localhost:8000/api/v1
+    description: Local development
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: auth
+  - name: inspect
+    description: Synchronous single-image inspection (server-side path)
+  - name: inspections
+    description: Inspection records, evidence and review queue
+  - name: recipes
+    description: Per-SKU inspection rules, versioned
+  - name: stations
+    description: Stations, cameras and calibration
+  - name: models
+    description: Model registry, shadow runs, promotion, rollback
+  - name: datasets
+    description: Retraining dataset snapshots
+  - name: stats
+    description: KPI, Pareto, station/shift breakdowns, agreement
+  - name: narrative
+    description: Grounded narratives and question answering
+  - name: edge
+    description: Edge node sync (identical contract to the platform)
+  - name: reports
+  - name: admin
+
+paths:
+
+  # ------------------------------------------------------------------ auth
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Exchange credentials for an access token
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: Rotate a refresh token
+      operationId: refreshToken
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        '200':
+          description: Refreshed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: Current user, role and line scope
+      operationId: getCurrentUser
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # --------------------------------------------------------------- inspect
+  /inspect:
+    post:
+      tags: [inspect]
+      summary: Inspect one uploaded image synchronously
+      description: |
+        Server-side inspection path for manual checks, re-judging an evidence
+        image, and recipe dry-runs. **Not** the line path — edge nodes judge
+        locally and push results via `/edge/records:batch`.
+
+        Runs the same rules engine as the edge with the SKU's active recipe
+        (or a specific `recipe_version`). Returns the verdict, detections,
+        measurements and — unless `persist=false` — the stored inspection.
+      operationId: inspectImage
+      parameters:
+        - name: persist
+          in: query
+          schema: { type: boolean, default: true }
+          description: When false, nothing is stored (dry-run)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image, sku]
+              properties:
+                image: { type: string, format: binary }
+                sku: { type: string }
+                line: { type: string }
+                station: { type: string }
+                lot: { type: string }
+                recipe_version: { type: integer }
+                camera_id: { type: string, format: uuid, description: Required for measurements (calibration lookup) }
+      responses:
+        '200':
+          description: Judged
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InspectResult' }
+              examples:
+                fail:
+                  value:
+                    verdict: FAIL
+                    quality_gate: { passed: true, blur_variance: 231.4, exposure_mean: 118 }
+                    detections:
+                      - { class_name: MISSING_FIN, confidence: 0.91, bbox: {x: 132, y: 251, w: 80, h: 70}, area_mm2: 21.0 }
+                    measurements:
+                      - { parameter: fin_pitch, value: 3.04, unit: mm, usl: 3.2, lsl: 2.8, in_spec: true }
+                    rules_fired: [ { kind: class_present, class: MISSING_FIN, threshold: 0.60, verdict: FAIL } ]
+                    anomaly: { score: 0.31, threshold: 0.82, flagged: false }
+                    recipe_version: 1
+                    model_version: defect-yolo11s:1.0.0
+                    latency_ms: 104
+                    inspection_id: 0192f0a1-0000-7000-8000-000000000001
+                noRead:
+                  summary: Quality gate failed — nothing judged
+                  value:
+                    verdict: NO_READ
+                    quality_gate: { passed: false, reason: BLUR, blur_variance: 41.2, threshold: 120 }
+                    detections: []
+                    measurements: []
+                    rules_fired: []
+                    recipe_version: 1
+                    model_version: defect-yolo11s:1.0.0
+                    latency_ms: 22
+        '409':
+          description: Measurements requested but no valid calibration for the camera
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://visionops.local/problems/calibration-stale
+                title: No valid calibration
+                status: 409
+                code: CALIBRATION_STALE
+                detail: Camera acA2440:40123403 has no valid calibration (v2 unverified). Measurements refused; verdict would be NO_READ.
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ----------------------------------------------------------- inspections
+  /inspections:
+    get:
+      tags: [inspections]
+      summary: Query inspection records
+      operationId: listInspections
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/LineFilter'
+        - $ref: '#/components/parameters/SkuFilter'
+        - name: station
+          in: query
+          schema: { type: string }
+        - name: verdict
+          in: query
+          schema: { $ref: '#/components/schemas/Verdict' }
+          description: Filters on the **effective** verdict (override applied)
+        - name: lot
+          in: query
+          schema: { type: string }
+        - name: class
+          in: query
+          schema: { type: string }
+          description: Only inspections with a detection of this class
+        - name: overridden
+          in: query
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InspectionPage' }
+    post:
+      tags: [inspections]
+      summary: Record an inspection judged elsewhere
+      description: |
+        For manual and mobile sources. `id` is client-generated UUIDv7;
+        re-posting an existing id returns `200` with the existing record.
+      operationId: createInspection
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InspectionCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Inspection' }
+        '200':
+          description: Already existed (idempotent replay)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Inspection' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /inspections/{inspectionId}:
+    get:
+      tags: [inspections]
+      summary: Inspection detail with detections, measurements, anomaly, override history and evidence URLs
+      operationId: getInspection
+      parameters:
+        - $ref: '#/components/parameters/InspectionId'
+      responses:
+        '200':
+          description: Detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InspectionDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /inspections/{inspectionId}/verdict:
+    patch:
+      tags: [inspections]
+      summary: Human override of the verdict
+      description: |
+        Role `inspector`+. Appends an override with user, timestamp and reason
+        code. The model's verdict is never modified (SRS-01 FR-13/14). When
+        the new verdict is FAIL, `label_class` records what the inspector saw
+        so the override can feed a dataset snapshot.
+      operationId: overrideVerdict
+      parameters:
+        - $ref: '#/components/parameters/InspectionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [verdict, reason_code]
+              properties:
+                verdict: { $ref: '#/components/schemas/Verdict' }
+                reason_code:
+                  type: string
+                  enum: [CONFIRMED_DEFECT, FALSE_ALARM, ACCEPTABLE_MARK, ESCAPE_FOUND, WRONG_CLASS, OTHER]
+                label_class: { type: string, description: Defect class the human observed (for retraining) }
+                note: { type: string }
+      responses:
+        '200':
+          description: Override recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Inspection' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: New verdict equals the current effective verdict
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /inspections/{inspectionId}/evidence:
+    get:
+      tags: [inspections]
+      summary: Short-lived signed URLs for the evidence image, overlay and anomaly heatmap
+      operationId: getEvidenceUrls
+      parameters:
+        - $ref: '#/components/parameters/InspectionId'
+      responses:
+        '200':
+          description: Signed URLs (15 min)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  image_url: { type: [string, 'null'] }
+                  overlay_url: { type: [string, 'null'] }
+                  heatmap_url: { type: [string, 'null'] }
+                  expires_at: { type: string, format: date-time }
+                  sampled_out:
+                    type: boolean
+                    description: True when this PASS part's image was not retained (sampling policy)
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /reviews:
+    get:
+      tags: [inspections]
+      summary: Pending review queue
+      description: REVIEW verdicts with no override yet, oldest first.
+      operationId: getReviewQueue
+      parameters:
+        - $ref: '#/components/parameters/LineFilter'
+        - name: station
+          in: query
+          schema: { type: string }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Queue page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InspectionPage' }
+
+  /reviews/next:
+    get:
+      tags: [inspections]
+      summary: Claim the next review item for this user
+      description: |
+        Returns the oldest unclaimed REVIEW and soft-locks it for 5 minutes so
+        two inspectors do not judge the same part. Backs the keyboard-first
+        review flow (SRS-01 FR-13, AC-07).
+      operationId: claimNextReview
+      parameters:
+        - $ref: '#/components/parameters/LineFilter'
+      responses:
+        '200':
+          description: Next item
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InspectionDetail' }
+        '204':
+          description: Queue empty
+
+  # --------------------------------------------------------------- recipes
+  /recipes:
+    get:
+      tags: [recipes]
+      summary: Active recipe per SKU
+      operationId: listRecipes
+      responses:
+        '200':
+          description: Recipes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Recipe' }
+
+  /recipes/{sku}:
+    get:
+      tags: [recipes]
+      summary: Recipe for a SKU (active version, or a specific version)
+      operationId: getRecipe
+      parameters:
+        - $ref: '#/components/parameters/Sku'
+        - name: version
+          in: query
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Recipe
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Recipe' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [recipes]
+      summary: Create a new recipe version
+      description: |
+        Role `engineer`+. Never edits in place: creates version N+1 with
+        `active_from`, closes version N, bumps the edge config ETag. A
+        `reason` is mandatory and audited. In-flight inspections keep the
+        version they started with.
+
+        Run `/recipes/{sku}/validate` first — the response tells you how many
+        recent verdicts the change would flip.
+      operationId: createRecipeVersion
+      parameters:
+        - $ref: '#/components/parameters/Sku'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecipeCreate' }
+      responses:
+        '201':
+          description: New version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Recipe' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422':
+          description: Rules fail JSON-Schema validation
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://visionops.local/problems/recipe-invalid
+                title: Recipe rules invalid
+                status: 422
+                code: RECIPE_INVALID
+                detail: "rules[3].usl (3.2) must be >= lsl (3.4)"
+                errors: [ { field: "rules[3]", message: "usl must be >= lsl" } ]
+
+  /recipes/{sku}/validate:
+    post:
+      tags: [recipes]
+      summary: Dry-run a proposed rule set against recent inspections
+      description: |
+        Re-evaluates the last `sample_size` inspections of this SKU under the
+        proposed rules and returns the verdict transition matrix. Nothing is
+        stored. This is the guard against the most common recipe error — a
+        threshold that silently flips hundreds of parts.
+      operationId: validateRecipe
+      parameters:
+        - $ref: '#/components/parameters/Sku'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rules]
+              properties:
+                rules: { $ref: '#/components/schemas/RecipeRules' }
+                review_threshold: { type: number, minimum: 0, maximum: 1 }
+                sample_size: { type: integer, default: 500, maximum: 5000 }
+      responses:
+        '200':
+          description: Impact analysis
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecipeValidation' }
+              example:
+                schema_valid: true
+                sample_size: 500
+                transitions:
+                  - { from: PASS, to: REVIEW, count: 14 }
+                  - { from: REVIEW, to: FAIL, count: 2 }
+                  - { from: FAIL, to: PASS, count: 0 }
+                unchanged: 484
+                new_defect_rate_pct: 3.4
+                current_defect_rate_pct: 3.0
+                warnings: [ "class_present threshold for SCRATCH lowered from 0.75 to 0.60: 14 additional REVIEW/day expected" ]
+        '422':
+          description: Rules fail JSON-Schema validation
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /recipes/{sku}/versions:
+    get:
+      tags: [recipes]
+      summary: Version history with author and reason
+      operationId: listRecipeVersions
+      parameters:
+        - $ref: '#/components/parameters/Sku'
+      responses:
+        '200':
+          description: Versions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Recipe' }
+
+  # -------------------------------------------------------------- stations
+  /stations:
+    get:
+      tags: [stations]
+      summary: Stations with cameras, current calibration and node state
+      operationId: listStations
+      parameters:
+        - $ref: '#/components/parameters/LineFilter'
+      responses:
+        '200':
+          description: Stations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Station' }
+    post:
+      tags: [stations]
+      summary: Create a station
+      operationId: createStation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StationCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Station' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /stations/{stationId}:
+    patch:
+      tags: [stations]
+      summary: Update a station (PLC I/O map, trigger mode, active)
+      description: Changing `plc_io_json` is a controlled change requiring PLC re-validation (ICD §3).
+      operationId: updateStation
+      parameters:
+        - name: stationId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StationCreate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Station' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /cameras:
+    get:
+      tags: [stations]
+      summary: Cameras
+      operationId: listCameras
+      responses:
+        '200':
+          description: Cameras
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Camera' }
+    post:
+      tags: [stations]
+      summary: Register a camera
+      operationId: createCamera
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CameraCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Camera' }
+
+  /cameras/{cameraId}/calibrations:
+    get:
+      tags: [stations]
+      summary: Calibration history for a camera
+      operationId: listCalibrations
+      parameters:
+        - $ref: '#/components/parameters/CameraId'
+      responses:
+        '200':
+          description: Calibrations, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  current: { oneOf: [ { $ref: '#/components/schemas/Calibration' }, { type: 'null' } ] }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Calibration' }
+    post:
+      tags: [stations]
+      summary: Record a calibration (unverified until gauge verification is posted)
+      description: |
+        Role `engineer`+. Creates version N+1 for the camera with
+        `valid = false`. It becomes valid only after `/verify` records a gauge
+        check within tolerance. Measurements are refused until then
+        (`CALIBRATION_STALE`).
+      operationId: createCalibration
+      parameters:
+        - $ref: '#/components/parameters/CameraId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CalibrationCreate' }
+      responses:
+        '201':
+          description: Created (unverified)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Calibration' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /cameras/{cameraId}/calibrations/{calibrationId}/verify:
+    post:
+      tags: [stations]
+      summary: Record the gauge verification for a calibration
+      description: |
+        Submit ≥ 10 repeat measurements of a known artefact. The server
+        computes mean, σ and max error; `valid` becomes true only if max error
+        ≤ tolerance. A failing verification is stored — it is evidence — but
+        the calibration stays invalid.
+      operationId: verifyCalibration
+      parameters:
+        - $ref: '#/components/parameters/CameraId'
+        - name: calibrationId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [gauge_nominal_mm, measurements_mm]
+              properties:
+                gauge_nominal_mm: { type: number }
+                measurements_mm:
+                  type: array
+                  minItems: 10
+                  items: { type: number }
+      responses:
+        '200':
+          description: Verification recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Calibration' }
+              examples:
+                pass:
+                  value: { id: "…", version: 1, valid: true, gauge_repeats: 30, gauge_mean_mm: 25.012, gauge_sigma_mm: 0.031, gauge_max_err_mm: 0.09, tolerance_mm: 0.2 }
+                fail:
+                  value: { id: "…", version: 2, valid: false, gauge_repeats: 30, gauge_mean_mm: 25.31, gauge_sigma_mm: 0.04, gauge_max_err_mm: 0.36, tolerance_mm: 0.2 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /cameras/{cameraId}/calibrations/{calibrationId}/invalidate:
+    post:
+      tags: [stations]
+      summary: Manually invalidate a calibration (camera moved, lens changed)
+      operationId: invalidateCalibration
+      parameters:
+        - $ref: '#/components/parameters/CameraId'
+        - name: calibrationId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+      responses:
+        '200':
+          description: Invalidated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Calibration' }
+
+  # ---------------------------------------------------------------- models
+  /models:
+    get:
+      tags: [models]
+      summary: Model registry
+      operationId: listModels
+      parameters:
+        - name: stage
+          in: query
+          schema: { $ref: '#/components/schemas/ModelStage' }
+      responses:
+        '200':
+          description: Models
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Model' }
+    post:
+      tags: [models]
+      summary: Register a candidate model from a manifest
+      description: |
+        The artefact must already be in the model bucket. Its SHA-256 is
+        verified against the manifest before the row is created; a mismatch is
+        rejected (SEC-181). `trained_from` must name a frozen dataset snapshot.
+      operationId: registerModel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModelManifest' }
+      responses:
+        '201':
+          description: Registered as candidate
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Model' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422':
+          description: Checksum mismatch, unknown snapshot, or class map incompatible with active recipes
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /models/{modelId}:
+    get:
+      tags: [models]
+      summary: Model detail with shadow report
+      operationId: getModel
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+      responses:
+        '200':
+          description: Model
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Model' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /models/{modelId}/shadow:
+    post:
+      tags: [models]
+      summary: Start a shadow run
+      description: Runs the candidate beside the active model on live frames with no verdict effect. Accumulates the disagreement report.
+      operationId: startShadowRun
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                min_frames: { type: integer, default: 200, minimum: 200 }
+                stations:
+                  type: array
+                  items: { type: string }
+      responses:
+        '202':
+          description: Shadow run started
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Model' }
+        '409':
+          description: Not a candidate, or a shadow run is already active
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /models/{modelId}/promote:
+    post:
+      tags: [models]
+      summary: Promote a shadowed model to active
+      description: |
+        Role `admin`. Refused unless a shadow run of ≥ `min_frames` has
+        completed **and** critical-class recall on the hold-out set is
+        ≥ 0.98 (SRS-01 AI-02). The previous active model is retained for
+        rollback. Edge nodes pick up the new manifest via the config ETag and
+        build their TensorRT engines on-device.
+      operationId: promoteModel
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string }
+      responses:
+        '200':
+          description: Promoted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Model' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: No completed shadow run, or critical recall below the gate
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                belowGate:
+                  value:
+                    type: https://visionops.local/problems/critical-recall-below-gate
+                    title: Promotion refused
+                    status: 409
+                    code: CRITICAL_RECALL_BELOW_GATE
+                    detail: "Hold-out recall on critical classes is 0.964 (gate 0.98). MISSING_FIN recall dropped from 0.985 to 0.951. Promotion refused."
+                notShadowed:
+                  value:
+                    type: https://visionops.local/problems/model-not-shadowed
+                    title: Promotion refused
+                    status: 409
+                    code: MODEL_NOT_SHADOWED
+                    detail: "Shadow run has 84 of 200 required frames."
+
+  /models/{modelId}/rollback:
+    post:
+      tags: [models]
+      summary: Re-activate a previously active model
+      description: One-command rollback. The currently active model is retired; the target becomes active. Audited.
+      operationId: rollbackModel
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+      responses:
+        '200':
+          description: Rolled back
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Model' }
+        '409':
+          description: Target was never active
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /models/{modelId}/drift:
+    get:
+      tags: [models]
+      summary: Drift metrics for a model (per camera)
+      operationId: getModelDrift
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: Drift series
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/DriftPoint' }
+
+  # -------------------------------------------------------------- datasets
+  /datasets:
+    get:
+      tags: [datasets]
+      summary: Dataset snapshots
+      operationId: listDatasets
+      responses:
+        '200':
+          description: Snapshots
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/DatasetSnapshot' }
+    post:
+      tags: [datasets]
+      summary: Create a snapshot from overrides, confirmed reviews and sampled PASS
+      description: |
+        Role `engineer`+. Selects items by period, line, SKU and label source;
+        the snapshot is created **unfrozen** so items can be curated, then
+        frozen by `/freeze`. Frozen snapshots are immutable (database trigger).
+      operationId: createDataset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, label_version]
+              properties:
+                name: { type: string }
+                purpose: { type: string, enum: [retrain, holdout, validation], default: retrain }
+                label_version: { type: string }
+                period_from: { type: string, format: date-time }
+                period_to: { type: string, format: date-time }
+                line: { type: string }
+                sku: { type: string }
+                label_sources:
+                  type: array
+                  items: { type: string, enum: [override, confirmed_review, sampled_pass, manual] }
+                pass_sample_count: { type: integer, default: 0 }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DatasetSnapshot' }
+
+  /datasets/{snapshotId}:
+    get:
+      tags: [datasets]
+      summary: Snapshot detail with class distribution
+      operationId: getDataset
+      parameters:
+        - $ref: '#/components/parameters/SnapshotId'
+      responses:
+        '200':
+          description: Snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DatasetSnapshot' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /datasets/{snapshotId}/freeze:
+    post:
+      tags: [datasets]
+      summary: Freeze the snapshot and export it
+      description: After this, items cannot change; the export is written to the model bucket with a SHA-256.
+      operationId: freezeDataset
+      parameters:
+        - $ref: '#/components/parameters/SnapshotId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [format]
+              properties:
+                format: { type: string, enum: [coco, yolo] }
+                pseudonymise: { type: boolean, default: true, description: Strip user identifiers from labels (SEC) }
+      responses:
+        '202':
+          description: Export job started
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '409':
+          description: Already frozen
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  # ----------------------------------------------------------------- stats
+  /stats/summary:
+    get:
+      tags: [stats]
+      summary: Inspection KPI with baseline comparison and significance
+      description: |
+        Same numbers the narrative agent's `inspection_stats` tool returns —
+        this endpoint is how a client (or a tester) verifies a narrative.
+        Defect rate uses the effective verdict and excludes REVIEW and NO_READ
+        from the denominator.
+      operationId: getStatsSummary
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/LineFilter'
+        - $ref: '#/components/parameters/SkuFilter'
+        - name: baseline_days
+          in: query
+          schema: { type: integer, default: 7, minimum: 1, maximum: 90 }
+      responses:
+        '200':
+          description: Summary
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatsSummary' }
+              example:
+                period: { from: '2026-09-10', to: '2026-09-10' }
+                inspected: 1240
+                judged: 1240
+                failed: 37
+                in_review: 0
+                no_read: 0
+                defect_rate_pct: 2.9839
+                baseline_pct: 2.1008
+                change_pct: 42.0
+                significant: true
+                p_value: 0.0011
+                top_defect: { class_name: MISSING_FIN, parts: 19, share_pct: 51.4 }
+                worst_sku: { sku: RAD-500-A, defect_rate_pct: 3.72 }
+
+  /stats/pareto:
+    get:
+      tags: [stats]
+      summary: Defect Pareto by class
+      operationId: getStatsPareto
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/LineFilter'
+        - $ref: '#/components/parameters/SkuFilter'
+        - name: top_n
+          in: query
+          schema: { type: integer, default: 10, maximum: 50 }
+      responses:
+        '200':
+          description: Pareto
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ParetoItem' }
+
+  /stats/stations:
+    get:
+      tags: [stats]
+      summary: Per-station defect share
+      operationId: getStatsStations
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/LineFilter'
+      responses:
+        '200':
+          description: Station breakdown
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/StationStat' }
+
+  /stats/correlation:
+    get:
+      tags: [stats]
+      summary: Defect association with shift, station, SKU and lot
+      description: |
+        Reports the share of defects per factor level, the rate within each
+        level, and a chi-square/Fisher p-value. Effect sizes are returned so a
+        strong-looking share on a tiny sample is not mistaken for a signal.
+        This is **association**, and the response says so.
+      operationId: getStatsCorrelation
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/LineFilter'
+        - name: factors
+          in: query
+          style: form
+          explode: false
+          schema:
+            type: array
+            items: { type: string, enum: [shift, station, sku, lot] }
+      responses:
+        '200':
+          description: Association table
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CorrelationResult' }
+
+  /stats/agreement:
+    get:
+      tags: [stats]
+      summary: Model-vs-human agreement
+      operationId: getStatsAgreement
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/LineFilter'
+        - name: class
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Agreement
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AgreementStat' }
+
+  # ------------------------------------------------------------- narrative
+  /agent/narrative:
+    post:
+      tags: [narrative]
+      summary: Generate a shift or daily narrative
+      description: |
+        Builds the facts object from `inspection_stats`, `defect_pareto`,
+        `station_breakdown`, `shift_correlation` and `similar_periods`; the
+        model writes prose around it; a deterministic post-check verifies every
+        number. When the change vs baseline is not significant the narrative
+        says "within normal variation" and proposes no cause.
+
+        **An ungrounded narrative is withheld** (`422 GROUNDING_FAILED`) and
+        stored with no text.
+      operationId: generateNarrative
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, period_from, period_to]
+              properties:
+                kind: { type: string, enum: [shift, daily, adhoc] }
+                period_from: { type: string, format: date-time }
+                period_to: { type: string, format: date-time }
+                line: { type: string }
+                lang: { $ref: '#/components/schemas/Language' }
+                deliver: { type: boolean, default: false, description: Also post to Discord (creates a proposal if the caller lacks manager role) }
+      responses:
+        '200':
+          description: Narrative
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Narrative' }
+              examples:
+                significant:
+                  value:
+                    id: 0192f0a1-0000-7000-8000-00000000e001
+                    kind: daily
+                    lang: en
+                    significant: true
+                    text: |
+                      Production line 2 — 2026-09-10. 1,240 units inspected, 37 defects, defect rate 2.98 % (+42 % vs 7-day average 2.10 %). Main defect: missing fin (19 pcs, 51 %). Most affected SKU: RAD-500-A. Possible correlation: 31 of 37 defects in Shift B and 27 of 37 at station ST3, coincident with lot LOT-2609-114 entering at 14:05 (5.12 % on that lot vs 0.94 % before). Recommendation: inspect feeder station #3 and verify the incoming lot. Confidence: correlation only — not verified as root cause.
+                    facts: { inspected: 1240, defects: 37, defect_rate_pct: 2.98, baseline_7d_pct: 2.10, change_pct: 42.0, significant: true, p_value: 0.0011 }
+                    sources:
+                      - { kind: tool, tool: inspection_stats, row_count: 1 }
+                      - { kind: tool, tool: defect_pareto, row_count: 4 }
+                      - { kind: tool, tool: station_breakdown, row_count: 3 }
+                      - { kind: tool, tool: shift_correlation, row_count: 3 }
+                    grounding: { numbers_found: ["1240","37","2.98","42","2.10","19","51","31","27","5.12","0.94"], all_matched: true }
+                    similar_periods: [ { period_from: '2026-05-14', similarity: 0.81, note: "missing fin concentrated at ST3, resolved by feeder alignment" } ]
+                notSignificant:
+                  value:
+                    id: 0192f0a1-0000-7000-8000-00000000e002
+                    kind: daily
+                    lang: en
+                    significant: false
+                    text: "Production line 2 — 2026-09-09. 1,202 units inspected, 25 defects, defect rate 2.10 %, within normal variation versus the 7-day average (2.10 %, p = 0.98). No action recommended."
+                    facts: { inspected: 1202, defects: 25, defect_rate_pct: 2.10, baseline_7d_pct: 2.10, significant: false, p_value: 0.98 }
+                    sources: [ { kind: tool, tool: inspection_stats, row_count: 1 } ]
+                    grounding: { all_matched: true }
+        '422':
+          description: Grounding failed — narrative withheld
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://visionops.local/problems/grounding-failed
+                title: Narrative withheld by grounding check
+                status: 422
+                code: GROUNDING_FAILED
+                detail: The generated narrative contained "4.7" which is not present in any tool result. Nothing was returned or delivered. Recorded as narrative 0192f0a1-…e002.
+        '503': { $ref: '#/components/responses/ModelUnavailable' }
+
+  /agent/narratives:
+    get:
+      tags: [narrative]
+      summary: Narrative history (including withheld ones)
+      operationId: listNarratives
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/LineFilter'
+        - name: withheld
+          in: query
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: Narratives
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Narrative' }
+
+  /agent/ask:
+    post:
+      tags: [narrative]
+      summary: Ask a grounded question about inspections
+      description: |
+        Tool-calling loop over the six inspection-domain tools. Budget: 5 tool
+        calls / 60 s, enforced by the executor. Questions outside inspection
+        data (machine parameters, material certificates) are answered
+        "outside my data" in standalone mode.
+      operationId: askAgent
+      parameters:
+        - name: stream
+          in: query
+          schema: { type: boolean, default: false }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AskRequest' }
+      responses:
+        '200':
+          description: Grounded answer
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AskResponse' }
+          headers:
+            X-Correlation-Id: { schema: { type: string } }
+        '422':
+          description: Grounding failed — answer withheld
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503': { $ref: '#/components/responses/ModelUnavailable' }
+
+  /agent/runs/{runId}:
+    get:
+      tags: [narrative]
+      summary: Full trace of an agent run — "show the numbers"
+      operationId: getAgentRun
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Trace
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentRunTrace' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /agent/tools:
+    get:
+      tags: [narrative]
+      summary: The tools the agent can call — the complete, visible capability boundary
+      operationId: listTools
+      responses:
+        '200':
+          description: Tools
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Tool' }
+
+  /agent/proposals:
+    get:
+      tags: [narrative]
+      summary: Pending write-tool proposals (e.g. send_discord)
+      operationId: listProposals
+      responses:
+        '200':
+          description: Proposals
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ActionProposal' }
+
+  /agent/proposals/{proposalId}/approve:
+    post:
+      tags: [narrative]
+      summary: Approve a proposal (binds to args_hash, expires)
+      operationId: approveProposal
+      parameters:
+        - $ref: '#/components/parameters/ProposalId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [args_hash]
+              properties:
+                args_hash: { type: string }
+      responses:
+        '200':
+          description: Approved and executed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionProposal' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Expired, already decided, or hash mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /agent/proposals/{proposalId}/deny:
+    post:
+      tags: [narrative]
+      summary: Deny a proposal
+      operationId: denyProposal
+      parameters:
+        - $ref: '#/components/parameters/ProposalId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses:
+        '200':
+          description: Denied
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionProposal' }
+
+  /agent/feedback:
+    post:
+      tags: [narrative]
+      summary: Rate a narrative or answer
+      operationId: submitFeedback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [run_id, rating]
+              properties:
+                run_id: { type: string, format: uuid }
+                rating: { type: integer, enum: [-1, 1] }
+                reason: { type: string }
+      responses:
+        '204':
+          description: Recorded
+
+  # ------------------------------------------------------------------ edge
+  /edge/records:batch:
+    post:
+      tags: [edge]
+      summary: Push a batch of inspection records from an edge node
+      description: |
+        **Identical contract to the platform's IF-01** so an EdgeGuard node
+        syncs to VisionOps standalone or to FactoryBrain without change.
+        At-least-once; `duplicate` is a success outcome; `207` per record.
+      operationId: pushEdgeRecords
+      security:
+        - edgeApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [node_code, records]
+              properties:
+                node_code: { type: string }
+                records:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items: { $ref: '#/components/schemas/InspectionCreate' }
+      responses:
+        '207':
+          description: Per-record outcomes
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BatchResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413':
+          description: Batch too large
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /edge/images:
+    post:
+      tags: [edge]
+      summary: Upload evidence for an already-synced record
+      operationId: uploadEdgeImage
+      security:
+        - edgeApiKey: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [inspection_id, kind, file]
+              properties:
+                inspection_id: { type: string, format: uuid }
+                kind: { type: string, enum: [original, overlay, heatmap] }
+                sha256: { type: string, description: Verified on receipt }
+                file: { type: string, format: binary }
+      responses:
+        '201':
+          description: Stored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  uri: { type: string }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: SHA-256 mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /edge/config:
+    get:
+      tags: [edge]
+      summary: Pull recipes, calibrations, thresholds and model manifests for this node
+      operationId: getEdgeConfig
+      security:
+        - edgeApiKey: []
+      parameters:
+        - name: node_code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: If-None-Match
+          in: header
+          schema: { type: string }
+      responses:
+        '200':
+          description: Configuration bundle
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EdgeConfig' }
+        '304':
+          description: Unchanged
+
+  /edge/heartbeat:
+    post:
+      tags: [edge]
+      summary: Node health
+      operationId: edgeHeartbeat
+      security:
+        - edgeApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodeHealth' }
+      responses:
+        '204':
+          description: Recorded
+
+  /edge/nodes:
+    get:
+      tags: [edge]
+      summary: Fleet status
+      operationId: listEdgeNodes
+      responses:
+        '200':
+          description: Nodes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/EdgeNode' }
+
+  # --------------------------------------------------------------- reports
+  /reports/{type}:
+    post:
+      tags: [reports]
+      summary: Generate a PDF/PPTX report with charts and top evidence
+      operationId: generateReport
+      parameters:
+        - name: type
+          in: path
+          required: true
+          schema: { type: string, enum: [daily, shift, station, agreement, calibration] }
+        - name: format
+          in: query
+          schema: { type: string, enum: [pdf, pptx], default: pdf }
+        - name: lang
+          in: query
+          schema: { $ref: '#/components/schemas/Language' }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                date: { type: string, format: date }
+                line: { type: string }
+                narrative_id: { type: string, format: uuid }
+      responses:
+        '202':
+          description: Job started
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+
+  /jobs/{jobId}:
+    get:
+      tags: [reports]
+      summary: Async job status and result
+      operationId: getJob
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Job
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ----------------------------------------------------------------- admin
+  /admin/config:
+    get:
+      tags: [admin]
+      summary: Runtime configuration
+      operationId: getConfig
+      responses:
+        '200':
+          description: Config
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+    patch:
+      tags: [admin]
+      summary: Update runtime configuration (thresholds, schedules)
+      operationId: updateConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/audit:
+    get:
+      tags: [admin]
+      summary: Audit log
+      operationId: queryAudit
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - name: entity
+          in: query
+          schema: { type: string }
+        - name: user_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: correlation_id
+          in: query
+          schema: { type: string }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditEntry' }
+                  next_cursor: { type: [string, 'null'] }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /healthz:
+    get:
+      tags: [admin]
+      summary: Liveness
+      operationId: healthz
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+
+  /readyz:
+    get:
+      tags: [admin]
+      summary: Readiness with dependency status
+      description: LLM unavailable → `degraded`, not `not_ready`. Inspection, review and stats work without it.
+      operationId: readyz
+      security: []
+      responses:
+        '200':
+          description: Ready or degraded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: Not ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 15-minute access token; 12-hour rotating refresh.
+    edgeApiKey:
+      type: apiKey
+      in: header
+      name: X-Edge-Key
+      description: Per-node key (mTLS preferred). Grants insert-only access to inspection data for that node.
+
+  parameters:
+    From:
+      name: from
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive start (plant-local date)
+    To:
+      name: to
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive end (plant-local date)
+    LineFilter:
+      name: line
+      in: query
+      schema: { type: string }
+      description: Line code; restricted users only see lines in scope
+    SkuFilter:
+      name: sku
+      in: query
+      schema: { type: string }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      schema: { type: string }
+    InspectionId:
+      name: inspectionId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Sku:
+      name: sku
+      in: path
+      required: true
+      schema: { type: string }
+    CameraId:
+      name: cameraId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ModelId:
+      name: modelId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SnapshotId:
+      name: snapshotId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ProposalId:
+      name: proposalId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Authenticated but not permitted; line-scoped rows are never retrieved
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Not found or not visible
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ValidationFailed:
+      description: Semantically invalid
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    TooManyRequests:
+      description: Rate limited
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ModelUnavailable:
+      description: LLM unavailable; deterministic features still work
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string, description: Stable code — API-Specification.md §7 }
+        correlation_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+
+    Language:
+      type: string
+      enum: [th, ja, en]
+      default: th
+
+    Verdict:
+      type: string
+      enum: [PASS, FAIL, REVIEW, NO_READ]
+      description: NO_READ = quality gate failed, nothing judged. Deliberately distinct from PASS.
+
+    ModelStage:
+      type: string
+      enum: [candidate, shadow, active, retired]
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string, format: password }
+        mfa_code: { type: string }
+
+    TokenPair:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string, enum: [Bearer] }
+        expires_in: { type: integer }
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+        display_name: { type: string }
+        role: { type: string, enum: [viewer, inspector, engineer, manager, admin] }
+        lang: { $ref: '#/components/schemas/Language' }
+        line_scope:
+          type: array
+          items: { type: string }
+          description: Empty = all lines
+
+    QualityGate:
+      type: object
+      properties:
+        passed: { type: boolean }
+        reason: { type: [string, 'null'], enum: [BLUR, EXPOSURE, NO_PART, CALIBRATION_STALE, null] }
+        blur_variance: { type: [number, 'null'] }
+        exposure_mean: { type: [number, 'null'] }
+        threshold: { type: [number, 'null'] }
+
+    Detection:
+      type: object
+      properties:
+        class_name: { type: string }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        bbox: { type: object, additionalProperties: true }
+        area_mm2: { type: [number, 'null'] }
+
+    Measurement:
+      type: object
+      properties:
+        parameter: { type: string }
+        value: { type: number }
+        unit: { type: string }
+        usl: { type: [number, 'null'] }
+        lsl: { type: [number, 'null'] }
+        in_spec: { type: boolean }
+
+    RuleFired:
+      type: object
+      properties:
+        kind: { type: string }
+        class: { type: [string, 'null'] }
+        threshold: { type: [number, 'null'] }
+        verdict: { $ref: '#/components/schemas/Verdict' }
+
+    AnomalyResult:
+      type: object
+      properties:
+        score: { type: number }
+        threshold: { type: number }
+        flagged: { type: boolean, description: True escalates to REVIEW only, never FAIL }
+
+    InspectResult:
+      type: object
+      properties:
+        verdict: { $ref: '#/components/schemas/Verdict' }
+        quality_gate: { $ref: '#/components/schemas/QualityGate' }
+        detections:
+          type: array
+          items: { $ref: '#/components/schemas/Detection' }
+        measurements:
+          type: array
+          items: { $ref: '#/components/schemas/Measurement' }
+        rules_fired:
+          type: array
+          items: { $ref: '#/components/schemas/RuleFired' }
+        anomaly: { oneOf: [ { $ref: '#/components/schemas/AnomalyResult' }, { type: 'null' } ] }
+        ocr_text: { type: [string, 'null'] }
+        recipe_version: { type: integer }
+        model_version: { type: string }
+        latency_ms: { type: integer }
+        inspection_id: { type: [string, 'null'], format: uuid, description: Null when persist=false }
+
+    InspectionCreate:
+      type: object
+      required: [id, ts, line, verdict]
+      properties:
+        id: { type: string, format: uuid, description: Client-generated UUIDv7 — the dedup key }
+        ts: { type: string, format: date-time }
+        line: { type: string }
+        sku: { type: string }
+        station: { type: string }
+        lot: { type: string }
+        verdict: { $ref: '#/components/schemas/Verdict' }
+        model_version: { type: string }
+        recipe_version: { type: integer }
+        latency_ms: { type: integer }
+        ocr_text: { type: string }
+        image_sha256: { type: string }
+        source: { type: string, enum: [edge, server, mobile, manual], default: edge }
+        detections:
+          type: array
+          items: { $ref: '#/components/schemas/Detection' }
+        measurements:
+          type: array
+          items:
+            type: object
+            required: [parameter, value]
+            properties:
+              parameter: { type: string }
+              value: { type: number }
+              unit: { type: string, default: mm }
+              usl: { type: number }
+              lsl: { type: number }
+        anomaly: { $ref: '#/components/schemas/AnomalyResult' }
+
+    Inspection:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        line: { type: string }
+        sku: { type: [string, 'null'] }
+        station: { type: [string, 'null'] }
+        lot: { type: [string, 'null'] }
+        model_verdict: { $ref: '#/components/schemas/Verdict' }
+        effective_verdict: { $ref: '#/components/schemas/Verdict' }
+        overridden: { type: boolean }
+        model_version: { type: [string, 'null'] }
+        recipe_version: { type: [integer, 'null'] }
+        latency_ms: { type: [integer, 'null'] }
+        has_image: { type: boolean }
+
+    InspectionDetail:
+      allOf:
+        - $ref: '#/components/schemas/Inspection'
+        - type: object
+          properties:
+            detections:
+              type: array
+              items: { $ref: '#/components/schemas/Detection' }
+            measurements:
+              type: array
+              items: { $ref: '#/components/schemas/Measurement' }
+            anomaly: { oneOf: [ { $ref: '#/components/schemas/AnomalyResult' }, { type: 'null' } ] }
+            ocr_text: { type: [string, 'null'] }
+            image_url: { type: [string, 'null'] }
+            overlay_url: { type: [string, 'null'] }
+            heatmap_url: { type: [string, 'null'] }
+            override_history:
+              type: array
+              items:
+                type: object
+                properties:
+                  from: { $ref: '#/components/schemas/Verdict' }
+                  to: { $ref: '#/components/schemas/Verdict' }
+                  user: { type: string }
+                  reason_code: { type: string }
+                  note: { type: [string, 'null'] }
+                  at: { type: string, format: date-time }
+            claimed_by: { type: [string, 'null'] }
+            claim_expires_at: { type: [string, 'null'], format: date-time }
+
+    InspectionPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Inspection' }
+        next_cursor: { type: [string, 'null'] }
+        total_estimate: { type: [integer, 'null'] }
+
+    BatchResult:
+      type: object
+      properties:
+        accepted: { type: integer }
+        duplicate: { type: integer, description: Not an error — expected result of a healthy retry }
+        rejected: { type: integer }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              status: { type: string, enum: [accepted, duplicate, rejected] }
+              code: { type: string }
+              detail: { type: string }
+
+    RecipeRules:
+      type: object
+      description: |
+        Validated against the recipe-rules JSON Schema (DDS-01 §6.3). Rules are
+        evaluated in array order after the quality gate; any FAIL rule → FAIL;
+        detections between review_threshold and the rule threshold → REVIEW;
+        anomaly.flagged → REVIEW only.
+      required: [schema_version, rules]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        quality_gate:
+          type: object
+          properties:
+            min_blur_variance: { type: number }
+            exposure_range:
+              type: array
+              items: { type: number }
+              minItems: 2
+              maxItems: 2
+        rules:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [kind]
+            properties:
+              kind: { type: string, enum: [class_present, class_count, class_area, measurement, ocr_match] }
+            additionalProperties: true
+        conflict_policy: { type: string, enum: [review, fail], default: review }
+        anomaly:
+          type: object
+          properties:
+            threshold: { type: number }
+            action: { type: string, const: review }
+
+    Recipe:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        sku: { type: string }
+        version: { type: integer }
+        rules: { $ref: '#/components/schemas/RecipeRules' }
+        review_threshold: { type: number }
+        active_from: { type: string, format: date-time }
+        active_to: { type: [string, 'null'], format: date-time }
+        created_by: { type: [string, 'null'] }
+        reason: { type: [string, 'null'] }
+        etag: { type: string }
+
+    RecipeCreate:
+      type: object
+      required: [rules, review_threshold, reason]
+      properties:
+        rules: { $ref: '#/components/schemas/RecipeRules' }
+        review_threshold: { type: number, minimum: 0, maximum: 1 }
+        reason: { type: string, minLength: 5, description: Mandatory and audited }
+        active_from: { type: string, format: date-time, description: Defaults to now }
+
+    RecipeValidation:
+      type: object
+      properties:
+        schema_valid: { type: boolean }
+        sample_size: { type: integer }
+        transitions:
+          type: array
+          items:
+            type: object
+            properties:
+              from: { $ref: '#/components/schemas/Verdict' }
+              to: { $ref: '#/components/schemas/Verdict' }
+              count: { type: integer }
+        unchanged: { type: integer }
+        current_defect_rate_pct: { type: [number, 'null'] }
+        new_defect_rate_pct: { type: [number, 'null'] }
+        warnings:
+          type: array
+          items: { type: string }
+
+    Station:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        line: { type: string }
+        code: { type: string }
+        name: { type: string }
+        position: { type: [integer, 'null'] }
+        trigger_mode: { type: string, enum: [hardware, software, freerun] }
+        plc_io: { type: object, additionalProperties: true }
+        active: { type: boolean }
+        cameras:
+          type: array
+          items: { $ref: '#/components/schemas/Camera' }
+        node: { oneOf: [ { $ref: '#/components/schemas/EdgeNode' }, { type: 'null' } ] }
+
+    StationCreate:
+      type: object
+      required: [line, code, name]
+      properties:
+        line: { type: string }
+        code: { type: string }
+        name: { type: string }
+        position: { type: integer }
+        trigger_mode: { type: string, enum: [hardware, software, freerun], default: hardware }
+        plc_io: { type: object, additionalProperties: true }
+        active: { type: boolean, default: true }
+
+    Camera:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        line: { type: string }
+        station: { type: string }
+        model: { type: [string, 'null'] }
+        resolution: { type: [string, 'null'] }
+        node_code: { type: [string, 'null'] }
+        active: { type: boolean }
+        current_calibration: { oneOf: [ { $ref: '#/components/schemas/Calibration' }, { type: 'null' } ] }
+
+    CameraCreate:
+      type: object
+      required: [line, station]
+      properties:
+        line: { type: string }
+        station: { type: string }
+        model: { type: string }
+        resolution: { type: string }
+        node_code: { type: string }
+        serial: { type: string }
+
+    Calibration:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        camera_id: { type: string, format: uuid }
+        version: { type: integer }
+        method: { type: string, enum: [scale, intrinsics_scale, homography] }
+        px_per_mm: { type: [number, 'null'] }
+        hardware_fingerprint: { type: string }
+        target_type: { type: [string, 'null'] }
+        gauge_nominal_mm: { type: [number, 'null'] }
+        gauge_repeats: { type: [integer, 'null'] }
+        gauge_mean_mm: { type: [number, 'null'] }
+        gauge_sigma_mm: { type: [number, 'null'] }
+        gauge_max_err_mm: { type: [number, 'null'] }
+        tolerance_mm: { type: number }
+        valid:
+          type: boolean
+          description: Generated — true only when gauge verification exists and max error ≤ tolerance
+        performed_by: { type: [string, 'null'] }
+        performed_at: { type: string, format: date-time }
+        invalidated_at: { type: [string, 'null'], format: date-time }
+        invalidated_reason: { type: [string, 'null'] }
+
+    CalibrationCreate:
+      type: object
+      required: [method, hardware_fingerprint]
+      properties:
+        method: { type: string, enum: [scale, intrinsics_scale, homography] }
+        px_per_mm: { type: number }
+        intrinsics: { type: object, additionalProperties: true }
+        homography: { type: object, additionalProperties: true }
+        hardware_fingerprint: { type: string, description: "camera serial | lens id | mount id" }
+        target_type: { type: string }
+        tolerance_mm: { type: number, default: 0.2 }
+
+    ModelManifest:
+      type: object
+      required: [name, version, sha256, task, uri, class_map, trained_from]
+      properties:
+        name: { type: string }
+        version: { type: string }
+        sha256: { type: string }
+        task: { type: string, enum: [detection, segmentation, classification, ocr, anomaly, embedding] }
+        uri: { type: string }
+        input_size: { type: integer }
+        class_map: { type: object, additionalProperties: true }
+        metrics:
+          type: object
+          properties:
+            map50: { type: number }
+            recall_critical: { type: number }
+            false_alarm_rate: { type: number }
+            holdout_images: { type: integer }
+        trained_from: { type: string, description: Name of a frozen dataset snapshot }
+
+    Model:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        version: { type: string }
+        sha256: { type: string }
+        task: { type: string }
+        stage: { $ref: '#/components/schemas/ModelStage' }
+        class_map: { type: object, additionalProperties: true }
+        metrics: { type: object, additionalProperties: true }
+        trained_from: { type: [string, 'null'] }
+        promoted_by: { type: [string, 'null'] }
+        promoted_at: { type: [string, 'null'], format: date-time }
+        shadow_report:
+          type: [object, 'null']
+          properties:
+            frames_evaluated: { type: integer }
+            frames_required: { type: integer }
+            disagreement_pct: { type: number }
+            critical_recall_delta: { type: number }
+            by_class:
+              type: array
+              items:
+                type: object
+                properties:
+                  class_name: { type: string }
+                  agree: { type: integer }
+                  candidate_only: { type: integer }
+                  active_only: { type: integer }
+        promotion_gate:
+          type: object
+          properties:
+            shadow_complete: { type: boolean }
+            critical_recall_ok: { type: boolean }
+            eligible: { type: boolean }
+            reasons:
+              type: array
+              items: { type: string }
+
+    DriftPoint:
+      type: object
+      properties:
+        ts: { type: string, format: date-time }
+        camera_id: { type: string, format: uuid }
+        metric: { type: string }
+        value: { type: number }
+        baseline: { type: [number, 'null'] }
+        sigma: { type: [number, 'null'] }
+        alerted: { type: boolean }
+
+    DatasetSnapshot:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        purpose: { type: string }
+        label_version: { type: string }
+        class_map: { type: object, additionalProperties: true }
+        item_count: { type: integer }
+        class_distribution: { type: object, additionalProperties: { type: integer } }
+        frozen: { type: boolean }
+        frozen_at: { type: [string, 'null'], format: date-time }
+        export_format: { type: [string, 'null'] }
+        export_url: { type: [string, 'null'], description: Signed, short-lived }
+        export_sha256: { type: [string, 'null'] }
+        created_by: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+
+    StatsSummary:
+      type: object
+      properties:
+        period:
+          type: object
+          properties:
+            from: { type: string, format: date }
+            to: { type: string, format: date }
+        inspected: { type: integer }
+        judged: { type: integer, description: PASS + FAIL — the defect-rate denominator }
+        failed: { type: integer }
+        in_review: { type: integer }
+        no_read: { type: integer }
+        defect_rate_pct: { type: [number, 'null'], description: Null when nothing judged — never 0 }
+        baseline_pct: { type: [number, 'null'] }
+        change_pct: { type: [number, 'null'] }
+        significant: { type: boolean, description: Two-proportion z-test, alpha 0.05 }
+        p_value: { type: [number, 'null'] }
+        top_defect:
+          type: [object, 'null']
+          properties:
+            class_name: { type: string }
+            parts: { type: integer }
+            share_pct: { type: number }
+        worst_sku:
+          type: [object, 'null']
+          properties:
+            sku: { type: string }
+            defect_rate_pct: { type: number }
+        no_read_pct: { type: [number, 'null'], description: NO_READ share of all inspected — a lighting/camera health signal }
+
+    ParetoItem:
+      type: object
+      properties:
+        class_name: { type: string }
+        name: { type: string }
+        parts: { type: integer }
+        share_pct: { type: number }
+        cumulative_pct: { type: number }
+        is_critical: { type: boolean }
+
+    StationStat:
+      type: object
+      properties:
+        station: { type: string }
+        judged: { type: integer }
+        failed: { type: integer }
+        defect_rate_pct: { type: [number, 'null'] }
+        share_of_defects_pct: { type: [number, 'null'] }
+        no_read: { type: integer }
+
+    CorrelationResult:
+      type: object
+      properties:
+        note:
+          type: string
+          const: "Association only. A factor with a high defect share may also carry a high volume share; compare rate_pct, not share."
+        factors:
+          type: array
+          items:
+            type: object
+            properties:
+              factor: { type: string, enum: [shift, station, sku, lot] }
+              p_value: { type: [number, 'null'] }
+              effect_size: { type: [number, 'null'], description: Cramér's V }
+              levels:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    level: { type: string }
+                    judged: { type: integer }
+                    failed: { type: integer }
+                    rate_pct: { type: [number, 'null'] }
+                    share_of_defects_pct: { type: [number, 'null'] }
+                    share_of_volume_pct: { type: [number, 'null'] }
+
+    AgreementStat:
+      type: object
+      properties:
+        period_from: { type: string, format: date-time }
+        period_to: { type: string, format: date-time }
+        line: { type: [string, 'null'] }
+        sku: { type: [string, 'null'] }
+        class_name: { type: [string, 'null'] }
+        model_version: { type: [string, 'null'] }
+        reviewed: { type: integer }
+        agreed: { type: integer }
+        model_fail_human_pass: { type: integer, description: False alarms }
+        model_pass_human_fail: { type: integer, description: Escapes — the critical-recall signal }
+        agreement_pct: { type: [number, 'null'] }
+
+    Source:
+      type: object
+      properties:
+        kind: { type: string, enum: [tool, evidence, similar_period] }
+        tool: { type: string }
+        args: { type: object, additionalProperties: true }
+        row_count: { type: integer }
+        inspection_ids:
+          type: array
+          items: { type: string, format: uuid }
+
+    Narrative:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [shift, daily, adhoc] }
+        period_from: { type: string, format: date-time }
+        period_to: { type: string, format: date-time }
+        line: { type: [string, 'null'] }
+        lang: { $ref: '#/components/schemas/Language' }
+        significant: { type: [boolean, 'null'] }
+        text: { type: [string, 'null'], description: Null when withheld }
+        facts: { type: object, additionalProperties: true, description: The only numeric input the model received }
+        sources:
+          type: array
+          items: { $ref: '#/components/schemas/Source' }
+        grounding:
+          type: [object, 'null']
+          properties:
+            numbers_found:
+              type: array
+              items: { type: string }
+            all_matched: { type: boolean }
+            unmatched:
+              type: array
+              items: { type: string }
+        similar_periods:
+          type: array
+          items:
+            type: object
+            properties:
+              period_from: { type: string, format: date }
+              similarity: { type: number }
+              note: { type: [string, 'null'] }
+        withheld: { type: boolean }
+        withheld_reason: { type: [string, 'null'] }
+        run_id: { type: [string, 'null'], format: uuid }
+        model: { type: [string, 'null'] }
+        prompt_version: { type: [string, 'null'] }
+        delivered_at: { type: [string, 'null'], format: date-time }
+
+    AskRequest:
+      type: object
+      required: [question]
+      properties:
+        question: { type: string }
+        conversation_id: { type: string, format: uuid }
+        lang: { $ref: '#/components/schemas/Language' }
+        scope:
+          type: object
+          properties:
+            line: { type: string }
+            date_from: { type: string, format: date }
+            date_to: { type: string, format: date }
+
+    AskResponse:
+      type: object
+      properties:
+        run_id: { type: string, format: uuid }
+        conversation_id: { type: [string, 'null'], format: uuid }
+        outcome: { type: string, enum: [ok, partial, refused] }
+        partial_reason: { type: [string, 'null'] }
+        lang: { $ref: '#/components/schemas/Language' }
+        answer: { type: string }
+        charts:
+          type: array
+          items:
+            type: object
+            properties:
+              kind: { type: string, enum: [trend, pareto, station, histogram] }
+              data: { type: object, additionalProperties: true }
+        sources:
+          type: array
+          items: { $ref: '#/components/schemas/Source' }
+        grounding:
+          type: object
+          properties:
+            numbers_found:
+              type: array
+              items: { type: string }
+            all_matched: { type: boolean }
+        latency_ms: { type: integer }
+        model: { type: string }
+
+    AgentRunTrace:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        correlation_id: { type: [string, 'null'] }
+        kind: { type: string }
+        question: { type: [string, 'null'] }
+        answer: { type: [string, 'null'] }
+        model: { type: string }
+        prompt_version: { type: [string, 'null'] }
+        outcome: { type: string, enum: [ok, partial, refused, grounding_failed, error, budget_exceeded] }
+        facts: { type: [object, 'null'], additionalProperties: true }
+        grounding: { type: [object, 'null'], additionalProperties: true }
+        tokens_in: { type: [integer, 'null'] }
+        tokens_out: { type: [integer, 'null'] }
+        latency_ms: { type: [integer, 'null'] }
+        tool_calls:
+          type: array
+          items:
+            type: object
+            properties:
+              ordinal: { type: integer }
+              tool_name: { type: string }
+              args: { type: object, additionalProperties: true }
+              row_count: { type: [integer, 'null'] }
+              duration_ms: { type: [integer, 'null'] }
+              ok: { type: boolean }
+              error: { type: [string, 'null'] }
+
+    Tool:
+      type: object
+      properties:
+        name: { type: string }
+        kind: { type: string, enum: [read, write] }
+        risk: { type: string, enum: [low, medium, high] }
+        min_role: { type: string }
+        schema: { type: object, additionalProperties: true }
+        enabled: { type: boolean }
+
+    ActionProposal:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tool_name: { type: string }
+        args: { type: object, additionalProperties: true }
+        args_hash: { type: string }
+        risk: { type: string, enum: [low, medium, high] }
+        status: { type: string, enum: [pending, approved, denied, expired, executed, failed] }
+        expires_at: { type: string, format: date-time }
+        approver: { type: [string, 'null'] }
+        result: { type: [object, 'null'], additionalProperties: true }
+
+    EdgeConfig:
+      type: object
+      properties:
+        etag: { type: string }
+        recipes:
+          type: array
+          items:
+            type: object
+            properties:
+              sku: { type: string }
+              version: { type: integer }
+              rules: { $ref: '#/components/schemas/RecipeRules' }
+              review_threshold: { type: number }
+        calibrations:
+          type: array
+          items:
+            type: object
+            properties:
+              camera_id: { type: string, format: uuid }
+              version: { type: integer }
+              method: { type: string }
+              px_per_mm: { type: [number, 'null'] }
+              intrinsics: { type: [object, 'null'], additionalProperties: true }
+              hardware_fingerprint: { type: string }
+              valid: { type: boolean }
+        models:
+          type: array
+          items: { $ref: '#/components/schemas/ModelManifest' }
+        stations:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string }
+              trigger_mode: { type: string }
+              plc_io: { type: object, additionalProperties: true }
+        thresholds: { type: object, additionalProperties: true }
+        sync:
+          type: object
+          properties:
+            batch_size: { type: integer }
+            image_window: { type: [string, 'null'] }
+            bandwidth_kbps: { type: [integer, 'null'] }
+            pass_image_sample_rate: { type: number }
+
+    NodeHealth:
+      type: object
+      required: [node_code]
+      properties:
+        node_code: { type: string }
+        app_version: { type: string }
+        model_versions: { type: object, additionalProperties: true }
+        config_etag: { type: string }
+        cpu_pct: { type: number }
+        gpu_pct: { type: number }
+        mem_pct: { type: number }
+        disk_pct: { type: number }
+        temp_c: { type: number }
+        fps: { type: number }
+        camera_state: { type: string, enum: [ok, disconnected, frozen, no_trigger] }
+        calibration_valid: { type: boolean }
+        buffer_depth: { type: integer }
+        last_verdict_at: { type: [string, 'null'], format: date-time }
+
+    EdgeNode:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        node_code: { type: string }
+        line: { type: [string, 'null'] }
+        state: { type: string, enum: [provisioning, online, degraded, offline, retired] }
+        app_version: { type: [string, 'null'] }
+        model_versions: { type: object, additionalProperties: true }
+        config_etag: { type: [string, 'null'] }
+        buffer_depth: { type: integer }
+        last_heartbeat: { type: [string, 'null'], format: date-time }
+        heartbeat_stale: { type: boolean }
+        camera_state: { type: [string, 'null'] }
+
+    Job:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string }
+        status: { type: string, enum: [queued, running, succeeded, failed] }
+        progress_pct: { type: [number, 'null'] }
+        result_url: { type: [string, 'null'] }
+        error: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+
+    AuditEntry:
+      type: object
+      properties:
+        id: { type: integer }
+        ts: { type: string, format: date-time }
+        user: { type: [string, 'null'] }
+        correlation_id: { type: [string, 'null'] }
+        action: { type: string }
+        entity: { type: string }
+        entity_id: { type: [string, 'null'] }
+        before: { type: [object, 'null'], additionalProperties: true }
+        after: { type: [object, 'null'], additionalProperties: true }
+        ip: { type: [string, 'null'] }
+
+    Readiness:
+      type: object
+      properties:
+        status: { type: string, enum: [ready, degraded, not_ready] }
+        dependencies:
+          type: object
+          properties:
+            database: { type: string, enum: [ok, fail] }
+            object_store: { type: string, enum: [ok, fail] }
+            queue: { type: string, enum: [ok, fail] }
+            llm: { type: string, enum: [ok, unavailable] }
+            edge_nodes_online: { type: integer }
+            edge_nodes_total: { type: integer }
+        version: { type: string }
+        schema_version: { type: string }
