@@ -1917,7 +1917,7 @@ components:
       properties:
         score: { type: number }
         threshold: { type: number }
-        flagged: { type: boolean, description: True escalates to REVIEW only, never FAIL }
+        flagged: { type: boolean, description: "True escalates to REVIEW only, never FAIL" }
 
     InspectResult:
       type: object

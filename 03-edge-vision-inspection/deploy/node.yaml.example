@@ -1,0 +1,124 @@
+# /etc/edgeguard/node.yaml — EdgeGuard node identity and hardware description
+# OPS-03 §4.2 · ICD-03 IF-22. Written once at provisioning; changing it is a controlled change.
+#
+# RULES
+#   - NO SECRETS. Certificates, keys, the supervisor PIN hash and technician token hashes live in
+#     /etc/edgeguard/secrets/ (0600 root). This file may be attached to a support ticket.
+#   - This file describes the DEVICE. Recipes, thresholds, models and calibrations come from the config
+#     bundle (central or USB) and are cached in the store. Where the bundle also carries `stations[].plc_io`
+#     or `calibrations`, the bundle wins; `plc_io` here is the fallback for an air-gapped first boot.
+#   - The node computes hash(node.yaml) at provisioning and checks it at boot (SEC-E35).
+
+schema_version: 1
+
+node_code: L2-ST3                 # = mTLS certificate CN; unique per node; immutable
+plant: BKK-PLANT-1
+line: L2
+station: ST3
+description: "Line 2 molding outlet — top-side visual + flash measurement"
+lang: th                          # HMI default language: th | ja | en
+
+sync:
+  url: https://visionops.plant.local          # VisionOps (01) or FactoryBrain (00) — identical contract
+  auth: mtls                                  # mtls | key
+  ca_file: /etc/edgeguard/secrets/ca.crt      # pinned CA (SEC-E20)
+  cert_file: /etc/edgeguard/secrets/node.crt
+  key_file: /etc/edgeguard/secrets/node.key
+  # key_file: /etc/edgeguard/secrets/edge.key  # when auth: key
+  batch_max: 500
+  config_interval_s: 300
+  heartbeat_interval_s: 60
+  backoff_max_s: 300
+
+signing_pubkey: "ed25519:REPLACE_WITH_FLEET_SIGNING_PUBLIC_KEY"   # public key only; bundles must be signed when set
+
+hardware:
+  device: jetson-orin-nano-8gb     # jetson-orin-nano-8gb | x86-rtx | rpi5-hailo8l
+  runtime: tensorrt                # tensorrt | onnxruntime | hailo
+  precision: fp16                  # fp16 | int8 (int8 only after the recall gate, AI-02)
+  nvpmodel: 0                      # Jetson power mode (fixed; OPS-03 §2.3)
+  storage: /var/lib/edgeguard      # must be SSD (never SD) and encrypted (SEC-E45)
+
+camera:
+  - id: cam-top
+    type: gige                     # gige | usb3 | csi | v4l2 (lab)
+    serial: "REPLACE_WITH_CAMERA_SERIAL"   # part of the calibration hardware fingerprint
+    model: "acA1920-40gm"
+    iface: eth1                    # dedicated NIC for GigE; not the plant LAN
+    lens: "C-mount 12mm f/2.8 s/n REPLACE"
+    mount: "bracket rev B, 320 mm working distance"
+    pixel_format: Mono8
+    trigger_mode: hardware         # hardware | software | freerun
+    trigger_line: Line1
+    strobe_line: Line2             # ExposureActive → light controller (IF-18)
+    chunk_data: true               # frame id + timestamp + exposure (liveness evidence)
+    packet_size: 9000
+    quality_gate:                  # defaults; the recipe may override
+      min_blur_variance: 120.0
+      exposure_range: [40, 200]
+
+plc_io:                            # ICD-03 IF-03. Must match the panel drawing.
+  device: /dev/gpiochip0
+  output_type: pnp                 # pnp | npn (through the opto-isolated 24 V HAT)
+  variant: pulse                   # pulse | level
+  pulse_ms: 200
+  timeout_ms: 400                  # PLC-side timeout; documented here for commissioning
+  no_read_as: REVIEW               # REVIEW | FAIL — never PASS
+  signals:
+    TRIGGER:      { pin: 7,  gpio: 9,  dir: in,  edge: rising, debounce_ms: 2 }
+    PART_PRESENT: { pin: 11, gpio: 17, dir: in,  enabled: false }
+    READY:        { pin: 13, gpio: 27, dir: out }
+    PASS:         { pin: 15, gpio: 22, dir: out }
+    FAIL:         { pin: 16, gpio: 23, dir: out }
+    REVIEW:       { pin: 18, gpio: 24, dir: out }
+    FAULT:        { pin: 22, gpio: 25, dir: out, relay: nc }   # normally-closed: powered-off node = FAULT
+    HEARTBEAT:    { pin: 29, gpio: 5,  dir: out, hz: 1 }
+
+identity:                          # ICD-03 IF-15
+  source: barcode                  # barcode | plc_tag | manual
+  pattern: "^(?P<sku>[A-Z0-9-]+);(?P<lot>[A-Z0-9-]+)$"
+  device: /dev/input/by-id/usb-Datalogic_Scanner-event-kbd
+  fallback: fault                  # last | fault — what to do on an unknown SKU
+  # plc_tag:
+  #   protocol: modbus-tcp
+  #   host: 192.168.10.5
+  #   sku_register: 40010
+  #   lot_register: 40020
+
+mqtt:
+  enabled: false
+  # url: mqtts://mqtt.plant.local:8883
+  # topic: vision/L2/ST3/verdict
+
+hmi:
+  kiosk: true
+  lang: th
+  languages: [th, ja, en]
+  status_poll_hz: 2
+  history_rows: 50
+
+disk:
+  min_free_pct: 15                 # FR-13 reserve; PASS images stop below this
+  pass_image_sample_rate: 0.02     # overridden by the bundle's sync.pass_image_sample_rate when present
+  synced_record_retention_days: 30
+  synced_fail_image_retention_days: 90
+
+thermal:
+  warn_c: 75
+  fault_after_s: 60                # p95 over budget for this long → FAULT thermal:OVER_BUDGET
+
+models:
+  shadow_min_frames: 200           # AI-04
+  keep_versions: 2                 # active + previous (ADR-E07)
+
+lab:
+  software_trigger: false          # true ONLY in the edge-lab (TEST-03); enables POST /inspect
+
+ssh:
+  enabled: false                   # key-only when true; never password
+
+security:
+  pin_max_attempts_per_min: 5
+  pin_lockout_min: 15
+  override_rate_alarm_per_shift: 20
+  tamper_input: null               # e.g. { gpio: 6, active: low } when a case sensor is fitted

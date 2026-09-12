@@ -1,0 +1,32 @@
+{
+  "_comment": "Local store → IF-01 InspectionCreate payload → platform vision.* column. Verified by TEST-03 TC-006 against 01/api/openapi.yaml. 'derived' means computed at send time from the named columns.",
+  "contract": "InspectionCreate",
+  "contract_source": "../../01-factory-inspector-agent/api/openapi.yaml",
+  "fields": {
+    "id":             { "local": "inspection.id",              "platform": "vision.inspection.id" },
+    "ts":             { "local": "inspection.ts",              "platform": "vision.inspection.ts" },
+    "line":           { "local": "inspection.line",            "platform": "vision.inspection.line_id (resolved by code)" },
+    "sku":            { "local": "inspection.sku",             "platform": "vision.inspection.sku_id (resolved by code)" },
+    "station":        { "local": "inspection.station",         "platform": "vision.inspection.station" },
+    "lot":            { "local": "inspection.lot",             "platform": "vision.inspection.lot" },
+    "verdict":        { "local": "inspection.verdict",         "platform": "vision.inspection.verdict" },
+    "model_version":  { "local": "inspection.model_version",   "platform": "vision.inspection.model_id (resolved name:version)" },
+    "recipe_version": { "local": "inspection.recipe_version",  "platform": "vision.inspection.recipe_id (resolved sku+version)" },
+    "latency_ms":     { "local": "inspection.latency_ms",      "platform": "vision.inspection.latency_ms" },
+    "ocr_text":       { "local": "inspection.ocr_text",        "platform": "vision.inspection.ocr_text" },
+    "image_sha256":   { "local": "inspection.image_sha256",    "platform": "verified on /edge/images upload" },
+    "source":         { "local": "inspection.source",          "platform": "vision.inspection.source" },
+    "detections":     { "local": "detection.* (class_name, confidence, bbox_json→bbox, area_mm2)", "platform": "vision.detection" },
+    "measurements":   { "local": "measurement.* (parameter, value, unit, usl, lsl)",              "platform": "vision.measurement" },
+    "anomaly":        { "local": "anomaly_score.* (score, threshold, flagged)",                   "platform": "vision.anomaly_score" }
+  },
+  "local_only_never_sent": [
+    "inspection.created_at", "inspection.synced_at", "inspection.sync_attempts", "inspection.last_sync_error",
+    "inspection.image_synced_at", "inspection.image_path", "inspection.overlay_path", "inspection.heatmap_path",
+    "inspection.frame_id", "inspection.device_ts", "inspection.no_read_reason", "inspection.camera_id"
+  ],
+  "notes": {
+    "camera_id": "Sent implicitly: the platform resolves the camera from (node_code, station). Kept local for calibration lookup.",
+    "no_read_reason": "Not in the v1 contract; carried in the heartbeat quality-gate counters instead. Candidate for contract v1.1."
+  }
+}

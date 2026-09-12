@@ -1,0 +1,242 @@
+# EdgeGuard node — docker-compose.yml
+# OPS-03 §4. One device = one stack. Started by systemd (edgeguard.service), never by hand in production.
+#
+# Principles visible in this file:
+#   - No service publishes a LAN port. `api`/`hmi` listen on 127.0.0.1 and a Unix socket only (ADR-E10, SEC-E10).
+#   - Only `capture` gets the camera device; only `supervisor` gets the GPIO / I-O device (SEC-E44). Nothing is `privileged`.
+#   - `store` is the only container that mounts the database read-write (ADR-E02); every other mount of it is :ro.
+#   - Every service restarts always; the supervisor feeds the systemd watchdog (IF-24).
+#   - Network is not a dependency for anything to start (C-01).
+#
+# Profiles:  jetson (default on Orin — runtime nvidia) · x86 (nvidia via deploy.resources) · hailo (Pi 5 + Hailo-8L)
+# Lab rig:   docker compose -f docker-compose.yml -f lab-compose.override.yml up
+
+name: edgeguard
+
+x-common: &common
+  restart: always
+  logging:
+    driver: json-file
+    options: { max-size: "50m", max-file: "5" }
+  env_file: .env
+
+# Read-only mount of the store for every non-writer (ADR-E02)
+x-store-ro: &store-ro ${EDGEGUARD_DATA}/store:/var/lib/edgeguard/store:ro
+
+services:
+
+  # ------------------------------------------------------------ supervisor
+  supervisor:
+    <<: *common
+    image: ${EDGEGUARD_REGISTRY}/edgeguard-supervisor@${EDGEGUARD_DIGEST_SUPERVISOR}
+    container_name: eg-supervisor
+    networks: [node]
+    # Fault manager + PLC I/O + watchdog feeder. The ONLY container with the GPIO / I-O device.
+    devices:
+      - ${GPIO_DEVICE}:${GPIO_DEVICE}
+    group_add: ["${GPIO_GID}"]
+    volumes:
+      - /etc/edgeguard/node.yaml:/etc/edgeguard/node.yaml:ro
+      - run:/run/edgeguard
+      - *store-ro
+      - /run/systemd/notify:/run/systemd/notify        # sd_notify WATCHDOG=1
+    environment:
+      NODE_YAML: /etc/edgeguard/node.yaml
+      TZ: ${TZ}
+      NOTIFY_SOCKET: /run/systemd/notify
+      WATCHDOG_USEC: "30000000"
+    healthcheck:
+      test: ["CMD", "eg-supervisor", "health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    stop_grace_period: 5s
+
+  # --------------------------------------------------------------- capture
+  capture:
+    <<: *common
+    image: ${EDGEGUARD_REGISTRY}/edgeguard-capture@${EDGEGUARD_DIGEST_CAPTURE}
+    container_name: eg-capture
+    # The ONLY container with the camera device. GigE cameras need host networking on the camera NIC only —
+    # the GenTL producer binds ${CAMERA_IFACE}; nothing listens on the plant LAN.
+    devices:
+      - ${CAMERA_DEVICE}:${CAMERA_DEVICE}
+    network_mode: host
+    ipc: host                     # shared-memory frame ring (capture → inference)
+    volumes:
+      - /etc/edgeguard/node.yaml:/etc/edgeguard/node.yaml:ro
+      - run:/run/edgeguard
+      - ${EDGEGUARD_DATA}/calib:/var/lib/edgeguard/calib:ro
+      - /dev/shm:/dev/shm
+    environment:
+      NODE_YAML: /etc/edgeguard/node.yaml
+      TZ: ${TZ}
+      CAMERA_IFACE: ${CAMERA_IFACE}
+      FRAME_RING_SLOTS: "8"
+    depends_on: [supervisor]
+
+  # ------------------------------------------------------------- inference
+  inference:
+    <<: *common
+    image: ${EDGEGUARD_REGISTRY}/edgeguard-inference-${EDGEGUARD_RUNTIME}@${EDGEGUARD_DIGEST_INFERENCE}
+    container_name: eg-inference
+    networks: [node]
+    ipc: host
+    runtime: ${CONTAINER_RUNTIME}          # nvidia on Jetson/x86; runc on hailo
+    devices:
+      - ${ACCEL_DEVICE}:${ACCEL_DEVICE}    # /dev/nvhost-* (Jetson) · /dev/nvidia0 (x86) · /dev/hailo0 (Pi)
+    volumes:
+      - /etc/edgeguard/node.yaml:/etc/edgeguard/node.yaml:ro
+      - run:/run/edgeguard
+      - ${EDGEGUARD_DATA}/models:/var/lib/edgeguard/models:ro
+      - ${EDGEGUARD_DATA}/engines:/var/lib/edgeguard/engines        # engine cache (rw: built on device, ADR-E06)
+      - /dev/shm:/dev/shm
+    environment:
+      NODE_YAML: /etc/edgeguard/node.yaml
+      TZ: ${TZ}
+      EDGEGUARD_RUNTIME: ${EDGEGUARD_RUNTIME}
+      MODEL_PRECISION: ${MODEL_PRECISION}
+      SHADOW_MIN_FRAMES: ${SHADOW_MIN_FRAMES}
+    depends_on: [capture]
+
+  # ----------------------------------------------------------------- rules
+  rules:
+    <<: *common
+    image: ${EDGEGUARD_REGISTRY}/edgeguard-rules@${EDGEGUARD_DIGEST_RULES}
+    container_name: eg-rules
+    networks: [node]
+    volumes:
+      - /etc/edgeguard/node.yaml:/etc/edgeguard/node.yaml:ro
+      - run:/run/edgeguard
+      - *store-ro                                                  # reads config_cache / calibration_cache
+    depends_on: [inference, store]
+
+  # ----------------------------------------------------------------- store
+  store:
+    <<: *common
+    image: ${EDGEGUARD_REGISTRY}/edgeguard-store@${EDGEGUARD_DIGEST_STORE}
+    container_name: eg-store
+    networks: [node]
+    # Single writer (ADR-E02). Owns the SQLite file and the image cache; runs the disk policy.
+    volumes:
+      - /etc/edgeguard/node.yaml:/etc/edgeguard/node.yaml:ro
+      - run:/run/edgeguard
+      - ${EDGEGUARD_DATA}/store:/var/lib/edgeguard/store            # rw — the only one
+      - ${EDGEGUARD_DATA}/images:/var/lib/edgeguard/images
+      - ${EDGEGUARD_DATA}/models:/var/lib/edgeguard/models          # rw — sync hands downloads to store for verify + stage
+      - ${EDGEGUARD_DATA}/calib:/var/lib/edgeguard/calib
+    environment:
+      NODE_YAML: /etc/edgeguard/node.yaml
+      TZ: ${TZ}
+      SQLITE_SYNCHRONOUS: ${SQLITE_SYNCHRONOUS}
+      DISK_MIN_FREE_PCT: ${DISK_MIN_FREE_PCT}
+      PASS_IMAGE_SAMPLE_RATE: ${PASS_IMAGE_SAMPLE_RATE}
+    healthcheck:
+      test: ["CMD", "eg-store", "health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    depends_on: [supervisor]
+
+  # ------------------------------------------------------------------ sync
+  sync:
+    <<: *common
+    image: ${EDGEGUARD_REGISTRY}/edgeguard-sync@${EDGEGUARD_DIGEST_SYNC}
+    container_name: eg-sync
+    # The only container with outbound network. mTLS to the central; CA pinned (SEC-E20).
+    networks: [node, egress]
+    volumes:
+      - /etc/edgeguard/node.yaml:/etc/edgeguard/node.yaml:ro
+      - run:/run/edgeguard
+      - *store-ro
+      - ${EDGEGUARD_DATA}/images:/var/lib/edgeguard/images:ro
+      - ${EDGEGUARD_DATA}/inbox:/var/lib/edgeguard/inbox              # downloads land here; store verifies + moves
+      - /etc/edgeguard/secrets:/etc/edgeguard/secrets:ro              # ca.crt, node.crt, node.key (0600)
+    environment:
+      NODE_YAML: /etc/edgeguard/node.yaml
+      TZ: ${TZ}
+      SYNC_URL: ${SYNC_URL}
+      SYNC_AUTH: ${SYNC_AUTH}
+      SYNC_BATCH_MAX: ${SYNC_BATCH_MAX}
+      SYNC_CONFIG_INTERVAL_S: ${SYNC_CONFIG_INTERVAL_S}
+      SYNC_HEARTBEAT_INTERVAL_S: ${SYNC_HEARTBEAT_INTERVAL_S}
+      SYNC_BACKOFF_MAX_S: ${SYNC_BACKOFF_MAX_S}
+      MQTT_URL: ${MQTT_URL}
+    depends_on: [store]
+
+  # ------------------------------------------------------------------- api
+  api:
+    <<: *common
+    image: ${EDGEGUARD_REGISTRY}/edgeguard-api@${EDGEGUARD_DIGEST_API}
+    container_name: eg-api
+    # Loopback + Unix socket only. NO `ports:` — verified by TEST-03 TC-004 / TC-084.
+    network_mode: host
+    command: ["eg-api", "--bind", "127.0.0.1:${API_PORT}", "--socket", "/run/edgeguard/api.sock"]
+    volumes:
+      - /etc/edgeguard/node.yaml:/etc/edgeguard/node.yaml:ro
+      - run:/run/edgeguard
+      - *store-ro
+      - ${EDGEGUARD_DATA}/images:/var/lib/edgeguard/images:ro
+      - ${EDGEGUARD_DATA}/diag:/var/lib/edgeguard/diag
+      - /etc/edgeguard/secrets/pin.hash:/etc/edgeguard/secrets/pin.hash:ro
+      - /etc/edgeguard/secrets/tech.hash:/etc/edgeguard/secrets/tech.hash:ro
+    environment:
+      NODE_YAML: /etc/edgeguard/node.yaml
+      TZ: ${TZ}
+      API_PORT: ${API_PORT}
+      PIN_MAX_ATTEMPTS_PER_MIN: ${PIN_MAX_ATTEMPTS_PER_MIN}
+      PIN_LOCKOUT_MIN: ${PIN_LOCKOUT_MIN}
+      LAB_SOFTWARE_TRIGGER: ${LAB_SOFTWARE_TRIGGER}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${API_PORT}/api/v1/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    depends_on: [store]
+
+  # ------------------------------------------------------------------- hmi
+  hmi:
+    <<: *common
+    image: ${EDGEGUARD_REGISTRY}/edgeguard-hmi@${EDGEGUARD_DIGEST_HMI}
+    container_name: eg-hmi
+    networks: [node]
+    # Static kiosk app served on the Unix socket; the kiosk browser on the host opens it. No TCP listener at all.
+    command: ["eg-hmi", "--socket", "/run/edgeguard/hmi.sock", "--api-socket", "/run/edgeguard/api.sock"]
+    volumes:
+      - /etc/edgeguard/node.yaml:/etc/edgeguard/node.yaml:ro
+      - run:/run/edgeguard
+      - *store-ro
+    environment:
+      NODE_YAML: /etc/edgeguard/node.yaml
+      TZ: ${TZ}
+      HMI_LANG: ${HMI_LANG}
+    depends_on: [api]
+
+  # --------------------------------------------------------------- metrics
+  metrics:
+    <<: *common
+    image: ${EDGEGUARD_REGISTRY}/edgeguard-metrics@${EDGEGUARD_DIGEST_METRICS}
+    container_name: eg-metrics
+    # Exposes /metrics on 127.0.0.1 only; the fleet Prometheus scrapes through the sync channel (heartbeat) or a
+    # push gateway — never by connecting to the node (SAD-03 §5).
+    network_mode: host
+    command: ["eg-metrics", "--bind", "127.0.0.1:${METRICS_PORT}"]
+    volumes:
+      - /etc/edgeguard/node.yaml:/etc/edgeguard/node.yaml:ro
+      - run:/run/edgeguard
+      - *store-ro
+    environment:
+      NODE_YAML: /etc/edgeguard/node.yaml
+      TZ: ${TZ}
+      METRICS_PORT: ${METRICS_PORT}
+    depends_on: [store]
+
+volumes:
+  run:
+    driver: local
+    driver_opts: { type: tmpfs, device: tmpfs, o: "size=64m,mode=0750" }
+
+networks:
+  node:
+    internal: true          # no egress from any service except sync
+  egress: {}

@@ -1,0 +1,896 @@
+openapi: 3.1.0
+info:
+  title: EdgeGuard Node-Local API
+  version: 1.0.0
+  summary: The API an EdgeGuard node exposes on itself — to its HMI, to a technician, and to nothing else.
+  description: |
+    **Scope.** This document specifies two things:
+
+    1. **The node-local API** (`/api/v1`, bound to `127.0.0.1:8080` and a Unix
+       socket — never a LAN interface, ADR-E10). Consumers: the kiosk HMI on the
+       same device, a technician's laptop through an SSH tunnel, and the
+       `edgectl` CLI. It is a *read-mostly* surface: the only writes are the
+       PIN-gated override, fault clear, technician model/config actions and
+       lab-only software triggers.
+    2. **The client contracts the node consumes** (`x-client-contracts`,
+       schemas `InspectionCreate`, `BatchResult`, `EdgeConfig`, `NodeHealth`,
+       `ModelManifest`). These are **copied verbatim from
+       [API-01](../../01-factory-inspector-agent/api/openapi.yaml)** and
+       verified identical by TEST-03 TC-008. The node is a *client* of IF-01;
+       it does not serve those paths.
+
+    **Fail-safe contract.** `GET /status` is a *report* of the READY line, not
+    the source of it. The supervisor drives the PLC READY output from
+    `v_ready` (DDS-03 §5) directly; if this API is down, the line is unaffected
+    and the PLC still sees a truthful READY/FAULT signal.
+
+    **Authentication.** Three tiers (SEC-03 §6):
+    - *none* — read-only status/counters/records from localhost (the HMI);
+    - *technician token* (`X-Tech-Token`, issued at provisioning, rotated per
+      visit) — config/model/self-test/diagnostics/sync actions;
+    - *supervisor PIN* (`X-Override-Pin`) — override and fault clear; PIN is
+      checked against a salted hash in `/etc/edgeguard/secrets/pin.hash` (0600, never in `node.yaml`), rate-limited 5/min, every
+      attempt logged.
+
+    Errors are RFC 7807 `application/problem+json` with a stable `code`
+    (API-Specification.md §7). Timestamps are RFC 3339 with offset.
+  contact: { name: Suphot N. }
+  license: { name: Proprietary }
+  x-document-id: API-03-EdgeGuard
+  x-node-binding: "127.0.0.1:8080 and unix:///run/edgeguard/api.sock — LAN binding is a SEC-E10 violation"
+  x-client-contracts:
+    description: |
+      Contracts this node CONSUMES as a client. Paths and schemas are those of
+      API-01 / API-00 (identical IF-01). Behaviour is specified in ICD-03 §IF-01.
+    consumes:
+      - { path: "/edge/records:batch", method: post, schema_in: InspectionCreate, schema_out: BatchResult, batch_max: 500, priority: "FAIL/REVIEW first" }
+      - { path: "/edge/images", method: post, multipart: "inspection_id, kind, sha256, file", window: "sync.image_window", priority: "after records" }
+      - { path: "/edge/config", method: get, schema_out: EdgeConfig, etag: "If-None-Match / 304", interval_s: 300 }
+      - { path: "/edge/heartbeat", method: post, schema_in: NodeHealth, interval_s: 60 }
+    backoff: { initial_s: 1, factor: 2, max_s: 300, jitter: "±20 %" }
+    outcomes: { accepted: "mark synced", duplicate: "mark synced (healthy retry)", rejected: "keep, attempts+1, raise alarm after 5" }
+
+servers:
+  - url: http://127.0.0.1:8080/api/v1
+    description: Loopback only
+  - url: http+unix://%2Frun%2Fedgeguard%2Fapi.sock/api/v1
+    description: Unix socket (HMI container)
+
+tags:
+  - { name: status,      description: "READY/FAULT report, health, counters" }
+  - { name: records,     description: "Query the local store; override a verdict (PIN)" }
+  - { name: config,      description: "Config bundle, apply from file (air-gapped)" }
+  - { name: models,      description: "Model cache, activate, rollback" }
+  - { name: maintenance, description: "Self-test, calibration check, diagnostics, fault clear" }
+  - { name: sync,        description: Store-and-forward status and flush }
+  - { name: lab,         description: "Software trigger — lab and commissioning only" }
+
+paths:
+  # ------------------------------------------------------------------ status
+  /status:
+    get:
+      tags: [status]
+      summary: Node status — the human-readable form of the READY line
+      description: |
+        One call the HMI polls at 2 Hz. `ready` mirrors `v_ready.ready`;
+        `blocking` lists the fault sources holding READY low; `alarms` lists
+        non-blocking conditions. Always answers, even in FAULT.
+      operationId: getStatus
+      responses:
+        '200':
+          description: Status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeStatus' }
+              example:
+                node_code: L2-ST3
+                ready: true
+                blocking: []
+                alarms: [ "config:SYNC_TARGET_UNREACHABLE" ]
+                camera: { state: ok, fps: 9.8, last_frame_at: "2026-09-10T22:39:30+07:00", frozen: false }
+                models: { active: { name: defect-yolo11s, version: "1.0.0" }, previous: "0.9.2", shadow: { version: "1.1.0", frames: 84, disagree: 3 } }
+                calibration: { valid: true, fingerprint_ok: true, version: 3 }
+                buffer: { records: 150, overrides: 1, images: 16, image_bytes: 29500000, stuck: 0, oldest_unsynced_at: "2026-09-10T21:25:00+07:00" }
+                disk: { free_pct: 18, reserve_pct: 15, pass_images_enabled: true }
+                thermal: { temp_c: 61.5, throttled: false }
+                sync: { target: "https://visionops.plant.local", last_ok_at: "2026-09-10T21:24:12+07:00", state: unreachable }
+                last_verdict: { verdict: PASS, at: "2026-09-10T22:39:30+07:00", latency_ms: 74 }
+                versions: { app: "1.4.2", schema: 1, config_etag: "W/\"cfg-1187\"" }
+
+  /healthz:
+    get:
+      tags: [status]
+      summary: Liveness for the host watchdog
+      description: 200 when the API process and its read-only store connection work. The systemd watchdog also uses this (IF-24).
+      operationId: healthz
+      responses:
+        '200': { description: Alive, content: { application/json: { schema: { type: object, properties: { ok: { type: boolean, const: true }, uptime_s: { type: integer } } } } } }
+        '503': { description: Store unreadable, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /counters:
+    get:
+      tags: [status]
+      summary: Shift counters for the HMI
+      operationId: getCounters
+      parameters:
+        - { name: date,  in: query, schema: { type: string, format: date }, description: Default today (node local time) }
+        - { name: shift, in: query, schema: { type: string, enum: [A, B, C] } }
+      responses:
+        '200':
+          description: Counters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  date: { type: string, format: date }
+                  shift: { type: string }
+                  counts:
+                    type: object
+                    properties:
+                      PASS: { type: integer }
+                      FAIL: { type: integer }
+                      REVIEW: { type: integer }
+                      NO_READ: { type: integer }
+                  effective_counts:
+                    type: object
+                    description: With local overrides applied (v_effective_verdict)
+                    additionalProperties: { type: integer }
+                  no_read_reasons: { type: object, additionalProperties: { type: integer } }
+                  since: { type: string, format: date-time }
+
+  # ----------------------------------------------------------------- records
+  /records:
+    get:
+      tags: [records]
+      summary: Query the local store
+      description: Cursor-paginated over `inspection.ts DESC, id DESC`. Serves the HMI "last 50" strip and technician searches. Rows already purged are on the central, not here.
+      operationId: listRecords
+      parameters:
+        - { name: verdict, in: query, schema: { $ref: '#/components/schemas/Verdict' } }
+        - { name: synced,  in: query, schema: { type: boolean }, description: Filter by `synced_at IS NOT NULL` }
+        - { name: from,    in: query, schema: { type: string, format: date-time } }
+        - { name: to,      in: query, schema: { type: string, format: date-time } }
+        - { name: lot,     in: query, schema: { type: string } }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/LocalRecord' } }
+                  next_cursor: { type: [string, 'null'] }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /records/{id}:
+    get:
+      tags: [records]
+      summary: One record with detections, measurements, anomaly, overrides and evidence paths
+      operationId: getRecord
+      parameters: [ { $ref: '#/components/parameters/RecordId' } ]
+      responses:
+        '200':
+          description: Record
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LocalRecordDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /records/{id}/image:
+    get:
+      tags: [records]
+      summary: Cached evidence image (original, overlay or heatmap)
+      description: 404 if the image was sampled out (PASS) or already purged — the central has it if it was ever uploaded.
+      operationId: getRecordImage
+      parameters:
+        - $ref: '#/components/parameters/RecordId'
+        - { name: kind, in: query, schema: { type: string, enum: [original, overlay, heatmap], default: overlay } }
+      responses:
+        '200': { description: Image, content: { image/jpeg: { schema: { type: string, format: binary } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /records/{id}/override:
+    post:
+      tags: [records]
+      summary: Override a verdict at the node (supervisor PIN)
+      description: |
+        P-3 at the node. Requires `X-Override-Pin`. The override is written
+        locally with `user_ref` and `reason_code`, queued for sync as a
+        platform verdict override, and reflected in `effective_counts`. It
+        **does not re-pulse the PLC** — the part has already moved; the
+        override is a record correction and a training signal. Model
+        promotion is never local (ADR-E08).
+      operationId: overrideRecord
+      security: [ { supervisorPin: [] } ]
+      parameters:
+        - $ref: '#/components/parameters/RecordId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_verdict, reason_code, user_ref]
+              properties:
+                new_verdict: { type: string, enum: [PASS, FAIL, REVIEW] }
+                reason_code: { type: string, enum: [CONFIRMED_DEFECT, FALSE_ALARM, ACCEPTABLE_MARK, ESCAPE_FOUND, WRONG_CLASS, OTHER], description: Same enum as API-01 overrideVerdict and the local override CHECK }
+                user_ref: { type: string, description: Badge or PIN-holder id — never a free-text name }
+                label_class: { type: string, description: Defect class the human observed (for retraining) — forwarded to the central }
+                note: { type: string, maxLength: 200 }
+      responses:
+        '201':
+          description: Override recorded and queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Override' }
+        '401': { $ref: '#/components/responses/PinRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Same verdict as current effective verdict, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ------------------------------------------------------------------ config
+  /config:
+    get:
+      tags: [config]
+      summary: The validated config bundle currently applied, with ETag and source
+      operationId: getConfig
+      responses:
+        '200':
+          description: Config
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  etag: { type: string }
+                  source: { type: string, enum: [central, usb, node_yaml] }
+                  applied_at: { type: string, format: date-time }
+                  bundle: { $ref: '#/components/schemas/EdgeConfig' }
+                  ignored_fields: { type: array, items: { type: string }, description: "Unknown top-level keys tolerated (superset rule, SAD-03 §6)" }
+
+  /config/apply:
+    post:
+      tags: [config]
+      summary: Apply a config bundle from a local file (air-gapped provisioning)
+      description: |
+        Technician only. The file must be a signed `EdgeConfig` bundle
+        (IF-22). Validation: signature, JSON schema, every recipe class exists
+        in the referenced model's `class_map`. Apply is atomic — the previous
+        bundle stays if anything fails. Same code path as the central pull.
+      operationId: applyConfig
+      security: [ { techToken: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string, description: Absolute path under /media/usb or /var/lib/edgeguard/inbox }
+                verify_signature: { type: boolean, default: true }
+      responses:
+        '200':
+          description: Applied
+          content:
+            application/json:
+              schema: { type: object, properties: { etag: { type: string }, recipes: { type: integer }, models_referenced: { type: integer }, warnings: { type: array, items: { type: string } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422':
+          description: Bundle rejected — previous config still active
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: "urn:edgeguard:problem:config-invalid", title: Config rejected, status: 422, code: CONFIG_INVALID, detail: "Recipe MOLD-A12 v4 references class 'flash' not in defect-yolo11s:1.0.0 class_map" }
+
+  # ------------------------------------------------------------------ models
+  /models:
+    get:
+      tags: [models]
+      summary: Model cache with stages, verification and engine state
+      operationId: listModels
+      responses:
+        '200':
+          description: Models
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/CachedModel' } }
+                  engine_building: { type: [string, 'null'], description: "name:version currently compiling, if any" }
+
+  /models/{name}/{version}/activate:
+    post:
+      tags: [models]
+      summary: Promote a verified, shadow-tested model to active (technician, local)
+      description: |
+        Local promotion is allowed only for a model the central already
+        marked `active` in the config bundle — this endpoint *executes* a
+        promotion decided upstream (e.g. after an air-gapped bundle), it does
+        not decide one. Requires `verified_at` and, unless `skip_shadow`, a
+        completed shadow run (≥ `shadow_min_frames`, default 200). The
+        previous active becomes `previous`.
+      operationId: activateModel
+      security: [ { techToken: [] } ]
+      parameters:
+        - { name: name,    in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { skip_shadow: { type: boolean, default: false, description: Commissioning only; logged as a node_event } } }
+      responses:
+        '200': { description: Activated, content: { application/json: { schema: { $ref: '#/components/schemas/CachedModel' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Not verified, engine not built, or shadow incomplete
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: "urn:edgeguard:problem:model-not-ready", title: Model not ready, status: 409, code: SHADOW_INCOMPLETE, detail: "defect-yolo11s:1.1.0 shadow 84/200 frames" }
+
+  /models/{name}/rollback:
+    post:
+      tags: [models]
+      summary: Swap active and previous (technician, local, offline-capable)
+      description: Works with no central. Logged as a node_event and reported in the next heartbeat's `model_versions`. The central's config bundle may re-promote on the next pull unless the fleet admin also rolls back there (OPS RB-09).
+      operationId: rollbackModel
+      security: [ { techToken: [] } ]
+      parameters: [ { name: name, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200': { description: Rolled back, content: { application/json: { schema: { $ref: '#/components/schemas/CachedModel' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: No previous model cached, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # ------------------------------------------------------------- maintenance
+  /selftest:
+    post:
+      tags: [maintenance]
+      summary: Capture a frame, run the active model, evaluate the recipe, report
+      description: The same routine the supervisor runs at boot before raising READY. Does **not** pulse the PLC. Returns per-stage latency and quality-gate values so a technician can see *which* stage is unhealthy.
+      operationId: selfTest
+      security: [ { techToken: [] } ]
+      responses:
+        '200':
+          description: Report
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SelfTestReport' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { description: A blocking fault prevents the test (e.g. camera disconnected), content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /calibration/check:
+    post:
+      tags: [maintenance]
+      summary: Drive the gauge-block routine and compare to the cached calibration
+      description: Technician places the reference gauge; the node measures it with the active calibration and reports the error. Does not write a calibration — that is done on the central (VisionOps calibration flow) or via a signed bundle.
+      operationId: calibrationCheck
+      security: [ { techToken: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [camera_id, reference_mm]
+              properties:
+                camera_id: { type: string }
+                reference_mm: { type: number }
+      responses:
+        '200':
+          description: Result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  camera_id: { type: string }
+                  measured_mm: { type: number }
+                  error_pct: { type: number }
+                  tolerance_pct: { type: number }
+                  within_tolerance: { type: boolean }
+                  calibration_version: { type: integer }
+                  fingerprint_ok: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { description: No valid calibration cached for this camera, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /diagnostics/bundle:
+    post:
+      tags: [maintenance]
+      summary: Build a redacted diagnostics archive for support
+      description: Logs (last 24 h), node_event, status snapshot, model/config/calibration metadata, thermal history, last 20 FAIL overlays. **Excludes** everything under `/etc/edgeguard/secrets/` (certificates, keys, PIN and token hashes) and PASS images (SEC-E52). Written to `/var/lib/edgeguard/diag/`; copy off with `edgectl diag pull` or USB.
+      operationId: diagnosticsBundle
+      security: [ { techToken: [] } ]
+      responses:
+        '202':
+          description: Building
+          content:
+            application/json:
+              schema: { type: object, properties: { path: { type: string }, eta_s: { type: integer } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /fault/clear:
+    post:
+      tags: [maintenance]
+      summary: Acknowledge a latched fault (supervisor PIN)
+      description: |
+        Only **latched** faults need clearing (`STORE_RECOVERED`, `FROZEN_FEED`
+        after the camera recovers, `TAMPER`). Faults whose cause is still
+        present are re-raised immediately by the fault manager — clearing is
+        not overriding. Logged with `user_ref`.
+      operationId: clearFault
+      security: [ { supervisorPin: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source, user_ref]
+              properties:
+                source: { type: string, enum: [camera, model, calibration, disk, thermal, store, config, plc, security] }
+                user_ref: { type: string }
+      responses:
+        '200': { description: Cleared (or re-raised — see body), content: { application/json: { schema: { type: object, properties: { cleared: { type: boolean }, ready: { type: boolean }, still_active: { type: [string, 'null'] } } } } } }
+        '401': { $ref: '#/components/responses/PinRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # -------------------------------------------------------------------- sync
+  /sync/status:
+    get:
+      tags: [sync]
+      summary: Store-and-forward state
+      operationId: syncStatus
+      responses:
+        '200':
+          description: Sync status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SyncStatus' }
+
+  /sync/flush:
+    post:
+      tags: [sync]
+      summary: Try to drain the backlog now, ignoring backoff and the image window
+      description: Technician action after a network fix. Records first, then images. Returns immediately; progress in `/sync/status`.
+      operationId: syncFlush
+      security: [ { techToken: [] } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { include_images: { type: boolean, default: true } } }
+      responses:
+        '202': { description: Flush started, content: { application/json: { schema: { type: object, properties: { records_pending: { type: integer }, images_pending: { type: integer } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { description: Sync target unreachable right now, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # --------------------------------------------------------------------- lab
+  /inspect:
+    post:
+      tags: [lab]
+      summary: Software-trigger one inspection (lab / commissioning)
+      description: |
+        Disabled unless `node.yaml: lab.software_trigger: true`. Captures a
+        frame (or uses the supplied image), runs the full pipeline and — only
+        if `pulse_plc` — drives the I/O exactly as a hardware trigger would.
+        Used by TEST-03 TS-3 through the lab compose. In production this
+        returns 403 `LAB_DISABLED`.
+      operationId: softwareInspect
+      security: [ { techToken: [] } ]
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                image: { type: string, format: binary, description: Optional — replay a file instead of capturing }
+                sku: { type: string }
+                lot: { type: string }
+                pulse_plc: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Verdict with the record id (persisted, synced like any other)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LocalRecordDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Software trigger disabled on this node, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '503': { description: Blocking fault active, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+components:
+  securitySchemes:
+    techToken:
+      type: apiKey
+      in: header
+      name: X-Tech-Token
+      description: Technician token issued at provisioning (`edgectl token issue`), 24 h lifetime, stored hashed in /etc/edgeguard/secrets/tech.hash (0600). Loopback only.
+    supervisorPin:
+      type: apiKey
+      in: header
+      name: X-Override-Pin
+      description: 6-digit supervisor PIN; salted hash in /etc/edgeguard/secrets/pin.hash (0600); 5 attempts/min then 15 min lockout; every attempt is a node_event.
+
+  parameters:
+    RecordId: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    Cursor: { name: cursor, in: query, schema: { type: string }, description: Opaque; from the previous page's `next_cursor` }
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 50 } }
+    IdempotencyKey: { name: Idempotency-Key, in: header, schema: { type: string, maxLength: 64 }, description: Replays return the original 201 for 24 h }
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    Unauthorized:
+      description: Missing or invalid technician token
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' }, example: { type: "urn:edgeguard:problem:unauthorized", title: Unauthorized, status: 401, code: TECH_TOKEN_REQUIRED } } }
+    PinRequired:
+      description: Missing or wrong supervisor PIN (attempt logged)
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' }, example: { type: "urn:edgeguard:problem:pin", title: PIN required, status: 401, code: PIN_REQUIRED, detail: "3 attempts remaining" } } }
+    NotFound:
+      description: Not in the local store (may be on the central)
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    ValidationFailed:
+      description: Body fails validation
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    TooManyRequests:
+      description: PIN rate limit (5/min) or lockout (15 min)
+      headers: { Retry-After: { schema: { type: integer } } }
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' }, example: { type: "urn:edgeguard:problem:pin-lockout", title: Locked out, status: 429, code: PIN_LOCKED } } }
+
+  schemas:
+    # ------------------------------------------------ node-local schemas
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string, description: Stable code — API-Specification.md §7 }
+        correlation_id: { type: string }
+        errors:
+          type: array
+          items: { type: object, properties: { field: { type: string }, message: { type: string } } }
+
+    NodeStatus:
+      type: object
+      required: [node_code, ready, blocking, alarms]
+      properties:
+        node_code: { type: string }
+        ready: { type: boolean, description: Mirrors the PLC READY line (v_ready) }
+        blocking: { type: array, items: { type: string }, description: "`source:CODE` entries holding READY low" }
+        alarms: { type: array, items: { type: string }, description: Non-blocking conditions }
+        camera:
+          type: object
+          properties:
+            state: { type: string, enum: [ok, disconnected, frozen, no_trigger, replay_suspect] }
+            fps: { type: number }
+            last_frame_at: { type: [string, 'null'], format: date-time }
+            frozen: { type: boolean }
+        models:
+          type: object
+          properties:
+            active: { type: object, properties: { name: { type: string }, version: { type: string } } }
+            previous: { type: [string, 'null'] }
+            shadow: { type: [object, 'null'], properties: { version: { type: string }, frames: { type: integer }, disagree: { type: integer } } }
+        calibration: { type: object, properties: { valid: { type: boolean }, fingerprint_ok: { type: boolean }, version: { type: integer } } }
+        buffer:
+          type: object
+          description: v_backlog
+          properties:
+            records: { type: integer }
+            overrides: { type: integer }
+            images: { type: integer }
+            image_bytes: { type: integer }
+            stuck: { type: integer, description: Records with ≥ 5 failed attempts }
+            oldest_unsynced_at: { type: [string, 'null'], format: date-time }
+        disk: { type: object, properties: { free_pct: { type: number }, reserve_pct: { type: number }, pass_images_enabled: { type: boolean } } }
+        thermal: { type: object, properties: { temp_c: { type: number }, throttled: { type: boolean } } }
+        sync:
+          type: object
+          properties:
+            target: { type: string }
+            last_ok_at: { type: [string, 'null'], format: date-time }
+            state: { type: string, enum: [idle, sending, unreachable, rejected, disabled] }
+        last_verdict: { type: [object, 'null'], properties: { verdict: { $ref: '#/components/schemas/Verdict' }, at: { type: string, format: date-time }, latency_ms: { type: integer } } }
+        versions: { type: object, properties: { app: { type: string }, schema: { type: integer }, config_etag: { type: string } } }
+
+    LocalRecord:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        station: { type: string }
+        sku: { type: string }
+        lot: { type: string }
+        verdict: { $ref: '#/components/schemas/Verdict' }
+        effective_verdict: { $ref: '#/components/schemas/Verdict' }
+        no_read_reason: { type: [string, 'null'], enum: [BLUR, EXPOSURE, NO_PART, CALIBRATION_STALE, null] }
+        latency_ms: { type: integer }
+        model_version: { type: string }
+        synced_at: { type: [string, 'null'], format: date-time }
+        has_image: { type: boolean }
+
+    LocalRecordDetail:
+      allOf:
+        - $ref: '#/components/schemas/LocalRecord'
+        - type: object
+          properties:
+            line: { type: string }
+            camera_id: { type: string }
+            recipe_version: { type: integer }
+            ocr_text: { type: [string, 'null'] }
+            image_sha256: { type: [string, 'null'] }
+            frame_id: { type: [integer, 'null'] }
+            detections: { type: array, items: { $ref: '#/components/schemas/Detection' } }
+            measurements: { type: array, items: { $ref: '#/components/schemas/Measurement' } }
+            anomaly: { $ref: '#/components/schemas/AnomalyResult' }
+            overrides: { type: array, items: { $ref: '#/components/schemas/Override' } }
+            sync: { type: object, properties: { attempts: { type: integer }, last_error: { type: [string, 'null'] }, image_synced_at: { type: [string, 'null'], format: date-time } } }
+
+    Override:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        inspection_id: { type: string, format: uuid }
+        old_verdict: { $ref: '#/components/schemas/Verdict' }
+        new_verdict: { $ref: '#/components/schemas/Verdict' }
+        reason_code: { type: string }
+        user_ref: { type: string }
+        note: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        synced_at: { type: [string, 'null'], format: date-time }
+
+    CachedModel:
+      type: object
+      properties:
+        name: { type: string }
+        version: { type: string }
+        task: { type: string }
+        sha256: { type: string }
+        stage: { type: string, enum: [downloaded, shadow, active, previous, failed] }
+        verified_at: { type: [string, 'null'], format: date-time }
+        engine: { type: object, properties: { runtime: { type: string, enum: [onnxruntime, tensorrt, hailo] }, key: { type: string }, built_at: { type: [string, 'null'], format: date-time }, state: { type: string, enum: [none, building, ready, failed] } } }
+        shadow: { type: [object, 'null'], properties: { frames: { type: integer }, disagree: { type: integer }, min_frames: { type: integer } } }
+        activated_at: { type: [string, 'null'], format: date-time }
+
+    SelfTestReport:
+      type: object
+      properties:
+        passed: { type: boolean }
+        stages:
+          type: array
+          items:
+            type: object
+            properties:
+              stage: { type: string, enum: [capture, quality_gate, preprocess, inference, rules, store] }
+              ok: { type: boolean }
+              latency_ms: { type: number }
+              detail: { type: string }
+        quality_gate: { type: object, properties: { blur_variance: { type: number }, exposure_mean: { type: number }, within_range: { type: boolean } } }
+        verdict: { $ref: '#/components/schemas/Verdict' }
+        model: { type: string }
+        total_latency_ms: { type: number }
+        budget_ms: { type: integer }
+
+    SyncStatus:
+      type: object
+      properties:
+        target: { type: string }
+        state: { type: string, enum: [idle, sending, unreachable, rejected, disabled] }
+        last_ok_at: { type: [string, 'null'], format: date-time }
+        last_error: { type: [string, 'null'] }
+        next_attempt_at: { type: [string, 'null'], format: date-time }
+        backoff_s: { type: integer }
+        backlog: { type: object, properties: { records: { type: integer }, overrides: { type: integer }, images: { type: integer }, image_bytes: { type: integer }, stuck: { type: integer } } }
+        image_window: { type: object, properties: { window: { type: [string, 'null'] }, open_now: { type: boolean }, bandwidth_kbps: { type: [integer, 'null'] } } }
+        last_batch: { type: [object, 'null'], properties: { at: { type: string, format: date-time }, accepted: { type: integer }, duplicate: { type: integer }, rejected: { type: integer } } }
+        config: { type: object, properties: { etag: { type: string }, last_pull_at: { type: [string, 'null'], format: date-time } } }
+        heartbeat: { type: object, properties: { last_sent_at: { type: [string, 'null'], format: date-time }, last_ok: { type: boolean } } }
+
+    # ------------------------------------------------ client contracts (verbatim from API-01)
+    # TEST-03 TC-008 asserts these five schemas plus Verdict, Detection, Measurement,
+    # AnomalyResult and RecipeRules are byte-for-byte identical to API-01.
+    Verdict:
+      type: string
+      enum: [PASS, FAIL, REVIEW, NO_READ]
+      description: NO_READ = quality gate failed, nothing judged. Deliberately distinct from PASS.
+
+    Detection:
+      type: object
+      properties:
+        class_name: { type: string }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        bbox: { type: object, additionalProperties: true }
+        area_mm2: { type: [number, 'null'] }
+
+    Measurement:
+      type: object
+      properties:
+        parameter: { type: string }
+        value: { type: number }
+        unit: { type: string }
+        usl: { type: [number, 'null'] }
+        lsl: { type: [number, 'null'] }
+        in_spec: { type: boolean }
+
+    AnomalyResult:
+      type: object
+      properties:
+        score: { type: number }
+        threshold: { type: number }
+        flagged: { type: boolean, description: "True escalates to REVIEW only, never FAIL" }
+
+    RecipeRules:
+      type: object
+      description: |
+        Validated against the recipe-rules JSON Schema (DDS-01 §6.3). Rules are
+        evaluated in array order after the quality gate; any FAIL rule → FAIL;
+        detections between review_threshold and the rule threshold → REVIEW;
+        anomaly.flagged → REVIEW only.
+      required: [schema_version, rules]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        quality_gate:
+          type: object
+          properties:
+            min_blur_variance: { type: number }
+            exposure_range: { type: array, items: { type: number }, minItems: 2, maxItems: 2 }
+        rules:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [kind]
+            properties:
+              kind: { type: string, enum: [class_present, class_count, class_area, measurement, ocr_match] }
+            additionalProperties: true
+        conflict_policy: { type: string, enum: [review, fail], default: review }
+        anomaly:
+          type: object
+          properties:
+            threshold: { type: number }
+            action: { type: string, const: review }
+
+    InspectionCreate:
+      type: object
+      required: [id, ts, line, verdict]
+      properties:
+        id: { type: string, format: uuid, description: Client-generated UUIDv7 — the dedup key }
+        ts: { type: string, format: date-time }
+        line: { type: string }
+        sku: { type: string }
+        station: { type: string }
+        lot: { type: string }
+        verdict: { $ref: '#/components/schemas/Verdict' }
+        model_version: { type: string }
+        recipe_version: { type: integer }
+        latency_ms: { type: integer }
+        ocr_text: { type: string }
+        image_sha256: { type: string }
+        source: { type: string, enum: [edge, server, mobile, manual], default: edge }
+        detections: { type: array, items: { $ref: '#/components/schemas/Detection' } }
+        measurements:
+          type: array
+          items:
+            type: object
+            required: [parameter, value]
+            properties:
+              parameter: { type: string }
+              value: { type: number }
+              unit: { type: string, default: mm }
+              usl: { type: number }
+              lsl: { type: number }
+        anomaly: { $ref: '#/components/schemas/AnomalyResult' }
+
+    BatchResult:
+      type: object
+      properties:
+        accepted: { type: integer }
+        duplicate: { type: integer, description: Not an error — expected result of a healthy retry }
+        rejected: { type: integer }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              status: { type: string, enum: [accepted, duplicate, rejected] }
+              code: { type: string }
+              detail: { type: string }
+
+    NodeHealth:
+      type: object
+      required: [node_code]
+      properties:
+        node_code: { type: string }
+        app_version: { type: string }
+        model_versions: { type: object, additionalProperties: true }
+        config_etag: { type: string }
+        cpu_pct: { type: number }
+        gpu_pct: { type: number }
+        mem_pct: { type: number }
+        disk_pct: { type: number }
+        temp_c: { type: number }
+        fps: { type: number }
+        camera_state: { type: string, enum: [ok, disconnected, frozen, no_trigger] }
+        calibration_valid: { type: boolean }
+        buffer_depth: { type: integer }
+        last_verdict_at: { type: [string, 'null'], format: date-time }
+
+    ModelManifest:
+      type: object
+      required: [name, version, sha256, task, uri, class_map, trained_from]
+      properties:
+        name: { type: string }
+        version: { type: string }
+        sha256: { type: string }
+        task: { type: string, enum: [detection, segmentation, classification, ocr, anomaly, embedding] }
+        uri: { type: string }
+        input_size: { type: integer }
+        class_map: { type: object, additionalProperties: true }
+        metrics:
+          type: object
+          properties:
+            map50: { type: number }
+            recall_critical: { type: number }
+            false_alarm_rate: { type: number }
+            holdout_images: { type: integer }
+        trained_from: { type: string, description: Name of a frozen dataset snapshot }
+
+    EdgeConfig:
+      type: object
+      properties:
+        etag: { type: string }
+        recipes:
+          type: array
+          items:
+            type: object
+            properties:
+              sku: { type: string }
+              version: { type: integer }
+              rules: { $ref: '#/components/schemas/RecipeRules' }
+              review_threshold: { type: number }
+        calibrations:
+          type: array
+          items:
+            type: object
+            properties:
+              camera_id: { type: string, format: uuid }
+              version: { type: integer }
+              method: { type: string }
+              px_per_mm: { type: [number, 'null'] }
+              intrinsics: { type: [object, 'null'], additionalProperties: true }
+              hardware_fingerprint: { type: string }
+              valid: { type: boolean }
+        models:
+          type: array
+          items: { $ref: '#/components/schemas/ModelManifest' }
+        stations:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string }
+              trigger_mode: { type: string }
+              plc_io: { type: object, additionalProperties: true }
+        thresholds: { type: object, additionalProperties: true }
+        sync:
+          type: object
+          properties:
+            batch_size: { type: integer }
+            image_window: { type: [string, 'null'] }
+            bandwidth_kbps: { type: [integer, 'null'] }
+            pass_image_sample_rate: { type: number }

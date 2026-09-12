@@ -1,0 +1,86 @@
+# EdgeGuard edge-lab override — hardware-in-the-loop without the hardware.
+# TEST-03 §1.1. Usage:  docker compose -f docker-compose.yml -f lab-compose.override.yml up
+#
+# What it changes:
+#   - camera:   `camera-replay` feeds a folder of frames into a v4l2loopback device; `capture` opens it as V4L2.
+#   - PLC:      `plc-sim` drives TRIGGER on a gpio-mockup chip and records READY/PASS/FAIL/REVIEW/FAULT with timestamps
+#               (the "logic analyser" for TC-021, TC-025, TC-029).
+#   - central:  `sync` points at the VisionOps (01) stack on the lab network (SYNC_URL from .env, e.g. https://visionops.lab).
+#   - lab flag: LAB_SOFTWARE_TRIGGER=true so `POST /inspect` works (TC-011). NEVER set in production.
+#   - power:    `power-relay` exposes a tiny HTTP control for the scripted supply relay used by TC-044 (a USB relay board).
+#
+# Nothing here publishes the node API to the LAN either — technicians reach it through `ssh -L 8080:127.0.0.1:8080`.
+
+services:
+
+  capture:
+    devices:
+      - /dev/video10:/dev/video10          # v4l2loopback target written by camera-replay
+    environment:
+      CAMERA_OVERRIDE_TYPE: v4l2
+      CAMERA_OVERRIDE_DEVICE: /dev/video10
+      CAMERA_IFACE: ""                     # no GigE NIC in the lab
+    depends_on: [supervisor, camera-replay]
+
+  supervisor:
+    devices:
+      - /dev/gpiochip1:/dev/gpiochip1      # gpio-mockup chip shared with plc-sim
+    environment:
+      GPIO_CHIP_OVERRIDE: /dev/gpiochip1
+
+  api:
+    environment:
+      LAB_SOFTWARE_TRIGGER: "true"
+
+  sync:
+    environment:
+      SYNC_URL: ${LAB_SYNC_URL}
+      SYNC_CA_OVERRIDE: /etc/edgeguard/secrets/lab-ca.crt
+
+  # ---------------------------------------------------------- camera replay
+  camera-replay:
+    image: ${EDGEGUARD_REGISTRY}/edgeguard-lab-camera-replay:${LAB_TOOLS_TAG}
+    container_name: eg-lab-camera
+    restart: unless-stopped
+    devices:
+      - /dev/video10:/dev/video10
+    volumes:
+      - ${LAB_FRAMES_DIR}:/frames:ro
+    environment:
+      REPLAY_DIR: /frames
+      REPLAY_MODE: ${LAB_REPLAY_MODE}          # triggered | freerun | frozen | replay-regress
+      REPLAY_FPS: ${LAB_REPLAY_FPS}
+      TRIGGER_SOCKET: /run/edgeguard/lab-trigger.sock
+    networks: [node]
+
+  # ----------------------------------------------------------- PLC simulator
+  plc-sim:
+    image: ${EDGEGUARD_REGISTRY}/edgeguard-lab-plc-sim:${LAB_TOOLS_TAG}
+    container_name: eg-lab-plc
+    restart: unless-stopped
+    devices:
+      - /dev/gpiochip1:/dev/gpiochip1
+    environment:
+      PLC_TRIGGER_HZ: ${LAB_TRIGGER_HZ}
+      PLC_TIMEOUT_MS: "400"
+      PLC_VARIANT: pulse                       # pulse | level
+      PLC_LOG: /var/lib/edgeguard/lab/plc-trace.jsonl
+      TRIGGER_SOCKET: /run/edgeguard/lab-trigger.sock
+    volumes:
+      - run:/run/edgeguard
+      - ${EDGEGUARD_DATA}/lab:/var/lib/edgeguard/lab
+    networks: [node]
+
+  # -------------------------------------------------------------- power relay
+  power-relay:
+    image: ${EDGEGUARD_REGISTRY}/edgeguard-lab-power-relay:${LAB_TOOLS_TAG}
+    container_name: eg-lab-power
+    restart: unless-stopped
+    devices:
+      - ${LAB_RELAY_DEVICE}:${LAB_RELAY_DEVICE}
+    environment:
+      RELAY_DEVICE: ${LAB_RELAY_DEVICE}
+      RELAY_CONTROL_SOCKET: /run/edgeguard/lab-power.sock
+    volumes:
+      - run:/run/edgeguard
+    networks: [node]
