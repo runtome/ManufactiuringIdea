@@ -1,0 +1,1973 @@
+openapi: 3.1.0
+
+info:
+  title: ShiftBrief — Production AI Analyst API
+  version: 1.0.0
+  summary: Daily production file → deterministic facts → grounded brief
+  description: |
+    REST API for ShiftBrief (SRS-02): file intake with validation and
+    quarantine, a deterministic hashed facts object per date, a grounded
+    LLM brief delivered to Discord/dashboard/PPTX, and a question-answering
+    agent over typed tools with an optional, flagged text-to-SQL path.
+
+    Companion documents:
+      * [SRS-02](../SRS-ShiftBrief-Production-AI-Analyst.md)
+      * [SAD-02](../docs/SAD-ShiftBrief-Software-Architecture.md)
+      * [DDS-02](../docs/DDS-ShiftBrief-Database-Design.md)
+      * [API-Specification.md](./API-Specification.md) — conventions, error catalogue
+      * [ICD-02](../docs/ICD-ShiftBrief-Interface-Control.md)
+
+    ## Standalone and platform mode
+    This is the standalone surface. In platform mode `/auth/*` and `/admin/*`
+    collapse into the FactoryBrain platform's, `/ingest/*` and `/kpi/*`
+    become the platform's implementations, and `/facts`, `/brief`, `/ask`
+    mount unchanged (API-Specification.md §11).
+
+    ## Three guarantees
+    1. **Facts are deterministic and hashed.** `GET /facts` returns the stored
+       object with its SHA-256; regeneration recomputes and must match, or
+       reports `FACTS_STALE`.
+    2. **No invented numbers.** The LLM receives only the facts object. Every
+       number in a brief is post-checked against it; an ungrounded brief is
+       withheld (`422 GROUNDING_FAILED`) and stores no text.
+    3. **Files are never modified; corrections are linked.** Re-ingest is
+       idempotent; a corrected file yields a new facts version and a brief
+       with `revised_of`, never an overwrite.
+
+    All errors are RFC 7807 `application/problem+json`.
+  contact:
+    name: ShiftBrief owner
+    email: shiftbrief@factorybrain.local
+  license:
+    name: Proprietary — internal use
+
+servers:
+  - url: https://shiftbrief.local/api/v1
+    description: Standalone on-premise / VPS deployment
+  - url: https://factorybrain.local/api/v1
+    description: Platform mode (mounted under FactoryBrain)
+  - url: http://localhost:8000/api/v1
+    description: Local development
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: auth
+  - name: ingest
+    description: File intake, batches, quarantine
+  - name: sources
+    description: Intake sources, versioned column mappings, arrival expectations
+  - name: facts
+    description: The deterministic facts object per date
+  - name: brief
+    description: Grounded briefs, revisions, delivery
+  - name: kpi
+    description: Aggregates, Pareto, trend, heatmap, OEE, significance
+  - name: ask
+    description: Question answering over typed tools (text-to-SQL behind a flag)
+  - name: export
+    description: PPTX / PDF generation
+  - name: admin
+
+paths:
+
+  # ------------------------------------------------------------------ auth
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Exchange credentials for an access token
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: Rotate a refresh token
+      operationId: refreshToken
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        '200':
+          description: Refreshed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: Current user, role and line scope
+      operationId: getCurrentUser
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---------------------------------------------------------------- ingest
+  /ingest/production:
+    post:
+      tags: [ingest]
+      summary: Upload a production file
+      description: |
+        Accepts CSV or XLSX (≤ `INGEST_MAX_FILE_MB`). The file is hashed
+        first: an identical file returns `409` with the existing batch.
+        Validation runs before commit; a batch whose invalid-row share exceeds
+        5 % is **rejected in full** (`status: rejected`, nothing written).
+        A header that does not match the source's mapping fingerprint is
+        **held** (`MAPPING_DRIFT`) rather than guessed.
+
+        Processing is asynchronous: poll `GET /ingest/batches/{batchId}`.
+      operationId: ingestProductionFile
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, source]
+              properties:
+                file: { type: string, format: binary }
+                source: { type: string, description: Source code selecting the mapping }
+      responses:
+        '202':
+          description: Accepted for processing
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestBatch' }
+        '409':
+          description: Identical file already ingested; existing batch returned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestBatch' }
+        '413':
+          description: File too large
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /ingest/batches:
+    get:
+      tags: [ingest]
+      summary: Batch history
+      operationId: listIngestBatches
+      parameters:
+        - name: source
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, enum: [running, succeeded, failed, rejected] }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Batches
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/IngestBatch' }
+                  next_cursor: { type: [string, 'null'] }
+
+  /ingest/batches/{batchId}:
+    get:
+      tags: [ingest]
+      summary: Batch detail with quarantined rows and disposition
+      operationId: getIngestBatch
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+      responses:
+        '200':
+          description: Batch detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestBatchDetail' }
+              example:
+                id: 00000000-0000-7000-8000-000000000702
+                source: mes_daily
+                filename: production_2026-09-11_bad.csv
+                sha256: "2222…"
+                status: rejected
+                disposition: rejected
+                rows_total: 24
+                rows_ok: 0
+                rows_quarantined: 3
+                reject_reason: "3 of 24 rows invalid (12.5 %) exceeds the 5 % threshold; nothing committed"
+                dates_covered: { from: '2026-09-11', to: '2026-09-11' }
+                quarantined:
+                  - { row_no: 3,  reason: "row 3: Output Qty (-5) must be >= 0" }
+                  - { row_no: 9,  reason: "row 9: Shift \"C\" is not defined in the shift calendar for 2026-09-11" }
+                  - { row_no: 17, reason: "row 17: Item Code \"XYZ-1\" is not a known SKU" }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /ingest/batches/{batchId}/quarantine:
+    get:
+      tags: [ingest]
+      summary: Quarantined rows with raw content and reasons
+      operationId: getQuarantine
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/QuarantineRow' }
+                  next_cursor: { type: [string, 'null'] }
+
+  /ingest/batches/{batchId}/archive:
+    get:
+      tags: [ingest]
+      summary: Signed URL for the archived original file
+      description: The original is immutable; the URL is short-lived and the access is audited.
+      operationId: getBatchArchive
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+      responses:
+        '200':
+          description: Signed URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url: { type: string }
+                  sha256: { type: string }
+                  expires_at: { type: string, format: date-time }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /ingest/batches/{batchId}/release:
+    post:
+      tags: [ingest]
+      summary: Re-process a batch held for mapping drift after the mapping was updated
+      operationId: releaseHeldBatch
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+      responses:
+        '202':
+          description: Re-queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestBatch' }
+        '409':
+          description: Batch is not held, or the active mapping still does not match
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  # --------------------------------------------------------------- sources
+  /sources:
+    get:
+      tags: [sources]
+      summary: Intake sources with active mapping version and arrival status
+      operationId: listSources
+      responses:
+        '200':
+          description: Sources
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Source' }
+    post:
+      tags: [sources]
+      summary: Create a source
+      operationId: createSource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SourceCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Source' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /sources/{sourceCode}/mappings:
+    get:
+      tags: [sources]
+      summary: Mapping version history
+      operationId: listMappings
+      parameters:
+        - $ref: '#/components/parameters/SourceCode'
+      responses:
+        '200':
+          description: Versions, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Mapping' }
+    post:
+      tags: [sources]
+      summary: Create a new mapping version
+      description: |
+        Role `engineer`+. Never edits in place. The YAML is validated against
+        the mapping schema (DDS-02 §6); the header fingerprint is computed
+        from the `from` names. A `reason` is mandatory and audited. Batches
+        held for drift can then be released.
+      operationId: createMapping
+      parameters:
+        - $ref: '#/components/parameters/SourceCode'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mapping_yaml, reason]
+              properties:
+                mapping_yaml: { type: string }
+                reason: { type: string, minLength: 5 }
+      responses:
+        '201':
+          description: New version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Mapping' }
+        '422':
+          description: YAML fails the mapping schema
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /sources/{sourceCode}/mappings/validate:
+    post:
+      tags: [sources]
+      summary: Dry-run a mapping against a sample file
+      description: Parses the sample with the proposed mapping and reports rows that would quarantine, without storing anything.
+      operationId: validateMapping
+      parameters:
+        - $ref: '#/components/parameters/SourceCode'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [mapping_yaml, sample]
+              properties:
+                mapping_yaml: { type: string }
+                sample: { type: string, format: binary }
+      responses:
+        '200':
+          description: Dry-run result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MappingValidation' }
+
+  /sources/{sourceCode}/expectation:
+    put:
+      tags: [sources]
+      summary: Set when a file is expected
+      operationId: setExpectation
+      parameters:
+        - $ref: '#/components/parameters/SourceCode'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FileExpectation' }
+      responses:
+        '200':
+          description: Saved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileExpectation' }
+
+  # ----------------------------------------------------------------- facts
+  /facts:
+    get:
+      tags: [facts]
+      summary: The facts object for a date (latest version)
+      description: |
+        Returns the stored JSON with its `facts_version` and `facts_sha256`.
+        This is exactly what the brief was written from — the verification
+        surface for every number in every brief.
+      operationId: getFacts
+      parameters:
+        - $ref: '#/components/parameters/Date'
+        - $ref: '#/components/parameters/LineFilter'
+        - name: version
+          in: query
+          schema: { type: string }
+          description: A specific `facts_version`; default latest
+      responses:
+        '200':
+          description: Facts
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FactsRecord' }
+        '404':
+          description: No facts for the date — usually the file has not arrived
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /facts/regenerate:
+    post:
+      tags: [facts]
+      summary: Recompute facts for a date and compare with the stored hash
+      description: |
+        Recomputes from `core.production_fact`/`defect_fact` under the current
+        `FACTS_VERSION`. If a row for that version exists and the hash differs,
+        the response is `409 FACTS_STALE` — the discrepancy is surfaced, never
+        silently overwritten. If no row exists for the current version, a new
+        row is written and older versions are retained.
+      operationId: regenerateFacts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [date]
+              properties:
+                date: { type: string, format: date }
+                line: { type: string }
+      responses:
+        '200':
+          description: Facts (matching hash, or newly computed for a new version)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FactsRecord' }
+        '409':
+          description: Recomputed hash differs from the stored hash for the same version
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://shiftbrief.local/problems/facts-stale
+                title: Facts do not reproduce
+                status: 409
+                code: FACTS_STALE
+                detail: "Recomputed facts for 2026-09-10 (version 1.0) hash 9c1f… but the stored row hashes 4a7e…. Either the underlying rows changed after the facts were computed (a corrected file without a superseding batch?) or the analytics code changed without a FACTS_VERSION bump."
+
+  /facts/history:
+    get:
+      tags: [facts]
+      summary: All facts versions for a date
+      operationId: listFactsVersions
+      parameters:
+        - $ref: '#/components/parameters/Date'
+        - $ref: '#/components/parameters/LineFilter'
+      responses:
+        '200':
+          description: Versions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/FactsRecord' }
+
+  # ----------------------------------------------------------------- brief
+  /brief:
+    post:
+      tags: [brief]
+      summary: Generate (or regenerate) a brief for a date
+      description: |
+        Loads the latest facts row for the date (or `facts_id`), composes prose
+        in `lang`/`tone`, runs the grounding post-check, stores the brief. If
+        the check fails the brief is **withheld**: `422 GROUNDING_FAILED`, a
+        row with `withheld = true` and no text.
+
+        When `facts.significance.significant` is false the brief says
+        "within normal variation" and proposes no cause or action.
+
+        `deliver: true` posts to the matching subscriptions (role `manager`+,
+        otherwise a proposal is created).
+      operationId: generateBrief
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [date]
+              properties:
+                date: { type: string, format: date }
+                line: { type: string }
+                kind: { $ref: '#/components/schemas/BriefKind' }
+                lang: { $ref: '#/components/schemas/Language' }
+                tone: { type: string, enum: [short, long], default: short }
+                facts_id: { type: string, format: uuid, description: Pin to a specific facts row }
+                regenerate: { type: boolean, default: false, description: Create a new brief even if one exists for this date/lang/kind }
+                deliver: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Brief
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Brief' }
+              examples:
+                significant:
+                  value:
+                    id: 00000000-0000-7000-8000-000000000b01
+                    kind: daily
+                    date: '2026-09-10'
+                    lang: en
+                    tone: short
+                    significant: true
+                    text: "Production Report — 2026-09-10. Production: 12,430 pcs. Defects: 382 pcs. Defect rate: 3.07 % (7-day avg 2.59 %, +18.4 %, p = 0.002 → significant). Top defect: Missing Component — 41 %. Worst line: Line 3 — 5.82 % (n = 2,147). Line 3 shows abnormal defect growth during Shift B (8.82 % vs 2.80 % in Shift A); Missing Component accounts for 63 % of Line 3 defects. Other lines are within normal variation. Recommended action: 1. Check the component feeder on Line 3. 2. Review Shift B changeover records on Line 3. Note: correlation only; root cause not verified."
+                    facts_id: 00000000-0000-7000-8000-000000000a01
+                    facts_version: "1.0"
+                    facts_sha256: "…"
+                    sources: [ { kind: facts, facts_id: 00000000-0000-7000-8000-000000000a01, facts_version: "1.0" } ]
+                    grounding: { numbers_found: ["12430","382","3.07","2.59","18.4","0.002","41","5.82","2147","8.82","2.80","63"], all_matched: true }
+                    withheld: false
+                    revised_of: null
+                    model: qwen3:8b
+                    prompt_version: brief.v1.2
+                normal:
+                  value:
+                    id: 00000000-0000-7000-8000-000000000b03
+                    kind: daily
+                    date: '2026-09-09'
+                    lang: en
+                    significant: false
+                    text: "Production Report — 2026-09-09. Production: 11,986 pcs. Defects: 311 pcs. Defect rate: 2.59 %, within normal variation versus the 7-day average (2.59 %, p = 1.00). No action recommended."
+                    facts_id: 00000000-0000-7000-8000-000000000a03
+                    grounding: { all_matched: true }
+                    withheld: false
+        '404':
+          description: No facts for the date
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: Grounding failed — brief withheld
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://shiftbrief.local/problems/grounding-failed
+                title: Brief withheld by grounding check
+                status: 422
+                code: GROUNDING_FAILED
+                detail: The generated brief contained "4.7" which is not present in the facts object. Nothing was returned or delivered. Recorded as brief 00000000-…b06.
+        '503': { $ref: '#/components/responses/ModelUnavailable' }
+
+  /brief/{briefId}:
+    get:
+      tags: [brief]
+      summary: A brief with its facts reference and revision chain
+      operationId: getBrief
+      parameters:
+        - name: briefId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Brief
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Brief' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /brief/history:
+    get:
+      tags: [brief]
+      summary: Briefs for a date range (all languages, including withheld and revisions)
+      operationId: listBriefs
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/LineFilter'
+        - name: lang
+          in: query
+          schema: { $ref: '#/components/schemas/Language' }
+        - name: withheld
+          in: query
+          schema: { type: boolean }
+        - name: latest_only
+          in: query
+          schema: { type: boolean, default: true, description: One brief per date/lang/kind (latest revision) }
+      responses:
+        '200':
+          description: Briefs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Brief' }
+
+  /brief/{briefId}/deliver:
+    post:
+      tags: [brief]
+      summary: Deliver a brief to subscriptions now
+      operationId: deliverBrief
+      parameters:
+        - name: briefId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                channels:
+                  type: array
+                  items: { type: string, enum: [discord, email] }
+      responses:
+        '200':
+          description: Delivered
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Brief' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Brief is withheld and cannot be delivered
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /subscriptions:
+    get:
+      tags: [brief]
+      summary: Delivery subscriptions
+      operationId: listSubscriptions
+      responses:
+        '200':
+          description: Subscriptions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Subscription' }
+    post:
+      tags: [brief]
+      summary: Subscribe a channel/target to briefs
+      operationId: createSubscription
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Subscription' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subscription' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ------------------------------------------------------------------- kpi
+  /kpi:
+    get:
+      tags: [kpi]
+      summary: Aggregate KPI over a range with baseline and significance
+      operationId: getKpi
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/LineFilter'
+        - name: shift
+          in: query
+          schema: { $ref: '#/components/schemas/Shift' }
+        - name: sku
+          in: query
+          schema: { type: string }
+        - name: baseline_days
+          in: query
+          schema: { type: integer, default: 7, minimum: 1, maximum: 90 }
+      responses:
+        '200':
+          description: KPI
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KpiResponse' }
+              example:
+                period: { from: '2026-09-10', to: '2026-09-10' }
+                produced: 12430
+                ng: 382
+                defect_rate_pct: 3.0732
+                baseline_pct: 2.5947
+                change_pct: 18.4
+                significant: true
+                p_value: 0.00196
+                by_line:
+                  - { line: L1, produced: 5140, ng: 128, defect_rate_pct: 2.4903, rankable: true }
+                  - { line: L2, produced: 5143, ng: 129, defect_rate_pct: 2.5083, rankable: true }
+                  - { line: L3, produced: 2147, ng: 125, defect_rate_pct: 5.8221, rankable: true }
+                worst_line: { line: L3, defect_rate_pct: 5.8221, n: 2147 }
+
+  /kpi/pareto:
+    get:
+      tags: [kpi]
+      summary: Defect Pareto with cumulative share
+      operationId: getPareto
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/LineFilter'
+        - name: top_n
+          in: query
+          schema: { type: integer, default: 10, maximum: 50 }
+      responses:
+        '200':
+          description: Pareto
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ParetoItem' }
+
+  /kpi/trend:
+    get:
+      tags: [kpi]
+      summary: Daily series with trailing baselines and pattern flags
+      operationId: getTrend
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/LineFilter'
+      responses:
+        '200':
+          description: Series
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  points:
+                    type: array
+                    items: { $ref: '#/components/schemas/TrendPoint' }
+                  patterns: { $ref: '#/components/schemas/TrendPatterns' }
+
+  /kpi/heatmap:
+    get:
+      tags: [kpi]
+      summary: Line × shift defect-rate cells
+      operationId: getHeatmap
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: Cells
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cells:
+                    type: array
+                    items: { $ref: '#/components/schemas/HeatmapCell' }
+
+  /kpi/oee:
+    get:
+      tags: [kpi]
+      summary: OEE components (availability, quality; performance omitted)
+      operationId: getOee
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/LineFilter'
+      responses:
+        '200':
+          description: OEE
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/OeeRow' }
+
+  /kpi/significance:
+    get:
+      tags: [kpi]
+      summary: Two-proportion z-test for a date versus its baseline
+      operationId: getSignificance
+      parameters:
+        - $ref: '#/components/parameters/Date'
+        - $ref: '#/components/parameters/LineFilter'
+        - name: baseline_days
+          in: query
+          schema: { type: integer, default: 7 }
+      responses:
+        '200':
+          description: Test result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Significance' }
+
+  # ------------------------------------------------------------------- ask
+  /ask:
+    post:
+      tags: [ask]
+      summary: Ask a grounded question about production data
+      description: |
+        Typed tools first (`kpi_summary`, `defect_pareto`, `line_shift_breakdown`,
+        `trend`, `significance`, `oee`, `compare_periods`, `get_facts`). If the
+        question cannot be answered by a typed tool and `ENABLE_TEXT_TO_SQL`
+        is on, a SELECT is generated, parsed, restricted to whitelisted views,
+        limited, time-boxed, executed as `agent_ro`, and **returned to the
+        caller** with the answer. With the flag off, such questions are
+        answered `outcome: refused` (HTTP 200).
+
+        Every number in `answer` is post-checked against tool results;
+        failure withholds the answer (`422 GROUNDING_FAILED`).
+      operationId: ask
+      parameters:
+        - name: stream
+          in: query
+          schema: { type: boolean, default: false }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AskRequest' }
+      responses:
+        '200':
+          description: Answer
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AskResponse' }
+              examples:
+                typed:
+                  value:
+                    run_id: 00000000-0000-7000-8000-000000000f04
+                    outcome: ok
+                    mode: tools
+                    lang: en
+                    answer: "The defect rate on 2026-09-10 was 3.07 % against a 7-day average of 2.59 % (+18.4 %, p = 0.002, significant). The increase is concentrated on Line 3 (5.82 %), specifically Shift B (8.82 % vs 2.80 % in Shift A), where Missing Component is 63 % of defects. Lines 1 and 2 are within normal variation. This is an association; I cannot see machine or material data to say why."
+                    sources:
+                      - { kind: tool, tool: significance, args: { date: '2026-09-10', baseline_days: 7 }, row_count: 1 }
+                      - { kind: tool, tool: line_shift_breakdown, args: { date_from: '2026-09-10', date_to: '2026-09-10' }, row_count: 6 }
+                      - { kind: tool, tool: defect_pareto, args: { date_from: '2026-09-10', date_to: '2026-09-10', line: L3, top_n: 5 }, row_count: 5 }
+                    grounding: { all_matched: true }
+                refused:
+                  value:
+                    run_id: 00000000-0000-7000-8000-000000000f05
+                    outcome: refused
+                    mode: tools
+                    lang: en
+                    answer: "I only have production and defect counts from the daily file. I do not have machine parameters or material lot data, so I cannot say why Line 3 rose. The typed tools cannot answer this and text-to-SQL is disabled."
+                    sources: []
+        '422':
+          description: Grounding failed — answer withheld
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503': { $ref: '#/components/responses/ModelUnavailable' }
+
+  /ask/sql-preview:
+    post:
+      tags: [ask]
+      summary: Show the SQL that would run for a question, without executing it
+      description: Available only when `ENABLE_TEXT_TO_SQL` is on and the caller is `engineer`+. Returns the parsed, restricted, limited statement or the rejection reason.
+      operationId: previewSql
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question]
+              properties:
+                question: { type: string }
+      responses:
+        '200':
+          description: Preview
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SqlPreview' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Text-to-SQL is disabled
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: Generated SQL rejected by the parser (not SELECT, non-whitelisted object, disallowed function)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /ask/runs/{runId}:
+    get:
+      tags: [ask]
+      summary: Full trace of an ask or brief run — "show the numbers"
+      operationId: getRun
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Trace
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunTrace' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /ask/tools:
+    get:
+      tags: [ask]
+      summary: Tools available to the caller — the visible capability boundary
+      operationId: listTools
+      responses:
+        '200':
+          description: Tools
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  text_to_sql_enabled: { type: boolean }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Tool' }
+
+  /ask/feedback:
+    post:
+      tags: [ask]
+      summary: Rate an answer or brief
+      operationId: submitFeedback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [run_id, rating]
+              properties:
+                run_id: { type: string, format: uuid }
+                rating: { type: integer, enum: [-1, 1] }
+                reason: { type: string }
+      responses:
+        '204':
+          description: Recorded
+
+  /ask/proposals:
+    get:
+      tags: [ask]
+      summary: Pending write-tool proposals (send_discord)
+      operationId: listProposals
+      responses:
+        '200':
+          description: Proposals
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ActionProposal' }
+
+  /ask/proposals/{proposalId}/approve:
+    post:
+      tags: [ask]
+      summary: Approve a proposal (binds to args_hash, expires)
+      operationId: approveProposal
+      parameters:
+        - $ref: '#/components/parameters/ProposalId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [args_hash]
+              properties:
+                args_hash: { type: string }
+      responses:
+        '200':
+          description: Approved and executed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionProposal' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Expired, decided, or hash mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /ask/proposals/{proposalId}/deny:
+    post:
+      tags: [ask]
+      summary: Deny a proposal
+      operationId: denyProposal
+      parameters:
+        - $ref: '#/components/parameters/ProposalId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses:
+        '200':
+          description: Denied
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionProposal' }
+
+  # ---------------------------------------------------------------- export
+  /export/{format}:
+    post:
+      tags: [export]
+      summary: Generate a PPTX or PDF deck for a date (or a brief)
+      description: Charts are rendered from the same facts row as the brief; TH/JA fonts are embedded. Cells that begin with `= + - @` are escaped in any tabular export.
+      operationId: createExport
+      parameters:
+        - name: format
+          in: path
+          required: true
+          schema: { type: string, enum: [pptx, pdf, xlsx] }
+        - name: lang
+          in: query
+          schema: { $ref: '#/components/schemas/Language' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                date: { type: string, format: date }
+                brief_id: { type: string, format: uuid }
+                line: { type: string }
+                range_days: { type: integer, default: 30 }
+      responses:
+        '202':
+          description: Job started
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+
+  /jobs/{jobId}:
+    get:
+      tags: [export]
+      summary: Async job status and signed result URL
+      operationId: getJob
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Job
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ----------------------------------------------------------------- admin
+  /admin/config:
+    get:
+      tags: [admin]
+      summary: Runtime configuration (thresholds, schedules, flags)
+      operationId: getConfig
+      responses:
+        '200':
+          description: Config
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+    patch:
+      tags: [admin]
+      summary: Update runtime configuration
+      description: Toggling `ask.enable_text_to_sql` is audited and requires `admin`.
+      operationId: updateConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/alerts:
+    get:
+      tags: [admin]
+      summary: Alert events
+      operationId: listAlerts
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - name: kind
+          in: query
+          schema: { type: string }
+        - name: unacknowledged
+          in: query
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: Alerts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AlertEvent' }
+
+  /admin/alerts/{alertId}/ack:
+    post:
+      tags: [admin]
+      summary: Acknowledge an alert
+      operationId: ackAlert
+      parameters:
+        - name: alertId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204':
+          description: Acknowledged
+
+  /admin/audit:
+    get:
+      tags: [admin]
+      summary: Audit log
+      operationId: queryAudit
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - name: entity
+          in: query
+          schema: { type: string }
+        - name: user_id
+          in: query
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditEntry' }
+                  next_cursor: { type: [string, 'null'] }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /healthz:
+    get:
+      tags: [admin]
+      summary: Liveness
+      operationId: healthz
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+
+  /readyz:
+    get:
+      tags: [admin]
+      summary: Readiness with dependency status
+      description: LLM unavailable → `degraded`. Intake, facts, KPI and dashboard work without it; brief generation is deferred.
+      operationId: readyz
+      security: []
+      responses:
+        '200':
+          description: Ready or degraded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: Not ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 15-minute access token; 12-hour rotating refresh.
+
+  parameters:
+    From:
+      name: from
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive start (plant-local)
+    To:
+      name: to
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive end (plant-local)
+    Date:
+      name: date
+      in: query
+      required: true
+      schema: { type: string, format: date }
+    LineFilter:
+      name: line
+      in: query
+      schema: { type: string }
+      description: Line code; restricted users only see lines in scope
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      schema: { type: string }
+    BatchId:
+      name: batchId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SourceCode:
+      name: sourceCode
+      in: path
+      required: true
+      schema: { type: string }
+    ProposalId:
+      name: proposalId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Authenticated but not permitted; line-scoped rows are never retrieved
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Not found or not visible
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ValidationFailed:
+      description: Semantically invalid
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    TooManyRequests:
+      description: Rate limited
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ModelUnavailable:
+      description: LLM unavailable; deterministic features still work
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string, description: Stable code — API-Specification.md §9 }
+        correlation_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+
+    Language:
+      type: string
+      enum: [th, ja, en]
+      default: th
+
+    Shift:
+      type: string
+      enum: [A, B, C, OT]
+
+    BriefKind:
+      type: string
+      enum: [daily, shift, adhoc]
+      default: daily
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string, format: password }
+        mfa_code: { type: string }
+
+    TokenPair:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string, enum: [Bearer] }
+        expires_in: { type: integer }
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+        display_name: { type: string }
+        role: { type: string, enum: [viewer, inspector, engineer, manager, admin] }
+        lang: { $ref: '#/components/schemas/Language' }
+        line_scope:
+          type: array
+          items: { type: string }
+
+    IngestBatch:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        source: { type: string }
+        filename: { type: [string, 'null'] }
+        sha256: { type: string }
+        status: { type: string, enum: [running, succeeded, failed, rejected] }
+        disposition: { type: [string, 'null'], enum: [committed, rejected, held_drift, null] }
+        rows_total: { type: integer }
+        rows_ok: { type: integer }
+        rows_quarantined: { type: integer }
+        reject_reason: { type: [string, 'null'] }
+        dates_covered:
+          type: [object, 'null']
+          properties:
+            from: { type: string, format: date }
+            to: { type: string, format: date }
+        supersedes_batch_id: { type: [string, 'null'], format: uuid }
+        mapping_version: { type: [integer, 'null'] }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+
+    IngestBatchDetail:
+      allOf:
+        - $ref: '#/components/schemas/IngestBatch'
+        - type: object
+          properties:
+            header_seen:
+              type: array
+              items: { type: string }
+            drift_detail:
+              type: [object, 'null']
+              properties:
+                missing:
+                  type: array
+                  items: { type: string }
+                unexpected:
+                  type: array
+                  items: { type: string }
+            quarantined:
+              type: array
+              items: { $ref: '#/components/schemas/QuarantineRow' }
+            facts_recomputed_for:
+              type: array
+              items: { type: string, format: date }
+
+    QuarantineRow:
+      type: object
+      properties:
+        row_no: { type: integer }
+        reason:
+          type: string
+          description: Written for the data owner — names the field and the problem
+        raw: { type: object, additionalProperties: true }
+
+    Source:
+      type: object
+      properties:
+        code: { type: string }
+        name: { type: string }
+        kind: { type: string, enum: [folder, upload, imap, sftp] }
+        location: { type: [string, 'null'] }
+        file_pattern: { type: string }
+        encoding: { type: string }
+        active: { type: boolean }
+        active_mapping_version: { type: [integer, 'null'] }
+        expectation: { oneOf: [ { $ref: '#/components/schemas/FileExpectation' }, { type: 'null' } ] }
+        last_batch_at: { type: [string, 'null'], format: date-time }
+        arrival_status: { type: string, enum: [on_time, awaiting, late, unknown] }
+
+    SourceCreate:
+      type: object
+      required: [code, name, kind]
+      properties:
+        code: { type: string }
+        name: { type: string }
+        kind: { type: string, enum: [folder, upload, imap, sftp] }
+        location: { type: string }
+        file_pattern: { type: string, default: "*.csv" }
+        encoding: { type: string, default: utf-8 }
+
+    Mapping:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        source: { type: string }
+        version: { type: integer }
+        mapping_yaml: { type: string }
+        header_fingerprint: { type: string }
+        reason: { type: string }
+        created_by: { type: [string, 'null'] }
+        active_from: { type: string, format: date-time }
+        active_to: { type: [string, 'null'], format: date-time }
+
+    MappingValidation:
+      type: object
+      properties:
+        schema_valid: { type: boolean }
+        header_match: { type: boolean }
+        rows_total: { type: integer }
+        rows_ok: { type: integer }
+        rows_would_quarantine: { type: integer }
+        would_reject: { type: boolean, description: True if the quarantine share exceeds 5 % }
+        sample_reasons:
+          type: array
+          items: { $ref: '#/components/schemas/QuarantineRow' }
+
+    FileExpectation:
+      type: object
+      required: [cadence, expected_by]
+      properties:
+        cadence: { type: string, enum: [daily, per_shift, weekly], default: daily }
+        expected_by: { type: string, pattern: '^[0-2][0-9]:[0-5][0-9]$', description: Plant-local HH:MM }
+        grace_minutes: { type: integer, default: 30 }
+        weekdays:
+          type: array
+          items: { type: integer, minimum: 1, maximum: 7 }
+        active: { type: boolean, default: true }
+
+    FactsRecord:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        date: { type: string, format: date }
+        line: { type: [string, 'null'], description: Null = plant-wide }
+        facts_version: { type: string }
+        facts_sha256: { type: string }
+        significant: { type: [boolean, 'null'] }
+        p_value: { type: [number, 'null'] }
+        data_complete: { type: boolean }
+        source_batches:
+          type: array
+          items: { type: string, format: uuid }
+        computed_at: { type: string, format: date-time }
+        facts:
+          $ref: '#/components/schemas/Facts'
+
+    Facts:
+      type: object
+      description: The facts object (DDS-02 §7). The only numeric input the LLM receives.
+      required: [facts_version, date, scope, totals, baseline, change, significance, pareto, completeness, meta]
+      properties:
+        facts_version: { type: string }
+        date: { type: string, format: date }
+        scope:
+          type: object
+          properties:
+            plant: { type: string }
+            line: { type: [string, 'null'] }
+        totals: { $ref: '#/components/schemas/RateBlock' }
+        baseline:
+          type: object
+          properties:
+            d1: { $ref: '#/components/schemas/RateBlock' }
+            d7: { $ref: '#/components/schemas/RateBlock' }
+            d30: { $ref: '#/components/schemas/RateBlock' }
+        change:
+          type: object
+          properties:
+            vs_d1_pct: { type: [number, 'null'] }
+            vs_d7_pct: { type: [number, 'null'] }
+            vs_d30_pct: { type: [number, 'null'] }
+        significance: { $ref: '#/components/schemas/Significance' }
+        by_line:
+          type: array
+          items: { $ref: '#/components/schemas/GroupStat' }
+        by_shift:
+          type: array
+          items: { $ref: '#/components/schemas/GroupStat' }
+        by_sku:
+          type: array
+          items: { $ref: '#/components/schemas/GroupStat' }
+        by_line_shift:
+          type: array
+          items: { $ref: '#/components/schemas/GroupStat' }
+        pareto:
+          type: array
+          items: { $ref: '#/components/schemas/ParetoItem' }
+        worst:
+          type: object
+          description: Only rankable groups may appear
+          additionalProperties: true
+        trend: { $ref: '#/components/schemas/TrendPatterns' }
+        oee:
+          type: object
+          properties:
+            availability_pct: { type: [number, 'null'] }
+            quality_pct: { type: [number, 'null'] }
+            performance_pct: { type: 'null', description: Omitted until a validated ideal cycle time exists }
+        completeness:
+          type: object
+          properties:
+            expected_shifts: { type: integer }
+            present_shifts: { type: integer }
+            complete: { type: boolean }
+            missing:
+              type: array
+              items: { type: string }
+        meta:
+          type: object
+          properties:
+            computed_at: { type: string, format: date-time }
+            source_batches:
+              type: array
+              items: { type: string }
+            revision: { type: integer }
+            supersedes: { type: [string, 'null'] }
+
+    RateBlock:
+      type: object
+      required: [produced, ng, defect_rate_pct]
+      properties:
+        produced: { type: integer }
+        ng: { type: integer }
+        defect_rate_pct: { type: [number, 'null'], description: Null when produced = 0 — never 0 }
+
+    GroupStat:
+      allOf:
+        - $ref: '#/components/schemas/RateBlock'
+        - type: object
+          properties:
+            line: { type: string }
+            shift: { type: string }
+            sku: { type: string }
+            rankable: { type: boolean, description: False below the minimum-volume guard (default 100) }
+
+    Significance:
+      type: object
+      required: [test, vs, p_value, alpha, significant]
+      properties:
+        test: { type: string, const: two_proportion_z }
+        vs: { type: string, enum: [d7, d30] }
+        z: { type: [number, 'null'] }
+        p_value: { type: [number, 'null'] }
+        alpha: { type: number }
+        significant: { type: boolean }
+        note: { type: string }
+
+    ParetoItem:
+      type: object
+      properties:
+        code: { type: string }
+        name: { type: string }
+        qty: { type: integer }
+        share_pct: { type: number }
+        cumulative_pct: { type: number }
+        is_critical: { type: boolean }
+
+    TrendPoint:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        produced: { type: integer }
+        ng: { type: integer }
+        defect_rate_pct: { type: [number, 'null'] }
+        baseline_7d_pct: { type: [number, 'null'] }
+        baseline_30d_pct: { type: [number, 'null'] }
+        data_complete: { type: boolean }
+
+    TrendPatterns:
+      type: object
+      properties:
+        consecutive_rise_days: { type: integer }
+        level_shift: { type: boolean }
+        outlier_3sigma: { type: boolean }
+
+    HeatmapCell:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        line: { type: string }
+        shift: { type: string }
+        produced: { type: integer }
+        ng: { type: integer }
+        defect_rate_pct: { type: [number, 'null'] }
+        rankable: { type: boolean }
+
+    OeeRow:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        line: { type: string }
+        runtime_min: { type: [number, 'null'] }
+        planned_min: { type: [number, 'null'] }
+        availability_pct: { type: [number, 'null'] }
+        quality_pct: { type: [number, 'null'] }
+        performance_pct: { type: 'null' }
+
+    KpiResponse:
+      type: object
+      properties:
+        period:
+          type: object
+          properties:
+            from: { type: string, format: date }
+            to: { type: string, format: date }
+        produced: { type: integer }
+        ng: { type: integer }
+        defect_rate_pct: { type: [number, 'null'] }
+        baseline_pct: { type: [number, 'null'] }
+        change_pct: { type: [number, 'null'] }
+        significant: { type: boolean }
+        p_value: { type: [number, 'null'] }
+        by_line:
+          type: array
+          items: { $ref: '#/components/schemas/GroupStat' }
+        by_shift:
+          type: array
+          items: { $ref: '#/components/schemas/GroupStat' }
+        worst_line:
+          type: [object, 'null']
+          properties:
+            line: { type: string }
+            defect_rate_pct: { type: number }
+            n: { type: integer }
+        data_complete: { type: boolean }
+
+    Brief:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/BriefKind' }
+        date: { type: string, format: date }
+        line: { type: [string, 'null'] }
+        lang: { $ref: '#/components/schemas/Language' }
+        tone: { type: string, enum: [short, long] }
+        significant: { type: [boolean, 'null'] }
+        text: { type: [string, 'null'], description: Null when withheld }
+        facts_id: { type: string, format: uuid }
+        facts_version: { type: string }
+        facts_sha256: { type: string }
+        sources:
+          type: array
+          items: { $ref: '#/components/schemas/Source_' }
+        grounding:
+          type: [object, 'null']
+          properties:
+            numbers_found:
+              type: array
+              items: { type: string }
+            all_matched: { type: boolean }
+            unmatched:
+              type: array
+              items: { type: string }
+        withheld: { type: boolean }
+        withheld_reason: { type: [string, 'null'] }
+        revised_of: { type: [string, 'null'], format: uuid }
+        revisions:
+          type: array
+          items: { type: string, format: uuid }
+          description: Later briefs that revise this one
+        model: { type: [string, 'null'] }
+        prompt_version: { type: [string, 'null'] }
+        delivered_at: { type: [string, 'null'], format: date-time }
+        delivery: { type: [object, 'null'], additionalProperties: true }
+        created_at: { type: string, format: date-time }
+
+    Source_:
+      type: object
+      description: A provenance entry for a brief or answer
+      properties:
+        kind: { type: string, enum: [facts, tool, sql] }
+        facts_id: { type: string, format: uuid }
+        facts_version: { type: string }
+        role: { type: string, enum: [current, previous] }
+        tool: { type: string }
+        args: { type: object, additionalProperties: true }
+        row_count: { type: integer }
+        sql: { type: string, description: Present only for text-to-SQL answers }
+
+    Subscription:
+      type: object
+      required: [channel, target]
+      properties:
+        id: { type: string, format: uuid }
+        channel: { type: string, enum: [discord, email] }
+        target: { type: string }
+        lang: { $ref: '#/components/schemas/Language' }
+        tone: { type: string, enum: [short, long], default: short }
+        line: { type: [string, 'null'] }
+        kinds:
+          type: array
+          items: { $ref: '#/components/schemas/BriefKind' }
+        active: { type: boolean, default: true }
+
+    AskRequest:
+      type: object
+      required: [question]
+      properties:
+        question: { type: string }
+        conversation_id: { type: string, format: uuid }
+        lang: { $ref: '#/components/schemas/Language' }
+        scope:
+          type: object
+          properties:
+            line: { type: string }
+            date_from: { type: string, format: date }
+            date_to: { type: string, format: date }
+
+    AskResponse:
+      type: object
+      properties:
+        run_id: { type: string, format: uuid }
+        conversation_id: { type: [string, 'null'], format: uuid }
+        outcome: { type: string, enum: [ok, partial, refused] }
+        mode: { type: string, enum: [tools, sql], description: Which path answered }
+        partial_reason: { type: [string, 'null'] }
+        lang: { $ref: '#/components/schemas/Language' }
+        answer: { type: string }
+        charts:
+          type: array
+          items:
+            type: object
+            properties:
+              kind: { type: string, enum: [trend, pareto, heatmap, bar] }
+              data: { type: object, additionalProperties: true }
+        sources:
+          type: array
+          items: { $ref: '#/components/schemas/Source_' }
+        sql: { type: [string, 'null'], description: The executed statement when mode is sql }
+        grounding:
+          type: object
+          properties:
+            numbers_found:
+              type: array
+              items: { type: string }
+            all_matched: { type: boolean }
+        latency_ms: { type: integer }
+        model: { type: string }
+
+    SqlPreview:
+      type: object
+      properties:
+        question: { type: string }
+        sql: { type: [string, 'null'] }
+        accepted: { type: boolean }
+        rejection_reason: { type: [string, 'null'] }
+        objects:
+          type: array
+          items: { type: string }
+          description: Views the statement reads
+        limit_applied: { type: integer }
+        timeout_ms: { type: integer }
+
+    RunTrace:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        correlation_id: { type: [string, 'null'] }
+        kind: { type: string, enum: [ask, brief] }
+        question: { type: [string, 'null'] }
+        answer: { type: [string, 'null'] }
+        model: { type: string }
+        prompt_version: { type: [string, 'null'] }
+        outcome: { type: string, enum: [ok, partial, refused, grounding_failed, error, budget_exceeded] }
+        facts: { type: [object, 'null'], additionalProperties: true }
+        grounding: { type: [object, 'null'], additionalProperties: true }
+        tokens_in: { type: [integer, 'null'] }
+        tokens_out: { type: [integer, 'null'] }
+        latency_ms: { type: [integer, 'null'] }
+        tool_calls:
+          type: array
+          items:
+            type: object
+            properties:
+              ordinal: { type: integer }
+              tool_name: { type: string }
+              args: { type: object, additionalProperties: true }
+              row_count: { type: [integer, 'null'] }
+              duration_ms: { type: [integer, 'null'] }
+              ok: { type: boolean }
+              error: { type: [string, 'null'] }
+              sql: { type: [string, 'null'] }
+
+    Tool:
+      type: object
+      properties:
+        name: { type: string }
+        kind: { type: string, enum: [read, write] }
+        risk: { type: string, enum: [low, medium, high] }
+        min_role: { type: string }
+        enabled: { type: boolean }
+        schema: { type: object, additionalProperties: true }
+
+    ActionProposal:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tool_name: { type: string }
+        args: { type: object, additionalProperties: true }
+        args_hash: { type: string }
+        risk: { type: string, enum: [low, medium, high] }
+        status: { type: string, enum: [pending, approved, denied, expired, executed, failed] }
+        expires_at: { type: string, format: date-time }
+        approver: { type: [string, 'null'] }
+        result: { type: [object, 'null'], additionalProperties: true }
+
+    AlertEvent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        kind:
+          type: string
+          enum: [defect_rate_threshold, defect_rate_change, file_not_arrived, batch_rejected, mapping_drift, brief_withheld, brief_revised]
+        severity: { type: string, enum: [info, warning, critical] }
+        date: { type: [string, 'null'], format: date }
+        line: { type: [string, 'null'] }
+        detail: { type: object, additionalProperties: true }
+        delivered_at: { type: [string, 'null'], format: date-time }
+        acknowledged_by: { type: [string, 'null'] }
+        acknowledged_at: { type: [string, 'null'], format: date-time }
+
+    Job:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string }
+        status: { type: string, enum: [queued, running, succeeded, failed] }
+        progress_pct: { type: [number, 'null'] }
+        result_url: { type: [string, 'null'] }
+        error: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+
+    AuditEntry:
+      type: object
+      properties:
+        id: { type: integer }
+        ts: { type: string, format: date-time }
+        user: { type: [string, 'null'] }
+        correlation_id: { type: [string, 'null'] }
+        action: { type: string }
+        entity: { type: string }
+        entity_id: { type: [string, 'null'] }
+        before: { type: [object, 'null'], additionalProperties: true }
+        after: { type: [object, 'null'], additionalProperties: true }
+        ip: { type: [string, 'null'] }
+
+    Readiness:
+      type: object
+      properties:
+        status: { type: string, enum: [ready, degraded, not_ready] }
+        dependencies:
+          type: object
+          properties:
+            database: { type: string, enum: [ok, fail] }
+            object_store: { type: string, enum: [ok, fail] }
+            queue: { type: string, enum: [ok, fail] }
+            llm: { type: string, enum: [ok, unavailable] }
+            llm_profile: { type: string, enum: [cpu, gpu, external] }
+            text_to_sql_enabled: { type: boolean }
+        version: { type: string }
+        schema_version: { type: string }
+        facts_version: { type: string }
