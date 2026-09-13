@@ -1,0 +1,61 @@
+# MachineSense alert rules — deploy/alert-rules.example.yaml
+# Loaded with:  msctl config load alert-rules.yaml   (engineer; PUT /config/alert-rules; validated against schemas/alert-rules.schema.json)
+# Every alert stamps the version that produced it (telemetry.config_version).
+#
+# These are the values the seed's Appendix A alert was computed with (DDS-06 §9):
+#   f(sigma) = 100 * clamp((sigma - 1) / 7, 0, 1); health = 100 - Σ w·f(sigma) - w_anomaly·anomaly·100 → 60.87 for M-07
+
+version: "2026-09-01"
+consecutive_windows: 3         # FR-17: three violating 60 s windows before an alert (ADR-P04)
+window_s: 60
+
+severity_ladder:               # evaluated top-down: CRITICAL, then HIGH, then WATCH
+  WATCH:    { sigma_min: 2.0 }
+  HIGH:     { sigma_min: 3.0, anomaly_min: 0.70 }
+  CRITICAL: { sigma_min: 4.5, health_below: 40 }
+
+health_index:
+  weights:                     # penalty weights; must sum to 1.0
+    bearing_temp_mean: 0.35
+    vib_rms: 0.25
+    vib_band_2x: 0.10
+    motor_current_mean: 0.10
+    anomaly: 0.20
+  sigma_transform: { kind: linear_clamp, start: 1.0, full: 8.0 }
+  critical_below: 40
+
+trend:
+  window_days: 5
+  ci: 0.8
+  min_pct_change: 5
+
+rul:
+  min_comparable_failures: 3   # AI-04 — cannot be lowered
+  confidence: 0.8
+  point_estimate: false        # C-04 — cannot be enabled
+
+suppression:
+  startup_minutes: 30          # FR-14: warm-up
+  changeover: true
+  rebaseline_required_downgrade_to: WATCH   # AI-07 / ADR-P03
+
+component_map:                 # C-05: top attributed features → suspected component and inspection
+  - features: [bearing_temp_mean, vib_rms, vib_band_2x, vib_band_bpfo, vib_band_bpfi]
+    component: drive-side bearing
+    recommendation: "Within 3 days: (1) check drive-side bearing lubrication and temperature by hand-held probe; (2) take a vibration spectrum reading, look for BPFO/BPFI peaks; (3) verify coupling alignment."
+    parts: ["6310-2RS bearing", "grease NLGI 2"]
+  - features: [vib_band_1x, vib_band_2x]
+    component: coupling
+    recommendation: "Check coupling alignment and element wear; 1x/2x dominance suggests misalignment or looseness."
+  - features: [motor_current_mean, motor_current_std]
+    component: motor
+    recommendation: "Inspect motor load and winding temperature; compare current against product/shot weight."
+  - features: [delta_t_mean]
+    component: cooling
+    recommendation: "Check coolant flow and heat-exchanger fouling; rising ΔT with flat ambient indicates cooling loss."
+
+delivery:
+  discord: true
+  email: true
+  webhook: false
+  min_severity: WATCH

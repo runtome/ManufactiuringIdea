@@ -1,0 +1,462 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://machinesense.plant.local/schemas/sensor-map.schema.json",
+  "title": "MachineSense sensor map",
+  "description": "Per-machine signal sources (MQTT, OPC-UA read-only, Modbus read FCs only, DAQ features, derived expressions) and context rules. Loaded by PUT /config/sensor-map; versioned in telemetry.config_version. C-01/C-02: any write access is invalid by schema. Credentials are NEVER here - only credential_ref names.",
+  "type": "object",
+  "required": [
+    "version",
+    "plant",
+    "machines"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}(-[0-9]+)?$"
+    },
+    "plant": {
+      "type": "string"
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gap_factor": {
+          "type": "number",
+          "minimum": 1.5,
+          "default": 3
+        },
+        "stuck_n": {
+          "type": "integer",
+          "minimum": 5,
+          "default": 30
+        },
+        "skew_s": {
+          "type": "number",
+          "minimum": 1,
+          "default": 5
+        },
+        "feature_windows_s": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "enum": [
+              60,
+              600
+            ]
+          },
+          "default": [
+            60,
+            600
+          ]
+        }
+      }
+    },
+    "machines": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/machine"
+      }
+    }
+  },
+  "$defs": {
+    "machine": {
+      "type": "object",
+      "required": [
+        "code",
+        "machine_type",
+        "criticality",
+        "signals",
+        "contexts"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z0-9][A-Z0-9-]{1,30}$"
+        },
+        "name": {
+          "type": "string"
+        },
+        "line": {
+          "type": "string"
+        },
+        "machine_type": {
+          "type": "string"
+        },
+        "criticality": {
+          "type": "string",
+          "enum": [
+            "INFO",
+            "LOW",
+            "MEDIUM",
+            "HIGH",
+            "CRITICAL"
+          ]
+        },
+        "nominal_rpm": {
+          "type": "number"
+        },
+        "sources": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "opcua": {
+              "$ref": "#/$defs/opcua_source"
+            },
+            "modbus": {
+              "$ref": "#/$defs/modbus_source"
+            },
+            "mqtt": {
+              "type": "object",
+              "properties": {
+                "topic_prefix": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "signals": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/signal"
+          }
+        },
+        "contexts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/context"
+          }
+        },
+        "components": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Attribution → component map targets (drive-side bearing, coupling, ...)"
+        }
+      }
+    },
+    "opcua_source": {
+      "type": "object",
+      "required": [
+        "endpoint",
+        "security_policy",
+        "security_mode",
+        "credential_ref",
+        "access"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "pattern": "^opc\\.tcp://"
+        },
+        "security_policy": {
+          "type": "string",
+          "enum": [
+            "Basic256Sha256",
+            "Aes128_Sha256_RsaOaep",
+            "Aes256_Sha256_RsaPss"
+          ]
+        },
+        "security_mode": {
+          "type": "string",
+          "const": "SignAndEncrypt"
+        },
+        "credential_ref": {
+          "type": "string",
+          "pattern": "^secret:[a-z0-9_-]+$"
+        },
+        "access": {
+          "type": "string",
+          "const": "read",
+          "description": "C-01/C-02: only 'read' is valid; the account must also be read-only on the server (TC-020)"
+        },
+        "publishing_interval_ms": {
+          "type": "integer",
+          "minimum": 100,
+          "default": 1000
+        }
+      }
+    },
+    "modbus_source": {
+      "type": "object",
+      "required": [
+        "host",
+        "unit_id",
+        "poll_s"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer",
+          "default": 502
+        },
+        "unit_id": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 247
+        },
+        "poll_s": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 60
+        },
+        "function_codes": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "enum": [
+              3,
+              4
+            ]
+          },
+          "default": [
+            3,
+            4
+          ],
+          "description": "Read-only function codes; 5/6/15/16 are invalid by schema"
+        },
+        "isolated_segment": {
+          "type": "boolean",
+          "const": true,
+          "description": "Modbus has no authentication - the schema requires the operator to assert an isolated segment (SEC-P32)"
+        }
+      }
+    },
+    "signal": {
+      "type": "object",
+      "required": [
+        "name",
+        "unit",
+        "source"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{1,40}$"
+        },
+        "unit": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "mqtt",
+            "opcua",
+            "modbus",
+            "daq",
+            "derived"
+          ]
+        },
+        "rate_hz": {
+          "type": "number",
+          "minimum": 0.001,
+          "maximum": 1
+        },
+        "range": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "topic": {
+          "type": "string"
+        },
+        "node_id": {
+          "type": "string"
+        },
+        "register": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "address": {
+              "type": "integer"
+            },
+            "count": {
+              "type": "integer",
+              "enum": [
+                1,
+                2
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "uint16",
+                "int16",
+                "uint32",
+                "int32",
+                "float32"
+              ]
+            },
+            "word_order": {
+              "type": "string",
+              "enum": [
+                "big",
+                "little"
+              ]
+            },
+            "scale": {
+              "type": "number"
+            },
+            "offset": {
+              "type": "number"
+            }
+          }
+        },
+        "expression": {
+          "type": "string",
+          "description": "derived only; safe expression over other signal names"
+        },
+        "inputs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "daq": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "window_s": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60
+            },
+            "bands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "1x",
+                  "2x",
+                  "3x",
+                  "bpfo",
+                  "bpfi",
+                  "bsf",
+                  "ftf",
+                  "hf_10k_20k"
+                ]
+              }
+            }
+          }
+        },
+        "context_tag": {
+          "type": "boolean",
+          "default": false,
+          "description": "May be used in context expressions"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "const": "opcua"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "node_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "const": "modbus"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "register"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "const": "derived"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "expression",
+              "inputs"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "const": "daq"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "daq"
+            ]
+          }
+        }
+      ]
+    },
+    "context": {
+      "type": "object",
+      "required": [
+        "name",
+        "expression"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "enum": [
+            "running",
+            "idle",
+            "changeover",
+            "stopped",
+            "startup"
+          ]
+        },
+        "expression": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 10
+        },
+        "hysteresis_s": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3600,
+          "default": 60
+        }
+      }
+    }
+  }
+}

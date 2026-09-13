@@ -1,0 +1,20 @@
+# MachineSense broker — mosquitto.conf.example (copy to ${CONFIG_DIR}/mosquitto.conf)
+# TLS listener on the OT-facing interface; per-client passwords; ACL restricts every publisher to its own machine prefix (IF-04, SEC-P30).
+per_listener_settings true
+listener 8883
+protocol mqtt
+cafile   /mosquitto/certs/ca.crt
+certfile /mosquitto/certs/broker.crt
+keyfile  /mosquitto/certs/broker.key
+require_certificate false
+allow_anonymous false
+password_file /mosquitto/config/passwd
+acl_file /mosquitto/config/acl
+max_inflight_messages 100
+max_queued_messages 10000
+message_size_limit 1048576          # 1 MB: DAQ snapshots are the largest payload (IF-38)
+persistence true
+persistence_location /mosquitto/data/
+log_type error
+log_type warning
+log_type notice

@@ -1,0 +1,1212 @@
+openapi: 3.1.0
+info:
+  title: MachineSense API
+  version: 1.0.0
+  summary: Telemetry in, health and actionable alerts out — with the numbers computed, stored and cited.
+  description: |
+    **Scope.** The standalone MachineSense API. In platform mode the five paths marked
+    *identical to API-00* (`POST /telemetry/samples`, `GET /machines/{id}/health`,
+    `GET /telemetry/series`, `GET /alerts`, `POST /alerts/{id}/feedback`) and the six
+    shared schemas (`TelemetrySample`, `TelemetrySeries`, `MachineHealth`,
+    `MaintenanceAlert`, `Severity`, `Problem`) are served by the platform; they are copied
+    verbatim here and diffed by TEST-06 TC-008. Everything else is MachineSense's own.
+
+    **Three contracts (API-Specification.md §3–§5):**
+    - **Evidence** — every number a narrative may contain is a value in the alert's
+      `evidence` object (`AlertEvidence`). The agent receives that object and nothing else;
+      its output is post-checked; a narrative with an unbacked number is withheld.
+    - **Uncertainty** — a RUL is an interval with a confidence, or `null` with a `reason`
+      ("insufficient history (1 of 3 comparable failures)"); a trend carries its CI. No
+      endpoint returns a point-estimate RUL.
+    - **Advisory** — there is no endpoint, tool or parameter that writes to a machine.
+
+    Errors are RFC 7807 `application/problem+json` with a stable `code`.
+  contact: { name: Suphot N. }
+  license: { name: Proprietary }
+  x-document-id: API-06-MachineSense
+
+servers:
+  - url: https://machinesense.plant.local/api/v1
+    description: Standalone
+  - url: https://factorybrain.plant.local/api/v1
+    description: Platform mode (shared paths served by the platform)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - { name: telemetry,   description: "Samples, series, rollups, data quality" }
+  - { name: machines,    description: "Machines, sensors, contexts, health" }
+  - { name: baselines,   description: "Engineer-confirmed healthy baselines" }
+  - { name: models,      description: "Versioned anomaly models and retraining" }
+  - { name: alerts,      description: "Alerts, incidents, lifecycle, feedback" }
+  - { name: risks,       description: "Ranked risks, RUL, failures" }
+  - { name: agent,       description: "Explain, ask, work-order draft" }
+  - { name: admin,       description: "Configuration, maintenance windows, imports" }
+  - { name: auth,        description: "Login" }
+  - { name: system,      description: "Health" }
+
+paths:
+  # ------------------------------------------------------------------ identical to API-00
+  /telemetry/samples:
+    post:
+      tags: [telemetry]
+      summary: Push telemetry samples
+      description: Alternative to MQTT/OPC-UA for gateways that prefer HTTP.
+      operationId: pushTelemetry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [samples]
+              properties:
+                samples:
+                  type: array
+                  maxItems: 5000
+                  items: { $ref: '#/components/schemas/TelemetrySample' }
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: { type: integer }
+                  rejected: { type: integer }
+
+  /machines/{machineId}/health:
+    get:
+      tags: [telemetry]
+      summary: Machine health index with component breakdown
+      operationId: getMachineHealth
+      parameters:
+        - name: machineId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Health
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MachineHealth' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /telemetry/series:
+    get:
+      tags: [telemetry]
+      summary: Signal series with baseline band
+      operationId: getTelemetrySeries
+      parameters:
+        - name: machine_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: signal
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/DateFrom'
+        - $ref: '#/components/parameters/DateTo'
+      responses:
+        '200':
+          description: Series
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TelemetrySeries' }
+
+  /alerts:
+    get:
+      tags: [telemetry]
+      summary: Predictive maintenance alerts
+      operationId: listAlerts
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [open, acknowledged, snoozed, resolved, dismissed]
+      responses:
+        '200':
+          description: Alerts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/MaintenanceAlert' }
+
+  /alerts/{alertId}/feedback:
+    post:
+      tags: [telemetry]
+      summary: Record the technician outcome for an alert
+      description: |
+        Required to compute alert precision. An alert programme without outcome
+        feedback cannot be tuned and will eventually be ignored.
+      operationId: recordAlertFeedback
+      parameters:
+        - name: alertId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outcome]
+              properties:
+                outcome:
+                  type: string
+                  enum: [true_positive, false_positive, unknown]
+                actual_finding:
+                  type: string
+      responses:
+        '204':
+          description: Recorded
+
+  # ------------------------------------------------------------------ telemetry (MachineSense)
+  /telemetry/rollup:
+    get:
+      tags: [telemetry]
+      summary: Series at a chosen resolution from the 1-minute rollup (30-day charts ≤ 2 s, NFR-04)
+      operationId: getTelemetryRollup
+      parameters:
+        - { name: machine, in: query, required: true, schema: { type: string }, description: Machine code }
+        - { name: signal, in: query, required: true, schema: { type: string } }
+        - { name: resolution, in: query, schema: { type: string, enum: [1m, 10m, 1h, 1d], default: 10m } }
+        - { name: context, in: query, schema: { type: string, enum: [running, idle, changeover, stopped, startup] } }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: Rollup points with baseline band and trend
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  machine: { type: string }
+                  signal: { type: string }
+                  unit: { type: [string, 'null'] }
+                  resolution: { type: string }
+                  points: { type: array, items: { type: object, properties: { ts: { type: string, format: date-time }, avg: { type: number }, min: { type: number }, max: { type: number }, n: { type: integer }, good_pct: { type: number } } } }
+                  baseline: { $ref: '#/components/schemas/Baseline' }
+                  trend: { $ref: '#/components/schemas/TrendEstimate' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /telemetry/features:
+    get:
+      tags: [telemetry]
+      summary: Computed features per window and context (FR-04)
+      operationId: listFeatures
+      parameters:
+        - { name: machine, in: query, required: true, schema: { type: string } }
+        - { name: signal, in: query, schema: { type: string } }
+        - { name: name, in: query, schema: { type: string }, description: "mean, std, rms, kurtosis, crest, band_1x, band_2x, …" }
+        - { name: window_s, in: query, schema: { type: integer, enum: [60, 600] } }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200': { description: Features, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { type: object, properties: { ts: { type: string, format: date-time }, signal: { type: string }, window_s: { type: integer }, context: { type: string }, name: { type: string }, value: { type: number } } } } } } } } }
+
+  /telemetry/data-quality:
+    get:
+      tags: [telemetry]
+      summary: Data-quality events — gaps, stuck values, out-of-range, clock skew (FR-03, NFR-09)
+      operationId: listDataQualityEvents
+      parameters:
+        - { name: machine, in: query, schema: { type: string } }
+        - { name: severity, in: query, schema: { type: string, enum: [info, warning, error] } }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200': { description: Events, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/DataQualityEvent' } } } } } } }
+
+  /telemetry/import:
+    post:
+      tags: [admin]
+      summary: Import a CSV/Parquet file of samples (IF-36); deduplicated by (sensor, ts)
+      operationId: importTelemetry
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, machine]
+              properties:
+                file: { type: string, format: binary }
+                machine: { type: string }
+                format: { type: string, enum: [csv, parquet], default: csv }
+                tz: { type: string, default: Asia/Bangkok }
+      responses:
+        '202': { description: Import job queued, content: { application/json: { schema: { type: object, properties: { job_id: { type: string, format: uuid }, rows_detected: { type: integer } } } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ------------------------------------------------------------------ machines
+  /machines:
+    get:
+      tags: [machines]
+      summary: Machines with latest health, alert enablement and open incidents
+      operationId: listMachines
+      parameters:
+        - { name: line, in: query, schema: { type: string } }
+        - { name: criticality, in: query, schema: { $ref: '#/components/schemas/Severity' } }
+      responses:
+        '200': { description: Machines, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Machine' } } } } } } }
+
+  /machines/{machineId}:
+    get:
+      tags: [machines]
+      summary: Machine detail — sensors, contexts, baseline state, active model, health history summary
+      operationId: getMachine
+      parameters: [ { $ref: '#/components/parameters/MachineId' } ]
+      responses:
+        '200': { description: Machine, content: { application/json: { schema: { $ref: '#/components/schemas/MachineDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /machines/{machineId}/sensors:
+    get:
+      tags: [machines]
+      summary: Sensors and their health (gap/stuck/range/skew counts)
+      operationId: listMachineSensors
+      parameters: [ { $ref: '#/components/parameters/MachineId' } ]
+      responses:
+        '200': { description: Sensors, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Sensor' } } } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /machines/{machineId}/context:
+    get:
+      tags: [machines]
+      summary: Context timeline (running / idle / changeover / stopped / startup) — FR-05
+      operationId: getMachineContext
+      parameters: [ { $ref: '#/components/parameters/MachineId' }, { $ref: '#/components/parameters/From' }, { $ref: '#/components/parameters/To' } ]
+      responses:
+        '200': { description: Timeline, content: { application/json: { schema: { type: object, properties: { current: { type: string }, since: { type: string, format: date-time }, segments: { type: array, items: { type: object, properties: { from: { type: string, format: date-time }, to: { type: [string, 'null'], format: date-time }, context: { type: string } } } } } } } } }
+
+  /machines/{machineId}/health/history:
+    get:
+      tags: [machines]
+      summary: Health index history with component penalties
+      operationId: getMachineHealthHistory
+      parameters: [ { $ref: '#/components/parameters/MachineId' }, { $ref: '#/components/parameters/From' }, { $ref: '#/components/parameters/To' }, { name: resolution, in: query, schema: { type: string, enum: [1h, 1d], default: 1h } } ]
+      responses:
+        '200': { description: History, content: { application/json: { schema: { type: object, properties: { points: { type: array, items: { type: object, properties: { ts: { type: string, format: date-time }, value: { type: number }, components: { type: object, additionalProperties: true } } } } } } } } }
+
+  /machines/{machineId}/alerts:
+    get:
+      tags: [alerts]
+      summary: Alerts of one machine with filters and pagination (superset of GET /alerts)
+      operationId: listMachineAlerts
+      parameters:
+        - $ref: '#/components/parameters/MachineId'
+        - { name: status, in: query, schema: { type: string, enum: [open, acknowledged, snoozed, resolved, dismissed] } }
+        - { name: severity, in: query, schema: { $ref: '#/components/schemas/Severity' } }
+        - { name: include_suppressed, in: query, schema: { type: boolean, default: false } }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200': { description: Page, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/AlertDetail' } }, next_cursor: { type: [string, 'null'] } } } } } }
+
+  # ------------------------------------------------------------------ baselines
+  /baselines:
+    get:
+      tags: [baselines]
+      summary: Baselines (active by default) with version, window and confirmer
+      operationId: listBaselines
+      parameters:
+        - { name: machine, in: query, schema: { type: string } }
+        - { name: signal, in: query, schema: { type: string } }
+        - { name: active, in: query, schema: { type: boolean, default: true } }
+      responses:
+        '200': { description: Baselines, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Baseline' } } } } } } }
+    post:
+      tags: [baselines]
+      summary: Propose a baseline from a healthy window (engineer) — inert until confirmed
+      description: Computes mean/std/p95 per (sensor, context, feature) over the window; the window must cover ≥ 4 weeks and all normal contexts (AI-01). Returns the proposal with coverage per context so the engineer can see what is missing.
+      operationId: proposeBaseline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [machine, window_from, window_to]
+              properties:
+                machine: { type: string }
+                window_from: { type: string, format: date-time }
+                window_to: { type: string, format: date-time }
+                signals: { type: array, items: { type: string }, description: Default all }
+      responses:
+        '201': { description: Proposed (inactive), content: { application/json: { schema: { type: object, properties: { version: { type: integer }, items: { type: array, items: { $ref: '#/components/schemas/Baseline' } }, coverage: { type: object, additionalProperties: { type: number }, description: Hours per context in the window } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422':
+          description: Window shorter than 4 weeks or a context uncovered
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' }, example: { type: "urn:machinesense:problem:baseline", title: Baseline window insufficient, status: 422, code: BASELINE_WINDOW_INSUFFICIENT, detail: "Window covers 19 days; 28 required (AI-01)" } } }
+
+  /baselines/{machine}/{version}/confirm:
+    post:
+      tags: [baselines]
+      summary: Confirm and activate a proposed baseline (engineer) — enables alerts for the machine
+      description: The engineer asserts the window was healthy. Activation replaces the previous active version; clears `rebaseline_required`; sets `alerts_enabled` when all contexts are covered.
+      operationId: confirmBaseline
+      parameters:
+        - { name: machine, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { note: { type: string, maxLength: 500 } } }
+      responses:
+        '200': { description: Activated, content: { application/json: { schema: { type: object, properties: { machine: { type: string }, version: { type: integer }, activated: { type: integer }, alerts_enabled: { type: boolean } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Version already active or superseded, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /baselines/{machine}/rebaseline:
+    post:
+      tags: [baselines]
+      summary: Flag a machine for re-baselining (after service) — alerts downgraded to WATCH until a new baseline is confirmed (AI-07)
+      operationId: requestRebaseline
+      parameters: [ { name: machine, in: path, required: true, schema: { type: string } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [reason], properties: { reason: { type: string } } }
+      responses:
+        '200': { description: Flagged, content: { application/json: { schema: { type: object, properties: { machine: { type: string }, rebaseline_required: { type: boolean, const: true } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ------------------------------------------------------------------ models
+  /models:
+    get:
+      tags: [models]
+      summary: Anomaly models with stage and retrospective metrics
+      operationId: listModels
+      parameters:
+        - { name: machine_type, in: query, schema: { type: string } }
+        - { name: stage, in: query, schema: { type: string, enum: [candidate, active, retired] } }
+      responses:
+        '200': { description: Models, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/AnomalyModel' } } } } } } }
+
+  /models/{modelId}/promote:
+    post:
+      tags: [models]
+      summary: Promote a candidate to active (engineer) — refused if metrics are below the active version (AI-06)
+      operationId: promoteModel
+      parameters: [ { name: modelId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Promoted; previous retired, content: { application/json: { schema: { $ref: '#/components/schemas/AnomalyModel' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Metrics below the active version or missing
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' }, example: { type: "urn:machinesense:problem:model", title: Promotion refused, status: 409, code: MODEL_METRICS_BELOW_ACTIVE, detail: "precision 0.68 < 0.74" } } }
+
+  /models/retrain:
+    post:
+      tags: [models]
+      summary: Queue a retraining run (engineer); automatic after a confirmed failure and on schedule
+      operationId: retrainModels
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { machine_type: { type: string }, algorithm: { type: string, enum: [isolation_forest, autoencoder, lstm_ae] }, reason: { type: string } } }
+      responses:
+        '202': { description: Queued, content: { application/json: { schema: { type: object, properties: { retrain_run_id: { type: string, format: uuid } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /models/retrain-runs:
+    get:
+      tags: [models]
+      summary: Retraining history with outcomes and metric comparisons
+      operationId: listRetrainRuns
+      parameters: [ { $ref: '#/components/parameters/Limit' } ]
+      responses:
+        '200': { description: Runs, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { type: object, properties: { id: { type: string, format: uuid }, started_at: { type: string, format: date-time }, finished_at: { type: [string, 'null'], format: date-time }, trigger: { type: string }, outcome: { type: [string, 'null'] }, metrics: { type: object, additionalProperties: true } } } } } } } } }
+
+  # ------------------------------------------------------------------ alerts and incidents
+  /alerts/{alertId}:
+    get:
+      tags: [alerts]
+      summary: Alert detail with the full evidence object, attribution, RUL and transitions
+      operationId: getAlert
+      parameters: [ { $ref: '#/components/parameters/AlertId' } ]
+      responses:
+        '200': { description: Alert, content: { application/json: { schema: { $ref: '#/components/schemas/AlertDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /alerts/{alertId}/acknowledge:
+    post:
+      tags: [alerts]
+      summary: Acknowledge (technician+) — logged with actor and channel (FR-19)
+      operationId: acknowledgeAlert
+      parameters: [ { $ref: '#/components/parameters/AlertId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { note: { type: string, maxLength: 500 } } }
+      responses:
+        '200': { description: Acknowledged, content: { application/json: { schema: { $ref: '#/components/schemas/AlertDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Not open, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /alerts/{alertId}/snooze:
+    post:
+      tags: [alerts]
+      summary: Snooze until a time (technician+); the alert re-opens if the condition persists after
+      operationId: snoozeAlert
+      parameters: [ { $ref: '#/components/parameters/AlertId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [until], properties: { until: { type: string, format: date-time }, note: { type: string } } }
+      responses:
+        '200': { description: Snoozed, content: { application/json: { schema: { $ref: '#/components/schemas/AlertDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { description: Until must be ≤ 7 days ahead, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /alerts/{alertId}/escalate:
+    post:
+      tags: [alerts]
+      summary: Escalate severity by one level and notify the planner (technician+)
+      operationId: escalateAlert
+      parameters: [ { $ref: '#/components/parameters/AlertId' } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { note: { type: string } } }
+      responses:
+        '200': { description: Escalated, content: { application/json: { schema: { $ref: '#/components/schemas/AlertDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Already CRITICAL, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /alerts/{alertId}/resolve:
+    post:
+      tags: [alerts]
+      summary: Resolve or dismiss (technician+) — feedback is required in the same call (FR-20)
+      operationId: resolveAlert
+      parameters: [ { $ref: '#/components/parameters/AlertId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status, outcome]
+              properties:
+                status: { type: string, enum: [resolved, dismissed] }
+                outcome: { type: string, enum: [true_positive, false_positive, unknown] }
+                actual_finding: { type: string }
+                failure: { type: [object, 'null'], description: "When a failure was found: label it (FR-15)", properties: { failure_mode: { type: string }, component: { type: string }, downtime_min: { type: number }, cost: { type: number } } }
+      responses:
+        '200': { description: Closed with feedback, content: { application/json: { schema: { $ref: '#/components/schemas/AlertDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Feedback already recorded (immutable), content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /incidents:
+    get:
+      tags: [alerts]
+      summary: Incidents — one per machine per suspected component (FR-18)
+      operationId: listIncidents
+      parameters:
+        - { name: open, in: query, schema: { type: boolean, default: true } }
+        - { name: machine, in: query, schema: { type: string } }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200': { description: Incidents, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Incident' } } } } } } }
+
+  /incidents/{incidentId}:
+    get:
+      tags: [alerts]
+      summary: Incident with its alerts, transitions and (when closed) the generated summary
+      operationId: getIncident
+      parameters: [ { name: incidentId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Incident, content: { application/json: { schema: { $ref: '#/components/schemas/Incident' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /reports/precision:
+    get:
+      tags: [alerts]
+      summary: Alert precision per machine and month from technician feedback (AC-08, AI-03)
+      operationId: getPrecisionReport
+      parameters:
+        - { name: machine, in: query, schema: { type: string } }
+        - { name: months, in: query, schema: { type: integer, minimum: 1, maximum: 24, default: 3 } }
+      responses:
+        '200':
+          description: Report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  overall: { type: object, properties: { judged: { type: integer }, true_positive: { type: integer }, false_positive: { type: integer }, unknown: { type: integer }, precision: { type: [number, 'null'] }, false_alerts_per_machine_month: { type: number } } }
+                  rows: { type: array, items: { type: object, properties: { machine: { type: string }, month: { type: string }, judged: { type: integer }, true_positive: { type: integer }, false_positive: { type: integer }, unknown: { type: integer }, precision: { type: [number, 'null'] } } } }
+                  tuning_suggestions: { type: array, items: { type: string }, description: "Rule-based, e.g. raise N for machine X where FP cluster" }
+
+  # ------------------------------------------------------------------ risks, RUL, failures
+  /risks/top:
+    get:
+      tags: [risks]
+      summary: Ranked "top risks this week" (FR-22)
+      operationId: getTopRisks
+      parameters: [ { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 10 } } ]
+      responses:
+        '200': { description: Ranked machines, content: { application/json: { schema: { type: object, properties: { as_of: { type: string, format: date-time }, items: { type: array, items: { $ref: '#/components/schemas/RiskRow' } } } } } } }
+
+  /machines/{machineId}/rul:
+    get:
+      tags: [risks]
+      summary: Latest RUL estimates per failure mode — interval with confidence, or null with reason (C-04, AI-04)
+      operationId: getMachineRul
+      parameters: [ { $ref: '#/components/parameters/MachineId' } ]
+      responses:
+        '200': { description: Estimates, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/RulEstimate' } } } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /failures:
+    get:
+      tags: [risks]
+      summary: Labelled failure events (FR-15) with lead times
+      operationId: listFailures
+      parameters:
+        - { name: machine, in: query, schema: { type: string } }
+        - { name: failure_mode, in: query, schema: { type: string } }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200': { description: Failures, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/FailureEvent' } } } } } } }
+    post:
+      tags: [risks]
+      summary: Label a failure event (engineer) — feeds retrospective validation and RUL
+      operationId: createFailure
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [machine, ts, failure_mode, component]
+              properties:
+                machine: { type: string }
+                ts: { type: string, format: date-time }
+                failure_mode: { type: string }
+                component: { type: string }
+                downtime_min: { type: number }
+                cost: { type: number }
+                detected_by_alert_id: { type: [string, 'null'], format: uuid }
+      responses:
+        '201': { description: Labelled, content: { application/json: { schema: { $ref: '#/components/schemas/FailureEvent' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ------------------------------------------------------------------ agent
+  /agent/explain/{alertId}:
+    post:
+      tags: [agent]
+      summary: Plain-language explanation of an alert from its evidence object (FR-23, FR-26, AI-08)
+      description: |
+        Input to the model: the alert's `evidence`, the baselines used, attribution, similar past
+        cases (Genba Memory, FR-24) and production context. Output is post-checked: every numeric
+        token must match a value in the evidence; hypotheses must carry a likelihood; a cause is never
+        stated as certain. If the check fails, `narrative` is null and `withheld_reason` says why —
+        the structured recommendation is always present.
+      operationId: explainAlert
+      parameters: [ { $ref: '#/components/parameters/AlertId' } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { lang: { type: string, enum: [th, ja, en] }, include_similar_cases: { type: boolean, default: true } } }
+      responses:
+        '200': { description: Explanation, content: { application/json: { schema: { $ref: '#/components/schemas/Explanation' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/ModelUnavailable' }
+
+  /agent/ask:
+    post:
+      tags: [agent]
+      summary: Question answering over the time-series store with typed tools (FR-25)
+      operationId: agentAsk
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [question], properties: { question: { type: string, maxLength: 2000 }, lang: { type: string, enum: [th, ja, en] }, machine: { type: string } } }
+            example: { question: "Which machines are degrading fastest this month?" }
+      responses:
+        '200':
+          description: Answer with the facts used
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: { type: string, format: uuid }
+                  answer: { type: [string, 'null'] }
+                  facts: { type: object, additionalProperties: true, description: Tool results the answer is grounded in }
+                  tool_calls: { type: array, items: { type: object, properties: { tool: { type: string }, args: { type: object, additionalProperties: true }, row_count: { type: integer } } } }
+                  grounding: { type: object, properties: { claims: { type: integer }, grounded: { type: integer }, withheld: { type: boolean } } }
+        '503': { $ref: '#/components/responses/ModelUnavailable' }
+
+  /workorders/draft:
+    post:
+      tags: [agent]
+      summary: Draft a work order from an alert (FR-21) — for export to CMMS or PDF (IF-37); never posted automatically
+      operationId: draftWorkOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [alert_id], properties: { alert_id: { type: string, format: uuid }, lang: { type: string, enum: [th, ja, en] } } }
+      responses:
+        '201': { description: Draft, content: { application/json: { schema: { $ref: '#/components/schemas/WorkOrderDraft' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /workorders/{draftId}/export:
+    post:
+      tags: [agent]
+      summary: Export a draft as PDF or to the CMMS webhook (planner+) — idempotent by draft id
+      operationId: exportWorkOrder
+      parameters: [ { name: draftId, in: path, required: true, schema: { type: string, format: uuid } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [target], properties: { target: { type: string, enum: [pdf, cmms_webhook] } } }
+      responses:
+        '200': { description: Exported, content: { application/json: { schema: { type: object, properties: { export_ref: { type: string }, url: { type: [string, 'null'] } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '502': { description: CMMS webhook failed, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # ------------------------------------------------------------------ admin
+  /maintenance-windows:
+    get:
+      tags: [admin]
+      summary: Maintenance windows (suppression, FR-14)
+      operationId: listMaintenanceWindows
+      parameters: [ { name: machine, in: query, schema: { type: string } }, { name: active, in: query, schema: { type: boolean } } ]
+      responses:
+        '200': { description: Windows, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/MaintenanceWindow' } } } } } } }
+    post:
+      tags: [admin]
+      summary: Declare a maintenance window (planner+)
+      operationId: createMaintenanceWindow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [machine, starts_at, ends_at, kind], properties: { machine: { type: string }, starts_at: { type: string, format: date-time }, ends_at: { type: string, format: date-time }, kind: { type: string, enum: [planned_service, changeover, warmup, commissioning] }, reason: { type: string } } }
+      responses:
+        '201': { description: Declared, content: { application/json: { schema: { $ref: '#/components/schemas/MaintenanceWindow' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /maintenance-events:
+    post:
+      tags: [admin]
+      summary: Record a maintenance action (technician+); component replacement flags re-baselining (AI-07)
+      operationId: createMaintenanceEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [machine, ts, kind], properties: { machine: { type: string }, ts: { type: string, format: date-time }, kind: { type: string, enum: [inspection, lubrication, adjustment, component_replaced, overhaul, failure_repair] }, description: { type: string }, parts: { type: array, items: { type: string } }, downtime_min: { type: number } } }
+      responses:
+        '201': { description: Recorded, content: { application/json: { schema: { type: object, properties: { id: { type: string, format: uuid }, rebaseline_required: { type: boolean } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /config/sensor-map:
+    get:
+      tags: [admin]
+      summary: Current sensor map version (engineer+; OT endpoints redacted for non-admins)
+      operationId: getSensorMap
+      responses:
+        '200': { description: Sensor map, content: { application/json: { schema: { $ref: '#/components/schemas/ConfigVersion' } } } }
+    put:
+      tags: [admin]
+      summary: Load a sensor map (admin) — validated against deploy/schemas/sensor-map.schema.json; OPC-UA write modes are refused
+      operationId: loadSensorMap
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: Loaded, content: { application/json: { schema: { $ref: '#/components/schemas/ConfigVersion' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /config/alert-rules:
+    get:
+      tags: [admin]
+      summary: Current alert rules version (thresholds, N, weights, severity ladder)
+      operationId: getAlertRules
+      responses:
+        '200': { description: Rules, content: { application/json: { schema: { $ref: '#/components/schemas/ConfigVersion' } } } }
+    put:
+      tags: [admin]
+      summary: Load alert rules (engineer+) — validated against deploy/schemas/alert-rules.schema.json
+      operationId: loadAlertRules
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: Loaded, content: { application/json: { schema: { $ref: '#/components/schemas/ConfigVersion' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ------------------------------------------------------------------ auth, system
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Login (standalone; platform mode uses the platform's /auth)
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [username, password], properties: { username: { type: string }, password: { type: string, format: password }, mfa_code: { type: string } } }
+      responses:
+        '200': { description: Tokens, content: { application/json: { schema: { type: object, properties: { access_token: { type: string }, refresh_token: { type: string }, role: { type: string, enum: [viewer, technician, planner, engineer, admin] } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /healthz:
+    get:
+      tags: [system]
+      summary: Liveness
+      operationId: healthz
+      security: []
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { ok: { type: boolean } } } } } }
+
+  /readyz:
+    get:
+      tags: [system]
+      summary: Readiness — DB, Redis, broker, ingest lag, feature lag, LLM (LLM down does not fail readiness)
+      operationId: readyz
+      security: []
+      responses:
+        '200': { description: Ready, content: { application/json: { schema: { type: object, properties: { db: { type: boolean }, timescaledb: { type: boolean }, redis: { type: boolean }, broker: { type: boolean }, ingest_lag_s: { type: number }, feature_lag_s: { type: number }, llm: { type: boolean }, buffer_depth: { type: integer } } } } } }
+        '503': { description: "DB, Redis or broker unavailable", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /metrics:
+    get:
+      tags: [system]
+      summary: Prometheus metrics (ICD-06 IF-14) — ingest rate and lag, buffer depth, feature/scoring lag, alerts opened/suppressed, 30-day precision, LLM breaker; internal network only
+      operationId: metrics
+      security: []
+      responses:
+        '200': { description: Metrics, content: { text/plain: { schema: { type: string } } } }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 15-minute access token with role; 12-hour rotating refresh.
+
+  parameters:
+    MachineId: { name: machineId, in: path, required: true, schema: { type: string, format: uuid } }
+    AlertId: { name: alertId, in: path, required: true, schema: { type: string, format: uuid } }
+    DateFrom:
+      name: from
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive start date (plant timezone)
+    DateTo:
+      name: to
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive end date (plant timezone)
+    From: { name: from, in: query, schema: { type: string, format: date-time } }
+    To: { name: to, in: query, schema: { type: string, format: date-time } }
+    Cursor: { name: cursor, in: query, schema: { type: string } }
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 1000, default: 100 } }
+    IdempotencyKey: { name: Idempotency-Key, in: header, schema: { type: string, maxLength: 64 }, description: Replays return the original response for 24 h }
+
+  responses:
+    BadRequest: { description: Malformed request, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    Unauthorized: { description: Missing or invalid token, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    Forbidden: { description: Role insufficient, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    NotFound: { description: Not found, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    ValidationFailed: { description: Validation failed, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    TooManyRequests:
+      description: Rate limited
+      headers: { Retry-After: { schema: { type: integer } } }
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    ModelUnavailable:
+      description: LLM unavailable — the structured evidence and recommendation are still returned by the alert endpoints
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' }, example: { type: "urn:machinesense:problem:llm", title: LLM unavailable, status: 503, code: LLM_UNAVAILABLE } } }
+
+  schemas:
+    # ------------------------------------------------ identical to API-00 (TC-008)
+    TelemetrySample:
+      type: object
+      required: [ts, machine, signal, value]
+      properties:
+        ts: { type: string, format: date-time }
+        machine: { type: string }
+        signal: { type: string }
+        value: { type: number }
+        quality: { type: integer, default: 192 }
+
+    TelemetrySeries:
+      type: object
+      properties:
+        machine: { type: string }
+        signal: { type: string }
+        unit: { type: [string, 'null'] }
+        points:
+          type: array
+          items:
+            type: object
+            properties:
+              ts: { type: string, format: date-time }
+              value: { type: number }
+        baseline:
+          type: [object, 'null']
+          properties:
+            mean: { type: number }
+            std: { type: number }
+            context: { type: string }
+            confirmed_by: { type: [string, 'null'] }
+
+    MachineHealth:
+      type: object
+      properties:
+        machine: { type: string }
+        health_index: { type: number, minimum: 0, maximum: 100 }
+        components: { type: object, additionalProperties: true }
+        open_alerts: { type: integer }
+        computed_at: { type: string, format: date-time }
+
+    MaintenanceAlert:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        machine: { type: string }
+        severity: { $ref: '#/components/schemas/Severity' }
+        signals:
+          type: array
+          items: { type: string }
+        evidence: { type: object, additionalProperties: true }
+        suspected_component: { type: [string, 'null'] }
+        recommendation: { type: string }
+        rul_days:
+          type: [object, 'null']
+          description: |
+            Prediction interval, never a point estimate. Null means insufficient
+            history — the system says so rather than guessing.
+          properties:
+            low: { type: number }
+            high: { type: number }
+            confidence: { type: number }
+        status: { type: string }
+        opened_at: { type: string, format: date-time }
+
+    Severity:
+      type: string
+      enum: [INFO, LOW, MEDIUM, HIGH, CRITICAL]
+
+    Problem:
+      type: object
+      description: RFC 7807 problem details with a stable machine-readable `code`.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string, description: "Stable error code — see API-Specification.md §7" }
+        correlation_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+
+    # ------------------------------------------------ MachineSense
+    Machine:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        name: { type: string }
+        line: { type: [string, 'null'] }
+        machine_type: { type: [string, 'null'] }
+        criticality: { $ref: '#/components/schemas/Severity' }
+        health_index: { type: [number, 'null'] }
+        health_ts: { type: [string, 'null'], format: date-time }
+        alerts_enabled: { type: boolean }
+        rebaseline_required: { type: boolean }
+        current_context: { type: [string, 'null'] }
+        open_incidents: { type: integer }
+
+    MachineDetail:
+      allOf:
+        - $ref: '#/components/schemas/Machine'
+        - type: object
+          properties:
+            sensors: { type: array, items: { $ref: '#/components/schemas/Sensor' } }
+            context_rules: { type: array, items: { type: object, properties: { context: { type: string }, expression: { type: string }, priority: { type: integer }, hysteresis_s: { type: integer } } } }
+            active_model: { type: [object, 'null'], properties: { algorithm: { type: string }, version: { type: integer }, precision: { type: number }, lead_time_days: { type: number } } }
+            baseline: { type: object, properties: { version: { type: [integer, 'null'] }, window_from: { type: [string, 'null'], format: date-time }, window_to: { type: [string, 'null'], format: date-time }, confirmed_by: { type: [string, 'null'] } } }
+            health_7d: { type: object, properties: { now: { type: number }, week_ago: { type: [number, 'null'] }, drop: { type: [number, 'null'] } } }
+
+    Sensor:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        signal: { type: string }
+        unit: { type: [string, 'null'] }
+        source: { type: string, enum: [mqtt, opcua, modbus, csv, derived] }
+        sample_rate_hz: { type: [number, 'null'] }
+        active: { type: boolean }
+        last_seen_at: { type: [string, 'null'], format: date-time }
+        health: { type: object, properties: { status: { type: string, enum: [ok, gap, stuck, out_of_range, skew, offline] }, gap_count_24h: { type: integer }, stuck_count_24h: { type: integer }, range_count_24h: { type: integer } } }
+
+    DataQualityEvent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        source: { type: string }
+        severity: { type: string, enum: [info, warning, error] }
+        entity: { type: [string, 'null'] }
+        entity_id: { type: [string, 'null'] }
+        message: { type: string }
+        detail: { type: [object, 'null'], additionalProperties: true }
+
+    Baseline:
+      type: object
+      properties:
+        sensor_id: { type: string, format: uuid }
+        machine: { type: string }
+        signal: { type: string }
+        context: { type: string }
+        name: { type: string }
+        mean: { type: number }
+        std: { type: number }
+        p95: { type: [number, 'null'] }
+        version: { type: integer }
+        window_from: { type: string, format: date-time }
+        window_to: { type: string, format: date-time }
+        confirmed_by: { type: [string, 'null'] }
+        active: { type: boolean }
+        sample_n: { type: [integer, 'null'] }
+
+    TrendEstimate:
+      type: object
+      required: [slope_per_day, slope_ci_low, slope_ci_high, window_days]
+      properties:
+        ts: { type: string, format: date-time }
+        window_days: { type: integer }
+        slope_per_day: { type: number }
+        slope_ci_low: { type: number }
+        slope_ci_high: { type: number }
+        pct_change: { type: [number, 'null'] }
+        consecutive_rising_days: { type: integer }
+
+    AnomalyModel:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        scope: { type: object, properties: { machine: { type: [string, 'null'] }, machine_type: { type: [string, 'null'] } } }
+        algorithm: { type: string, enum: [isolation_forest, autoencoder, lstm_ae] }
+        version: { type: integer }
+        features: { type: array, items: { type: string } }
+        trained_from: { type: string, format: date-time }
+        trained_to: { type: string, format: date-time }
+        metrics: { type: object, properties: { precision: { type: [number, 'null'] }, lead_time_days: { type: [number, 'null'] }, false_alerts_per_machine_month: { type: [number, 'null'] } } }
+        stage: { type: string, enum: [candidate, active, retired] }
+        promoted_at: { type: [string, 'null'], format: date-time }
+
+    Attribution:
+      type: array
+      minItems: 1
+      items:
+        type: object
+        required: [feature, contribution]
+        properties:
+          feature: { type: string }
+          contribution: { type: number, minimum: 0, maximum: 1 }
+
+    AlertEvidence:
+      type: object
+      description: "The numeric contract (AI-08): everything the narrative may cite. Per-signal values, anomaly, attribution, trend, production context, RUL, similar case. Shape of the seed's Appendix A alert."
+      required: [machine, context, health_index, signals, attribution]
+      properties:
+        machine: { type: object, properties: { code: { type: string }, name: { type: string } } }
+        context: { type: string }
+        health_index: { type: number }
+        signals:
+          type: object
+          additionalProperties:
+            type: object
+            required: [now, baseline_mean, baseline_std, sigma]
+            properties:
+              now: { type: number }
+              baseline_mean: { type: number }
+              baseline_std: { type: number }
+              sigma: { type: number }
+              pct_change_5d: { type: number }
+              trend_slope_per_day: { type: number }
+              trend_ci_80: { type: array, items: { type: number }, minItems: 2, maxItems: 2 }
+              consecutive_rising_days: { type: integer }
+              within_baseline: { type: boolean }
+              unit: { type: string }
+        anomaly: { type: object, properties: { model: { type: string }, score: { type: number, minimum: 0, maximum: 1 } } }
+        attribution: { $ref: '#/components/schemas/Attribution' }
+        production_context: { type: object, additionalProperties: true }
+        rul: { type: [object, 'null'], properties: { low_days: { type: number }, high_days: { type: number }, confidence: { type: number }, comparable_failures: { type: integer } } }
+        similar_case: { type: [object, 'null'], additionalProperties: true }
+
+    RulEstimate:
+      type: object
+      required: [failure_mode, ts]
+      description: Interval with confidence, or null values with a reason — never a point estimate (C-04, AI-04).
+      properties:
+        ts: { type: string, format: date-time }
+        failure_mode: { type: string }
+        low_days: { type: [number, 'null'] }
+        high_days: { type: [number, 'null'] }
+        confidence: { type: [number, 'null'] }
+        comparable_failures: { type: integer }
+        reason: { type: [string, 'null'], description: "Present when the interval is null, e.g. insufficient history (1 of 3 comparable failures)" }
+        method: { type: string, enum: [empirical_ttf, trend_extrapolation] }
+
+    AlertDetail:
+      allOf:
+        - $ref: '#/components/schemas/MaintenanceAlert'
+        - type: object
+          properties:
+            evidence: { $ref: '#/components/schemas/AlertEvidence' }
+            health_index: { type: [number, 'null'] }
+            rule_code: { type: [string, 'null'] }
+            consecutive_windows: { type: [integer, 'null'] }
+            model: { type: [string, 'null'], description: algorithm vN }
+            rul_reason: { type: [string, 'null'] }
+            suppressed: { type: boolean }
+            incident_id: { type: [string, 'null'], format: uuid }
+            closed_at: { type: [string, 'null'], format: date-time }
+            transitions: { type: array, items: { type: object, properties: { ts: { type: string, format: date-time }, from: { type: [string, 'null'] }, to: { type: string }, actor: { type: [string, 'null'] }, channel: { type: string }, note: { type: [string, 'null'] } } } }
+            feedback: { type: [object, 'null'], properties: { outcome: { type: string }, actual_finding: { type: [string, 'null'] }, technician: { type: [string, 'null'] }, created_at: { type: string, format: date-time } } }
+
+    Incident:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        machine: { type: string }
+        suspected_component: { type: string }
+        opened_at: { type: string, format: date-time }
+        closed_at: { type: [string, 'null'], format: date-time }
+        max_severity: { $ref: '#/components/schemas/Severity' }
+        status: { type: string }
+        title: { type: string }
+        alerts: { type: array, items: { $ref: '#/components/schemas/MaintenanceAlert' } }
+        rul: { type: [object, 'null'], properties: { low_days: { type: number }, high_days: { type: number } } }
+        summary: { type: [string, 'null'], description: Generated from rows when closed (not model text) }
+        genba_case_id: { type: [string, 'null'] }
+
+    RiskRow:
+      type: object
+      properties:
+        machine: { type: string }
+        name: { type: string }
+        criticality: { $ref: '#/components/schemas/Severity' }
+        health_now: { type: number }
+        health_week_ago: { type: [number, 'null'] }
+        health_drop_7d: { type: [number, 'null'] }
+        open_incidents: { type: integer }
+        top_severity: { type: [string, 'null'] }
+        risk_score: { type: number }
+
+    FailureEvent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        machine: { type: string }
+        ts: { type: string, format: date-time }
+        failure_mode: { type: string }
+        component: { type: string }
+        downtime_min: { type: [number, 'null'] }
+        cost: { type: [number, 'null'] }
+        detected_by_alert_id: { type: [string, 'null'], format: uuid }
+        lead_time_days: { type: [number, 'null'] }
+
+    Explanation:
+      type: object
+      properties:
+        alert_id: { type: string, format: uuid }
+        lang: { type: string }
+        narrative: { type: [string, 'null'], description: Null when withheld by the grounding post-check }
+        withheld_reason: { type: [string, 'null'] }
+        assessment: { type: object, properties: { hypothesis: { type: string }, likelihood: { type: string, enum: [low, medium, high] }, verification_required: { type: array, items: { type: string } } } }
+        recommended_inspection: { type: array, items: { type: string } }
+        evidence_used: { type: array, items: { type: string }, description: Keys of the evidence object cited }
+        similar_cases: { type: array, items: { type: object, properties: { machine: { type: string }, date: { type: string }, outcome: { type: string }, genba_case: { type: [integer, 'null'] } } } }
+        grounding: { type: object, properties: { numbers_found: { type: integer }, numbers_matched: { type: integer } } }
+        model: { type: string }
+        prompt_version: { type: string }
+
+    WorkOrderDraft:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        alert_id: { type: string, format: uuid }
+        machine: { type: string }
+        symptom: { type: string }
+        evidence: { type: object, additionalProperties: true }
+        tasks: { type: array, items: { type: string } }
+        parts: { type: array, items: { type: string } }
+        priority: { type: string, enum: [low, medium, high, urgent] }
+        due_within_days: { type: [integer, 'null'] }
+        created_at: { type: string, format: date-time }
+        exported_at: { type: [string, 'null'], format: date-time }
+        export_ref: { type: [string, 'null'] }
+
+    MaintenanceWindow:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        machine: { type: string }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        kind: { type: string, enum: [planned_service, changeover, warmup, commissioning] }
+        reason: { type: [string, 'null'] }
+        declared_by: { type: [string, 'null'] }
+
+    ConfigVersion:
+      type: object
+      properties:
+        kind: { type: string, enum: [sensor_map, alert_rules] }
+        version: { type: string }
+        sha256: { type: string }
+        loaded_at: { type: string, format: date-time }
+        loaded_by: { type: [string, 'null'] }
+        content: { type: object, additionalProperties: true, description: OT endpoints and register maps redacted unless admin }

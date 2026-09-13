@@ -1,0 +1,23 @@
+# MachineSense broker ACL — mosquitto.acl.example (copy to ${CONFIG_DIR}/mosquitto.acl)
+# Each gateway / DAQ may publish ONLY under its own machine prefix; only the ingest user may subscribe with wildcards (SEC-P30).
+
+# ingest service: subscribe everything, publish nothing
+user ms-ingest
+topic read factory/#
+
+# machine gateways: write own prefix only
+user gw-m07
+topic write factory/BKK-1/M-07/#
+
+user gw-m04
+topic write factory/BKK-1/M-04/#
+
+# vibration DAQ devices (IF-38): features and snapshots for their machine only
+user daq-07
+topic write factory/BKK-1/M-07/features/#
+
+user daq-04
+topic write factory/BKK-1/M-04/features/#
+
+# default: nothing
+pattern read $SYS/broker/uptime

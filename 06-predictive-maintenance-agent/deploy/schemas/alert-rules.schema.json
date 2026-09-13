@@ -1,0 +1,285 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://machinesense.plant.local/schemas/alert-rules.schema.json",
+  "title": "MachineSense alert rules",
+  "description": "Thresholds, consecutive-window rule, severity ladder, health-index weights, suppression and the attribution → component map. Loaded by PUT /config/alert-rules; every alert stamps the version. C-04: RUL point estimates are invalid by schema.",
+  "type": "object",
+  "required": [
+    "version",
+    "consecutive_windows",
+    "severity_ladder",
+    "health_index",
+    "rul",
+    "component_map"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}(-[0-9]+)?$"
+    },
+    "consecutive_windows": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 20,
+      "description": "FR-17: N violating windows before an alert (default 3)"
+    },
+    "window_s": {
+      "type": "integer",
+      "enum": [
+        60,
+        600
+      ],
+      "default": 60
+    },
+    "severity_ladder": {
+      "type": "object",
+      "required": [
+        "WATCH",
+        "HIGH",
+        "CRITICAL"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "WATCH": {
+          "$ref": "#/$defs/level"
+        },
+        "HIGH": {
+          "$ref": "#/$defs/level"
+        },
+        "CRITICAL": {
+          "$ref": "#/$defs/level"
+        }
+      }
+    },
+    "health_index": {
+      "type": "object",
+      "required": [
+        "weights",
+        "sigma_transform"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "weights": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "minProperties": 2,
+          "description": "Penalty weights per feature plus 'anomaly'; MUST sum to 1.0 (checked by the loader; TC-006 negative)"
+        },
+        "sigma_transform": {
+          "type": "object",
+          "required": [
+            "kind",
+            "start",
+            "full"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "linear_clamp"
+            },
+            "start": {
+              "type": "number",
+              "minimum": 0
+            },
+            "full": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          },
+          "description": "f(sigma) = 100 * clamp((sigma - start) / (full - start), 0, 1)"
+        },
+        "critical_below": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 40
+        }
+      }
+    },
+    "trend": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "window_days": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 30,
+          "default": 5
+        },
+        "ci": {
+          "type": "number",
+          "enum": [
+            0.8,
+            0.9,
+            0.95
+          ],
+          "default": 0.8
+        },
+        "min_pct_change": {
+          "type": "number",
+          "minimum": 0,
+          "default": 5
+        }
+      }
+    },
+    "rul": {
+      "type": "object",
+      "required": [
+        "min_comparable_failures",
+        "confidence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "min_comparable_failures": {
+          "type": "integer",
+          "minimum": 3,
+          "description": "AI-04: never below 3"
+        },
+        "confidence": {
+          "type": "number",
+          "enum": [
+            0.8,
+            0.9
+          ]
+        },
+        "point_estimate": {
+          "type": "boolean",
+          "const": false,
+          "description": "C-04: a point estimate is never allowed"
+        }
+      }
+    },
+    "suppression": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "startup_minutes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 240,
+          "default": 30
+        },
+        "changeover": {
+          "type": "boolean",
+          "default": true
+        },
+        "rebaseline_required_downgrade_to": {
+          "type": "string",
+          "enum": [
+            "WATCH",
+            "INFO"
+          ],
+          "default": "WATCH"
+        }
+      }
+    },
+    "component_map": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "features",
+          "component",
+          "recommendation"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "features": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          },
+          "component": {
+            "type": "string"
+          },
+          "recommendation": {
+            "type": "string",
+            "minLength": 10
+          },
+          "parts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "description": "C-05: the attribution's top features select the suspected component and the recommended inspection"
+    },
+    "delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "discord": {
+          "type": "boolean",
+          "default": true
+        },
+        "email": {
+          "type": "boolean",
+          "default": false
+        },
+        "webhook": {
+          "type": "boolean",
+          "default": false
+        },
+        "min_severity": {
+          "type": "string",
+          "enum": [
+            "WATCH",
+            "HIGH",
+            "CRITICAL"
+          ],
+          "default": "WATCH"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "level": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sigma_min": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "anomaly_min": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "health_below": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "sigma_min"
+          ]
+        },
+        {
+          "required": [
+            "anomaly_min"
+          ]
+        },
+        {
+          "required": [
+            "health_below"
+          ]
+        }
+      ]
+    }
+  }
+}

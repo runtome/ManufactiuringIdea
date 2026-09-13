@@ -1,0 +1,103 @@
+# MachineSense sensor map — deploy/sensors.example.yaml
+# Loaded with:  msctl config load sensors.yaml    (admin; PUT /config/sensor-map; validated against schemas/sensor-map.schema.json)
+#
+# Rules this file lives by (ICD-06, SEC-06):
+#   - OPC-UA sources are READ-ONLY: access: read is the only value the schema accepts, and the account named by
+#     credential_ref must be read-only on the controller itself (TEST-06 TC-020 proves it at onboarding).
+#   - Modbus: read function codes only (3, 4); the operator asserts an isolated segment (isolated_segment: true).
+#   - Credentials are never here — only secret:<name> references resolved from the secrets directory.
+#   - High-rate vibration comes as DAQ features (IF-38), never raw waveforms (C-03).
+#   - Contexts are expressions over signals with hysteresis; a baseline exists per context or not at all (ADR-P02).
+
+version: "2026-09-01"
+plant: BKK-1
+
+defaults:
+  gap_factor: 3          # gap = no sample for > 3 × expected interval (FR-03)
+  stuck_n: 30            # identical values for 30 samples → stuck
+  skew_s: 5              # NFR-09
+  feature_windows_s: [60, 600]
+
+machines:
+
+  - code: M-07
+    name: Injection press B
+    line: L1
+    machine_type: injection_press
+    criticality: CRITICAL
+    nominal_rpm: 1450
+    sources:
+      opcua:
+        endpoint: opc.tcp://10.20.3.7:4840
+        security_policy: Basic256Sha256
+        security_mode: SignAndEncrypt
+        credential_ref: secret:opcua-m07-ro          # read-only account, enforced on the controller
+        access: read
+        publishing_interval_ms: 1000
+      mqtt:
+        topic_prefix: factory/BKK-1/M-07
+    signals:
+      - { name: bearing_temp_ds, unit: degC, source: mqtt,  rate_hz: 1,   range: [0, 200],  topic: factory/BKK-1/M-07/telemetry/bearing_temp_ds }
+      - { name: ambient_temp,    unit: degC, source: mqtt,  rate_hz: 0.1, range: [-10, 60], topic: factory/BKK-1/M-07/telemetry/ambient_temp }
+      - { name: vib_rms_ds,      unit: mm/s, source: daq,   rate_hz: 1,   range: [0, 50],   daq: { id: DAQ-07, window_s: 10, bands: [1x, 2x, 3x, bpfo, bpfi, hf_10k_20k] } }
+      - { name: motor_current,   unit: A,    source: opcua, rate_hz: 1,   range: [0, 120],  node_id: "ns=2;s=Drive.MotorCurrent" }
+      - { name: rpm,             unit: rpm,  source: opcua, rate_hz: 1,   range: [0, 3000], node_id: "ns=2;s=Drive.Speed", context_tag: true }
+      - { name: plc_state,       unit: enum, source: opcua, rate_hz: 1,   node_id: "ns=2;s=Machine.State", context_tag: true }
+      - { name: delta_t,         unit: degC, source: derived, expression: "bearing_temp_ds - ambient_temp", inputs: [bearing_temp_ds, ambient_temp] }
+    contexts:
+      - { name: running,    expression: "rpm > 200 and motor_current > 5", priority: 10, hysteresis_s: 60 }
+      - { name: changeover, expression: "plc_state == 'CHG'",             priority: 5,  hysteresis_s: 0 }
+      - { name: startup,    expression: "plc_state == 'START'",           priority: 5,  hysteresis_s: 0 }
+      - { name: idle,       expression: "rpm > 0 and rpm <= 200",         priority: 20, hysteresis_s: 60 }
+      - { name: stopped,    expression: "rpm == 0",                       priority: 30, hysteresis_s: 60 }
+    components: [drive-side bearing, non-drive-side bearing, coupling, motor, hydraulic pump]
+
+  - code: M-04
+    name: Injection press A
+    line: L1
+    machine_type: injection_press
+    criticality: HIGH
+    nominal_rpm: 1450
+    sources:
+      opcua:
+        endpoint: opc.tcp://10.20.3.4:4840
+        security_policy: Basic256Sha256
+        security_mode: SignAndEncrypt
+        credential_ref: secret:opcua-m04-ro
+        access: read
+      mqtt:
+        topic_prefix: factory/BKK-1/M-04
+    signals:
+      - { name: bearing_temp_ds, unit: degC, source: mqtt,  rate_hz: 1,   range: [0, 200],  topic: factory/BKK-1/M-04/telemetry/bearing_temp_ds }
+      - { name: ambient_temp,    unit: degC, source: mqtt,  rate_hz: 0.1, range: [-10, 60], topic: factory/BKK-1/M-04/telemetry/ambient_temp }
+      - { name: vib_rms_ds,      unit: mm/s, source: daq,   rate_hz: 1,   range: [0, 50],   daq: { id: DAQ-04, window_s: 10, bands: [1x, 2x, 3x, bpfo, bpfi] } }
+      - { name: motor_current,   unit: A,    source: opcua, rate_hz: 1,   range: [0, 120],  node_id: "ns=2;s=Drive.MotorCurrent" }
+      - { name: rpm,             unit: rpm,  source: opcua, rate_hz: 1,   range: [0, 3000], node_id: "ns=2;s=Drive.Speed", context_tag: true }
+    contexts:
+      - { name: running, expression: "rpm > 200 and motor_current > 5", priority: 10, hysteresis_s: 60 }
+      - { name: idle,    expression: "rpm > 0 and rpm <= 200",         priority: 20, hysteresis_s: 60 }
+      - { name: stopped, expression: "rpm == 0",                       priority: 30, hysteresis_s: 60 }
+    components: [drive-side bearing, non-drive-side bearing, coupling, motor]
+
+  - code: M-11
+    name: Conveyor C
+    line: L2
+    machine_type: conveyor
+    criticality: MEDIUM
+    nominal_rpm: 90
+    sources:
+      modbus:
+        host: 10.20.9.11
+        port: 502
+        unit_id: 1
+        poll_s: 2
+        function_codes: [3, 4]
+        isolated_segment: true          # SEC-P32: Modbus has no authentication; the OT segment is isolated and the risk signed
+    signals:
+      - { name: motor_current, unit: A,    source: modbus, rate_hz: 0.5, range: [0, 60],  register: { address: 40001, count: 2, type: float32, word_order: big } }
+      - { name: bearing_temp_ds, unit: degC, source: modbus, rate_hz: 0.5, range: [0, 150], register: { address: 40010, count: 1, type: uint16, scale: 0.1 } }
+      - { name: rpm,           unit: rpm,  source: modbus, rate_hz: 0.5, range: [0, 300], register: { address: 40012, count: 1, type: uint16 }, context_tag: true }
+    contexts:
+      - { name: running, expression: "rpm > 10 and motor_current > 2", priority: 10, hysteresis_s: 60 }
+      - { name: stopped, expression: "rpm == 0",                      priority: 30, hysteresis_s: 60 }
+    components: [main belt, drive motor, idler bearing]

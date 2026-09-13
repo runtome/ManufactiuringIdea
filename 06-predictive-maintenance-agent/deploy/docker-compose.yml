@@ -1,0 +1,335 @@
+# MachineSense — docker-compose.yml (standalone; OPS-06 §4)
+#
+# Principles visible in this file:
+#   - Ingest services (ingest-mqtt, ingest-opcua, ingest-modbus) are the ONLY members of the `ot` network. Nothing else
+#     can reach machines; nothing on the OT segment can reach the server side (SEC-P31). They initiate; they read.
+#   - No service carries a write-capable OT flag; OPC-UA accounts are read-only on the controller (TC-020), Modbus
+#     function codes 3/4 only — enforced by the sensor-map schema, not by an environment variable.
+#   - Every application container: non-root, read-only rootfs, cap_drop ALL, no-new-privileges.
+#   - Secrets are files under ${SECRETS_DIR} (OT credentials, Discord, SMTP, CMMS HMAC). Nothing secret in .env.
+#   - Losing any of this affects no machine (NFR-07).
+#
+# Profiles:  opcua, modbus — start the corresponding ingest. GPU: set GPU_COUNT=1 in .env (0 = CPU-only, use a <= 4B model).
+
+name: machinesense
+
+x-hardened: &hardened
+  restart: unless-stopped
+  user: "10001:10001"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: { max-size: "50m", max-file: "5" }
+  env_file: .env
+  tmpfs: ["/tmp:size=128m,mode=1777"]
+
+x-app-env: &app-env
+  DATABASE_URL_FILE: /run/secrets/database_url
+  REDIS_URL: redis://redis:6379/0
+  TZ: ${TZ}
+  PLANT_TZ: ${PLANT_TZ}
+
+services:
+
+  # ------------------------------------------------------------- ingest (OT-facing)
+  ingest-mqtt:
+    <<: *hardened
+    image: ${MS_REGISTRY}/machinesense-ingest-mqtt:${MS_VERSION}
+    container_name: ms-ingest-mqtt
+    networks: [ot, internal]
+    environment:
+      <<: *app-env
+      MQTT_URL: ${MQTT_URL}
+      MQTT_CREDENTIAL_FILE: /run/secrets/mqtt_ingest
+      MQTT_TOPIC_ROOT: ${MQTT_TOPIC_ROOT}
+      BUFFER_DIR: /var/lib/machinesense/buffer
+      BUFFER_MAX_HOURS: ${BUFFER_MAX_HOURS}
+      BATCH_ROWS: ${INGEST_BATCH_ROWS}
+      GAP_FACTOR: ${GAP_FACTOR}
+      STUCK_N: ${STUCK_N}
+      SKEW_S: ${SKEW_S}
+      SENSOR_MAP_FILE: /etc/machinesense/sensors.yaml
+    volumes:
+      - ${SECRETS_DIR}/database_url:/run/secrets/database_url:ro
+      - ${SECRETS_DIR}/mqtt_ingest:/run/secrets/mqtt_ingest:ro
+      - ${CONFIG_DIR}/sensors.yaml:/etc/machinesense/sensors.yaml:ro
+      - buffer-mqtt:/var/lib/machinesense/buffer
+    depends_on: [postgres, mosquitto]
+
+  ingest-opcua:
+    <<: *hardened
+    profiles: [opcua]
+    image: ${MS_REGISTRY}/machinesense-ingest-opcua:${MS_VERSION}
+    container_name: ms-ingest-opcua
+    # Read-only client. No write code path exists in this image (TC-100); the account is read-only on the controller (TC-020).
+    networks: [ot, internal]
+    environment:
+      <<: *app-env
+      OPCUA_CREDENTIALS_DIR: /run/secrets/opcua        # one file per credential_ref in sensors.yaml
+      OPCUA_CLIENT_CERT_FILE: /run/secrets/opcua_client.crt
+      OPCUA_CLIENT_KEY_FILE: /run/secrets/opcua_client.key
+      OPCUA_RECONNECT_MAX_S: ${OPCUA_RECONNECT_MAX_S}
+      BUFFER_DIR: /var/lib/machinesense/buffer
+      BUFFER_MAX_HOURS: ${BUFFER_MAX_HOURS}
+      BATCH_ROWS: ${INGEST_BATCH_ROWS}
+      SENSOR_MAP_FILE: /etc/machinesense/sensors.yaml
+    volumes:
+      - ${SECRETS_DIR}/database_url:/run/secrets/database_url:ro
+      - ${SECRETS_DIR}/opcua:/run/secrets/opcua:ro
+      - ${SECRETS_DIR}/opcua_client.crt:/run/secrets/opcua_client.crt:ro
+      - ${SECRETS_DIR}/opcua_client.key:/run/secrets/opcua_client.key:ro
+      - ${CONFIG_DIR}/sensors.yaml:/etc/machinesense/sensors.yaml:ro
+      - buffer-opcua:/var/lib/machinesense/buffer
+    depends_on: [postgres]
+
+  ingest-modbus:
+    <<: *hardened
+    profiles: [modbus]
+    image: ${MS_REGISTRY}/machinesense-ingest-modbus:${MS_VERSION}
+    container_name: ms-ingest-modbus
+    # Polling client with function codes 3 and 4 only (TC-031). Modbus segments must be isolated (SEC-P32).
+    networks: [ot, internal]
+    environment:
+      <<: *app-env
+      MODBUS_POLL_TIMEOUT_S: ${MODBUS_POLL_TIMEOUT_S}
+      BUFFER_DIR: /var/lib/machinesense/buffer
+      BUFFER_MAX_HOURS: ${BUFFER_MAX_HOURS}
+      BATCH_ROWS: ${INGEST_BATCH_ROWS}
+      STUCK_N: ${STUCK_N}
+      SENSOR_MAP_FILE: /etc/machinesense/sensors.yaml
+    volumes:
+      - ${SECRETS_DIR}/database_url:/run/secrets/database_url:ro
+      - ${CONFIG_DIR}/sensors.yaml:/etc/machinesense/sensors.yaml:ro
+      - buffer-modbus:/var/lib/machinesense/buffer
+    depends_on: [postgres]
+
+  mosquitto:
+    image: eclipse-mosquitto:${MOSQUITTO_VERSION}
+    container_name: ms-mosquitto
+    restart: unless-stopped
+    networks: [ot]
+    ports:
+      - "${OT_BIND_ADDR}:8883:8883"                   # TLS listener on the OT-facing interface only
+    volumes:
+      - ${CONFIG_DIR}/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ${CONFIG_DIR}/mosquitto.acl:/mosquitto/config/acl:ro
+      - ${SECRETS_DIR}/mosquitto_passwd:/mosquitto/config/passwd:ro
+      - ${SECRETS_DIR}/mosquitto_tls:/mosquitto/certs:ro
+      - mosquitto-data:/mosquitto/data
+    user: "1883:1883"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  # ------------------------------------------------------------- pipeline
+  features:
+    <<: *hardened
+    image: ${MS_REGISTRY}/machinesense-features:${MS_VERSION}
+    container_name: ms-features
+    networks: [internal]
+    environment:
+      <<: *app-env
+      FEATURE_WINDOWS_S: ${FEATURE_WINDOWS_S}
+      FEATURE_LAG_TARGET_S: ${FEATURE_LAG_TARGET_S}
+      WORKERS: ${FEATURE_WORKERS}
+      SENSOR_MAP_FILE: /etc/machinesense/sensors.yaml
+    volumes:
+      - ${SECRETS_DIR}/database_url:/run/secrets/database_url:ro
+      - ${CONFIG_DIR}/sensors.yaml:/etc/machinesense/sensors.yaml:ro
+    depends_on: [postgres, redis]
+
+  scoring:
+    <<: *hardened
+    image: ${MS_REGISTRY}/machinesense-scoring:${MS_VERSION}
+    container_name: ms-scoring
+    networks: [internal]
+    environment:
+      <<: *app-env
+      SCORING_INTERVAL_S: ${SCORING_INTERVAL_S}
+      MODEL_ARTEFACT_DIR: /var/lib/machinesense/models
+      ALERT_RULES_FILE: /etc/machinesense/alert-rules.yaml
+      EWMA_LAMBDA: ${EWMA_LAMBDA}
+    volumes:
+      - ${SECRETS_DIR}/database_url:/run/secrets/database_url:ro
+      - ${CONFIG_DIR}/alert-rules.yaml:/etc/machinesense/alert-rules.yaml:ro
+      - models:/var/lib/machinesense/models
+    depends_on: [postgres, redis]
+
+  alerting:
+    <<: *hardened
+    image: ${MS_REGISTRY}/machinesense-alerting:${MS_VERSION}
+    container_name: ms-alerting
+    networks: [internal, egress]                      # egress: Discord, SMTP, webhook only
+    environment:
+      <<: *app-env
+      ALERT_RULES_FILE: /etc/machinesense/alert-rules.yaml
+      DISCORD_BOT_TOKEN_FILE: /run/secrets/discord_bot_token
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID}
+      DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID}
+      SMTP_URL_FILE: /run/secrets/smtp_url
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL}
+      ALERT_WEBHOOK_HMAC_FILE: /run/secrets/alert_webhook_hmac
+      PUBLIC_URL: ${PUBLIC_URL}
+    volumes:
+      - ${SECRETS_DIR}/database_url:/run/secrets/database_url:ro
+      - ${SECRETS_DIR}/discord_bot_token:/run/secrets/discord_bot_token:ro
+      - ${SECRETS_DIR}/smtp_url:/run/secrets/smtp_url:ro
+      - ${SECRETS_DIR}/alert_webhook_hmac:/run/secrets/alert_webhook_hmac:ro
+      - ${CONFIG_DIR}/alert-rules.yaml:/etc/machinesense/alert-rules.yaml:ro
+    depends_on: [postgres, redis]
+
+  agent:
+    <<: *hardened
+    image: ${MS_REGISTRY}/machinesense-agent:${MS_VERSION}
+    container_name: ms-agent
+    networks: [internal]
+    environment:
+      <<: *app-env
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+      PROMPT_VERSION: ${PROMPT_VERSION}
+      LLM_TIMEOUT_S: ${LLM_TIMEOUT_S}
+      ASK_MAX_TOOL_CALLS: ${ASK_MAX_TOOL_CALLS}
+      GENBA_MEMORY_URL: ${GENBA_MEMORY_URL}
+      DEFAULT_LANG: ${DEFAULT_LANG}
+    volumes:
+      - ${SECRETS_DIR}/database_url:/run/secrets/database_url:ro
+    depends_on: [postgres, redis, ollama]
+
+  scheduler:
+    <<: *hardened
+    image: ${MS_REGISTRY}/machinesense-scheduler:${MS_VERSION}
+    container_name: ms-scheduler
+    networks: [internal, egress]
+    environment:
+      <<: *app-env
+      ROLLUP_CRON: ${ROLLUP_CRON}
+      RETENTION_CRON: ${RETENTION_CRON}
+      RETRAIN_CRON: ${RETRAIN_CRON}
+      WEEKLY_RISKS_CRON: ${WEEKLY_RISKS_CRON}
+      SENSOR_HEALTH_INTERVAL_S: ${SENSOR_HEALTH_INTERVAL_S}
+      RETENTION_RAW_DAYS: ${RETENTION_RAW_DAYS}
+      RETENTION_ROLLUP_DAYS: ${RETENTION_ROLLUP_DAYS}
+      RETENTION_FEATURE_DAYS: ${RETENTION_FEATURE_DAYS}
+      MODEL_ARTEFACT_DIR: /var/lib/machinesense/models
+    volumes:
+      - ${SECRETS_DIR}/database_url:/run/secrets/database_url:ro
+      - models:/var/lib/machinesense/models
+    depends_on: [postgres, redis]
+
+  # ------------------------------------------------------------- people-facing
+  api:
+    <<: *hardened
+    image: ${MS_REGISTRY}/machinesense-api:${MS_VERSION}
+    container_name: ms-api
+    networks: [internal, frontend, egress]            # egress: CMMS webhook (IF-37)
+    ports:
+      - "${BIND_ADDR}:${API_PORT}:8000"
+    environment:
+      <<: *app-env
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      CMMS_WEBHOOK_URL: ${CMMS_WEBHOOK_URL}
+      CMMS_WEBHOOK_HMAC_FILE: /run/secrets/cmms_webhook_hmac
+      SENSOR_MAP_SCHEMA: /etc/machinesense/schemas/sensor-map.schema.json
+      ALERT_RULES_SCHEMA: /etc/machinesense/schemas/alert-rules.schema.json
+      PUBLIC_URL: ${PUBLIC_URL}
+    volumes:
+      - ${SECRETS_DIR}/database_url:/run/secrets/database_url:ro
+      - ${SECRETS_DIR}/jwt_secret:/run/secrets/jwt_secret:ro
+      - ${SECRETS_DIR}/cmms_webhook_hmac:/run/secrets/cmms_webhook_hmac:ro
+      - ./schemas:/etc/machinesense/schemas:ro
+      - exports:/var/lib/machinesense/exports
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/v1/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    depends_on: [postgres, redis]
+
+  web:
+    <<: *hardened
+    image: ${MS_REGISTRY}/machinesense-web:${MS_VERSION}
+    container_name: ms-web
+    networks: [frontend]
+    ports:
+      - "${BIND_ADDR}:${WEB_PORT}:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: ${PUBLIC_URL}/api/v1
+      TZ: ${TZ}
+    tmpfs: ["/tmp:size=64m,mode=1777", "/app/.next/cache:size=128m"]
+    depends_on: [api]
+
+  # ------------------------------------------------------------- state
+  postgres:
+    image: timescale/timescaledb:${TIMESCALE_IMAGE_TAG}
+    container_name: ms-postgres
+    restart: unless-stopped
+    networks: [internal]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    command: ["postgres", "-c", "shared_buffers=${PG_SHARED_BUFFERS}", "-c", "max_wal_size=4GB", "-c", "timescaledb.max_background_workers=8"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ${SECRETS_DIR}/postgres_password:/run/secrets/postgres_password:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }
+
+  redis:
+    image: redis:7-alpine
+    container_name: ms-redis
+    restart: unless-stopped
+    networks: [internal]
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    user: "999:999"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/data:size=64m"]
+
+  ollama:
+    image: ollama/ollama:${OLLAMA_VERSION}
+    container_name: ms-ollama
+    restart: unless-stopped
+    networks: [internal]                      # no egress; models pulled at install time (OPS-06 §4.3)
+    environment:
+      OLLAMA_KEEP_ALIVE: 30m
+      OLLAMA_NUM_PARALLEL: "1"
+    volumes:
+      - ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT}             # 0 on CPU-only hosts (use a <= 4B model)
+              capabilities: [gpu]
+
+volumes:
+  pgdata: {}
+  ollama: {}
+  models: {}
+  exports: {}
+  mosquitto-data: {}
+  buffer-mqtt: {}
+  buffer-opcua: {}
+  buffer-modbus: {}
+
+networks:
+  ot:
+    driver: bridge
+    driver_opts: { com.docker.network.bridge.name: br-ms-ot }   # attach the OT-facing NIC / VLAN to this bridge on the ingest host (OPS-06 §3)
+  internal:
+    internal: true          # postgres, redis, ollama, pipeline: no route out
+  frontend: {}              # api, web: published on ${BIND_ADDR}
+  egress: {}                # alerting (Discord/SMTP/webhook), scheduler, api (CMMS)
