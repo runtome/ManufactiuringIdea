@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.plant.local/schemas/pocketqc/model-manifest.schema.json",
+  "title": "PocketQC model manifest",
+  "description": "What the platform publishes for a mobile model (API-05 MobileModelManifest). C-02: size <= 25 MB. FR-26: samples for the on-device self-test are mandatory. AI-02 gates are minimums here.",
+  "type": "object",
+  "required": [
+    "name",
+    "version",
+    "task",
+    "sha256",
+    "url",
+    "size_bytes",
+    "input_size",
+    "class_map",
+    "samples_url",
+    "samples_sha256",
+    "expected_metrics"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{2,40}$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "task": {
+      "type": "string",
+      "enum": [
+        "detection",
+        "classification",
+        "ocr"
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "url": {
+      "type": "string",
+      "pattern": "^https://"
+    },
+    "size_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 26214400
+    },
+    "input_size": {
+      "type": "integer",
+      "enum": [
+        224,
+        320,
+        416,
+        512,
+        640
+      ]
+    },
+    "precision": {
+      "type": "string",
+      "enum": [
+        "int8",
+        "fp16"
+      ],
+      "default": "int8"
+    },
+    "class_map": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "minProperties": 1
+    },
+    "samples_url": {
+      "type": "string",
+      "pattern": "^https://"
+    },
+    "samples_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "min_app_version": {
+      "type": "string"
+    },
+    "expected_metrics": {
+      "type": "object",
+      "required": [
+        "map50",
+        "recall_critical"
+      ],
+      "properties": {
+        "map50": {
+          "type": "number",
+          "minimum": 0.75
+        },
+        "recall_critical": {
+          "type": "number",
+          "minimum": 0.95
+        },
+        "int8_delta_map": {
+          "type": "number",
+          "maximum": 0.03
+        },
+        "holdout_images": {
+          "type": "integer"
+        }
+      }
+    },
+    "selftest": {
+      "type": "object",
+      "properties": {
+        "min_recall": {
+          "type": "number",
+          "default": 0.95
+        },
+        "max_latency_ms": {
+          "type": "integer",
+          "default": 500
+        }
+      }
+    },
+    "device_classes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

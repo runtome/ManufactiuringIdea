@@ -1,0 +1,529 @@
+openapi: 3.1.0
+info:
+  title: PocketQC ↔ Platform mobile contract (IF-11)
+  version: 1.1.0-proposed
+  summary: The server API a PocketQC device consumes — the platform's IF-11 as PocketQC needs it.
+  description: |
+    **Who serves this.** The FactoryBrain platform (API-00). PocketQC is a **client**; it
+    serves nothing. This document exists so the client's behaviour is specified against
+    one exact contract, and so the platform team can see precisely what must be added.
+
+    **Two kinds of content:**
+    - **Identical to API-00 today** — `GET /mobile/bootstrap`, `POST /mobile/sessions:batch`
+      and the schemas `MobileBootstrap`, `MobileSession`, `BatchResult`, `ModelManifest`,
+      `Verdict`, `Problem`. Copied verbatim and diffed by TEST-05 TC-008. Do not edit here;
+      change API-00 first.
+    - **Proposed v1.1 additions** (marked `x-status: proposed`) — required by SRS-05 §4.1 and
+      not in API-00: auth with an offline window, ranged model download, resumable image
+      upload, policy, device heartbeat and commands (remote wipe), and a **typed session
+      step** (`MobileSessionStep`) that the untyped `MobileSession.steps` items conform to
+      — an additive refinement, not a breaking change.
+
+    **The conflict rule (FR-23, IF-11):** the server wins for master data; the **device
+    wins for inspection records** — the server stores what the device sent and records
+    any later server-side review as a separate override, never by altering the device's
+    `human_result`.
+
+    Errors are RFC 7807 `application/problem+json` with a stable `code`.
+  contact: { name: Suphot N. }
+  license: { name: Proprietary }
+  x-document-id: API-05-PocketQC
+  x-client-behaviour:
+    order: "bootstrap → policy → sessions:batch (≤ 200, oldest first) → images (resumable, sessions already accepted) → models → heartbeat"
+    trigger: "WorkManager: Wi-Fi (or any, per policy), periodic 15 min + on-connectivity + manual"
+    backoff: { initial_s: 2, factor: 2, max_s: 900, jitter: "±20 %" }
+    outcomes: { accepted: "synced_at set", duplicate: "synced_at set (healthy retry)", rejected: "kept; attempts+1; stuck after 5" }
+
+servers:
+  - url: https://factorybrain.plant.local/api/v1
+    description: The platform (URL comes from managed configuration, IF-33; certificate pinned)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - { name: mobile, description: "IF-11 endpoints consumed by PocketQC" }
+
+paths:
+  # ------------------------------------------------------------------ existing (verbatim from API-00)
+  /mobile/bootstrap:
+    get:
+      tags: [mobile]
+      summary: Checklists, SKUs, defect codes and model manifest
+      operationId: mobileBootstrap
+      parameters:
+        - name: If-None-Match
+          in: header
+          schema: { type: string }
+      responses:
+        '200':
+          description: Bootstrap bundle
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MobileBootstrap' }
+        '304':
+          description: Unchanged
+
+  /mobile/sessions:batch:
+    post:
+      tags: [mobile]
+      summary: Upload offline inspection sessions
+      description: |
+        Conflict rule: the server wins for master data, the **device wins for
+        inspection records**. The server never silently changes a verdict the
+        inspector recorded.
+      operationId: pushMobileSessions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sessions]
+              properties:
+                sessions:
+                  type: array
+                  maxItems: 200
+                  items: { $ref: '#/components/schemas/MobileSession' }
+      responses:
+        '207':
+          description: Per-session outcomes
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BatchResult' }
+
+  # ------------------------------------------------------------------ proposed v1.1
+  /mobile/auth:
+    post:
+      tags: [mobile]
+      summary: Login with company credentials; returns tokens and the offline validity window (FR-27)
+      operationId: mobileAuth
+      x-status: proposed
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password, device_id]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+                device_id: { type: string, description: From managed configuration; the server binds the refresh token to it }
+                app_version: { type: string }
+      responses:
+        '200':
+          description: Tokens
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [access_token, refresh_token, offline_valid_until, user]
+                properties:
+                  access_token: { type: string }
+                  refresh_token: { type: string, description: "Long-lived (offline window), bound to device_id, revocable" }
+                  offline_valid_until: { type: string, format: date-time, description: "Default now + 30 d; policy may shorten" }
+                  user: { type: object, properties: { id: { type: string }, display_name: { type: string }, role: { type: string, enum: [inspector, supervisor, admin] }, lang: { type: string, enum: [th, ja, en] } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Device not enrolled or wiped, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' }, example: { type: "urn:factorybrain:problem:device", title: Device not allowed, status: 403, code: DEVICE_WIPED } } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /mobile/auth/refresh:
+    post:
+      tags: [mobile]
+      summary: Refresh the access token (online); extends the offline window
+      operationId: mobileRefresh
+      x-status: proposed
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [refresh_token, device_id], properties: { refresh_token: { type: string }, device_id: { type: string } } }
+      responses:
+        '200': { description: Tokens, content: { application/json: { schema: { type: object, properties: { access_token: { type: string }, refresh_token: { type: string }, offline_valid_until: { type: string, format: date-time } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /mobile/models:
+    get:
+      tags: [mobile]
+      summary: Model manifests for this device class (superset of bootstrap.models with download details)
+      operationId: mobileModels
+      x-status: proposed
+      parameters:
+        - { name: device_class, in: query, schema: { type: string }, description: e.g. arm64-nnapi; the server may return per-class builds }
+        - { name: If-None-Match, in: header, schema: { type: string } }
+      responses:
+        '200':
+          description: Manifests
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  etag: { type: string }
+                  models: { type: array, items: { $ref: '#/components/schemas/MobileModelManifest' } }
+        '304': { description: Unchanged }
+
+  /mobile/models/{name}/{version}/download:
+    get:
+      tags: [mobile]
+      summary: Ranged model download (resumable)
+      description: Supports `Range`; the client verifies sha256 against the manifest before the on-device self-test (FR-26). Sample images for the self-test are a separate `samples_url` in the manifest.
+      operationId: mobileModelDownload
+      x-status: proposed
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+        - { name: Range, in: header, schema: { type: string } }
+      responses:
+        '200': { description: Whole file, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+        '206': { description: Partial content, headers: { Content-Range: { schema: { type: string } } }, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /mobile/images:
+    post:
+      tags: [mobile]
+      summary: Initiate a resumable image upload for an already-accepted session step
+      description: |
+        Resumable protocol (tus-style): `POST` creates the upload and returns its URL and
+        `Upload-Offset: 0`; `PATCH` appends bytes at the current offset; `HEAD` returns the
+        current offset after a network change. The server verifies `sha256` when the last
+        byte arrives; a mismatch is 422 `CHECKSUM_MISMATCH` and the upload is discarded.
+        Images are accepted only for sessions the server already holds (records first).
+      operationId: mobileImageInit
+      x-status: proposed
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image_id, session_id, step_uuid, sha256, bytes, content_type]
+              properties:
+                image_id: { type: string, format: uuid }
+                session_id: { type: string, format: uuid }
+                step_uuid: { type: string, format: uuid }
+                sha256: { type: string }
+                bytes: { type: integer }
+                content_type: { type: string, enum: [image/jpeg] }
+                captured_at: { type: string, format: date-time }
+      responses:
+        '201':
+          description: Upload created
+          headers: { Location: { schema: { type: string } }, Upload-Offset: { schema: { type: integer } } }
+          content: { application/json: { schema: { type: object, properties: { upload_url: { type: string }, offset: { type: integer } } } } }
+        '200': { description: Already complete (duplicate image_id) — treat as success, content: { application/json: { schema: { type: object, properties: { status: { type: string, const: complete } } } } } }
+        '404': { description: Session or step unknown — upload records first, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '413': { description: Image too large for policy, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /mobile/images/{imageId}:
+    patch:
+      tags: [mobile]
+      summary: Append bytes at the current offset
+      operationId: mobileImageAppend
+      x-status: proposed
+      parameters:
+        - { name: imageId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: Upload-Offset, in: header, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/offset+octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '204': { description: Appended, headers: { Upload-Offset: { schema: { type: integer } } } }
+        '409': { description: Offset mismatch — HEAD and resume, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' }, example: { type: "urn:factorybrain:problem:upload", title: Offset mismatch, status: 409, code: UPLOAD_OFFSET_MISMATCH, detail: "server offset 131072" } } } }
+        '422': { description: sha256 mismatch at completion — upload discarded, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    head:
+      tags: [mobile]
+      summary: Current offset of an upload
+      operationId: mobileImageStatus
+      x-status: proposed
+      parameters: [ { name: imageId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Offset, headers: { Upload-Offset: { schema: { type: integer } }, Upload-Length: { schema: { type: integer } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /mobile/policy:
+    get:
+      tags: [mobile]
+      summary: Retention, sync and wipe policy for this device (FR-21, FR-25, FR-28, FR-30)
+      operationId: mobilePolicy
+      x-status: proposed
+      parameters: [ { name: If-None-Match, in: header, schema: { type: string } } ]
+      responses:
+        '200': { description: Policy, content: { application/json: { schema: { $ref: '#/components/schemas/MobilePolicy' } } } }
+        '304': { description: Unchanged }
+
+  /mobile/devices/{deviceId}/heartbeat:
+    post:
+      tags: [mobile]
+      summary: Device health for the fleet view
+      operationId: mobileHeartbeat
+      x-status: proposed
+      parameters: [ { name: deviceId, in: path, required: true, schema: { type: string } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceHeartbeat' }
+      responses:
+        '200':
+          description: Acknowledged; may carry pending commands
+          content:
+            application/json:
+              schema: { type: object, properties: { commands: { type: array, items: { $ref: '#/components/schemas/DeviceCommand' } } } }
+
+  /mobile/devices/{deviceId}/commands:
+    get:
+      tags: [mobile]
+      summary: Pending commands (remote wipe, force re-login, force bootstrap)
+      operationId: mobileCommands
+      x-status: proposed
+      parameters: [ { name: deviceId, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200': { description: Commands, content: { application/json: { schema: { type: object, properties: { commands: { type: array, items: { $ref: '#/components/schemas/DeviceCommand' } } } } } } }
+
+  /mobile/devices/{deviceId}/commands/{commandId}/ack:
+    post:
+      tags: [mobile]
+      summary: Acknowledge a command (posted before the wipe deletes credentials)
+      operationId: mobileCommandAck
+      x-status: proposed
+      parameters:
+        - { name: deviceId, in: path, required: true, schema: { type: string } }
+        - { name: commandId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { result: { type: string, enum: [done, failed] }, detail: { type: string } } }
+      responses:
+        '204': { description: Acknowledged }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /mobile/audit:batch:
+    post:
+      tags: [mobile]
+      summary: Upload device audit events (logins, PIN, re-judge, model activation, purge, wipe)
+      operationId: pushMobileAudit
+      x-status: proposed
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id, events]
+              properties:
+                device_id: { type: string }
+                events: { type: array, maxItems: 500, items: { $ref: '#/components/schemas/MobileAuditEvent' } }
+      responses:
+        '207': { description: Per-event outcomes, content: { application/json: { schema: { $ref: '#/components/schemas/BatchResult' } } } }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token from /mobile/auth; refresh bound to device_id; offline validity window per policy (FR-27).
+
+  responses:
+    Unauthorized: { description: Missing or invalid token, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    NotFound: { description: Not found, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    TooManyRequests:
+      description: Rate limited
+      headers: { Retry-After: { schema: { type: integer } } }
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+
+  schemas:
+    # ------------------------------------------------ verbatim from API-00 (TEST-05 TC-008 diffs these six)
+    MobileBootstrap:
+      type: object
+      properties:
+        etag: { type: string }
+        checklists:
+          type: array
+          items: { type: object, additionalProperties: true }
+        skus:
+          type: array
+          items: { type: object, additionalProperties: true }
+        defect_codes:
+          type: array
+          items: { type: object, additionalProperties: true }
+        models:
+          type: array
+          items: { $ref: '#/components/schemas/ModelManifest' }
+
+    MobileSession:
+      type: object
+      required: [id, checklist_id, started_at, verdict]
+      properties:
+        id: { type: string, format: uuid }
+        checklist_id: { type: string }
+        sku: { type: string }
+        lot: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        verdict: { $ref: '#/components/schemas/Verdict' }
+        steps:
+          type: array
+          items: { type: object, additionalProperties: true }
+
+    BatchResult:
+      type: object
+      properties:
+        accepted: { type: integer }
+        duplicate: { type: integer, description: "Already present — not an error, the client may retry freely" }
+        rejected: { type: integer }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              status: { type: string, enum: [accepted, duplicate, rejected] }
+              code: { type: string }
+              detail: { type: string }
+
+    ModelManifest:
+      type: object
+      properties:
+        name: { type: string }
+        version: { type: string }
+        sha256: { type: string, description: Verified before load. A mismatch aborts and alarms. }
+        url: { type: string }
+        input_size: { type: integer }
+        class_map: { type: object, additionalProperties: true }
+        expected_metrics: { type: object, additionalProperties: true }
+
+    Verdict:
+      type: string
+      enum: [PASS, FAIL, REVIEW, NO_READ]
+      description: |
+        `NO_READ` means the frame failed the quality gate and nothing was
+        judged. It is deliberately distinct from `PASS`.
+
+    Problem:
+      type: object
+      description: RFC 7807 problem details with a stable machine-readable `code`.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string, description: "Stable error code — see API-Specification.md §7" }
+        correlation_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+
+    # ------------------------------------------------ proposed v1.1 (additive)
+    MobileSessionStep:
+      type: object
+      description: The typed shape PocketQC sends in MobileSession.steps[] (API-00 accepts any object). Local source columns in db/payload_mapping.json.
+      required: [uuid, step_no, kind]
+      properties:
+        uuid: { type: string, format: uuid }
+        step_no: { type: integer, minimum: 1 }
+        kind: { type: string, enum: [photo_ai, photo, barcode, ocr, measure, check] }
+        model_name: { type: [string, 'null'] }
+        model_version: { type: [string, 'null'], description: null = manual mode (AI-08) }
+        model_result: { type: [object, 'null'], additionalProperties: true, description: detections / OCR raw / barcode raw / marker data }
+        suggested_result: { type: [string, 'null'], enum: [PASS, FAIL, REVIEW, null] }
+        human_result: { type: [string, 'null'], enum: [PASS, FAIL, null], description: "The inspector's judgement — the server never alters it (FR-11, FR-23)" }
+        decided_at: { type: [string, 'null'], format: date-time }
+        note: { type: [string, 'null'] }
+        defect_code: { type: [string, 'null'] }
+        severity: { type: [string, 'null'], enum: [minor, major, critical, null] }
+        text_value: { type: [string, 'null'] }
+        text_raw: { type: [string, 'null'] }
+        latency_ms: { type: [integer, 'null'] }
+        image: { type: [object, 'null'], properties: { id: { type: string, format: uuid }, sha256: { type: string }, bytes: { type: integer }, captured_at: { type: string, format: date-time }, torch_on: { type: boolean } } }
+        measurements:
+          type: array
+          items: { $ref: '#/components/schemas/MobileMeasurement' }
+
+    MobileMeasurement:
+      type: object
+      required: [name, value, unit, in_spec, method]
+      properties:
+        name: { type: string }
+        value: { type: number }
+        unit: { type: string, default: mm }
+        usl: { type: [number, 'null'] }
+        lsl: { type: [number, 'null'] }
+        tolerance: { type: [number, 'null'], description: ± from marker size and distance (AI-05) }
+        in_spec: { type: boolean }
+        method: { type: string, enum: [aruco_reference, fixed_distance, manual] }
+
+    MobileModelManifest:
+      allOf:
+        - $ref: '#/components/schemas/ModelManifest'
+        - type: object
+          required: [name, version, sha256, url, size_bytes, task, samples_url]
+          properties:
+            task: { type: string, enum: [detection, classification, ocr] }
+            size_bytes: { type: integer, maximum: 26214400, description: "C-02: ≤ 25 MB" }
+            samples_url: { type: string, description: Zip of sample images + expected classes for the on-device self-test (FR-26) }
+            samples_sha256: { type: string }
+            min_app_version: { type: string }
+            selftest: { type: object, properties: { min_recall: { type: number, default: 0.95 }, max_latency_ms: { type: integer, default: 500 } } }
+
+    MobilePolicy:
+      type: object
+      required: [etag, retention_days, sync_network, offline_days]
+      properties:
+        etag: { type: string }
+        retention_days: { type: integer, minimum: 1, maximum: 365, default: 60 }
+        sync_network: { type: string, enum: [wifi, any], default: wifi }
+        image: { type: object, properties: { max_edge_px: { type: integer, default: 1600 }, jpeg_quality: { type: integer, minimum: 40, maximum: 100, default: 85 }, upload_pass_images: { type: boolean, default: true } } }
+        gps_enabled: { type: boolean, default: false }
+        offline_days: { type: integer, minimum: 1, maximum: 90, default: 30 }
+        low_space: { type: object, properties: { warn_pct: { type: integer, default: 20 }, critical_pct: { type: integer, default: 10 } } }
+        wipe_requested: { type: boolean, default: false, description: FR-28 — also delivered as a DeviceCommand }
+        allowed_share_targets: { type: [array, 'null'], items: { type: string }, description: Android package names allowed for PDF share; null = any (SEC-M52) }
+
+    DeviceHeartbeat:
+      type: object
+      required: [device_id, app_version, ts]
+      properties:
+        device_id: { type: string }
+        app_version: { type: string }
+        ts: { type: string, format: date-time }
+        user_id: { type: string }
+        pending: { type: object, properties: { sessions: { type: integer }, images: { type: integer }, image_bytes: { type: integer }, stuck: { type: integer } } }
+        models: { type: array, items: { type: object, properties: { name: { type: string }, version: { type: string }, active: { type: boolean }, selftest_passed: { type: boolean }, latency_p95_ms: { type: integer } } } }
+        delegate: { type: string, enum: [nnapi, gpu, cpu] }
+        storage: { type: object, properties: { free_pct: { type: number }, image_bytes: { type: integer } } }
+        battery_pct: { type: integer }
+        offline_valid_until: { type: string, format: date-time }
+        last_sync_ok_at: { type: [string, 'null'], format: date-time }
+
+    DeviceCommand:
+      type: object
+      required: [id, kind, issued_at]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [wipe, force_relogin, force_bootstrap, rollback_model] }
+        issued_at: { type: string, format: date-time }
+        args: { type: object, additionalProperties: true }
+
+    MobileAuditEvent:
+      type: object
+      required: [id, ts, user_id, event]
+      properties:
+        id: { type: integer }
+        ts: { type: string, format: date-time }
+        user_id: { type: string }
+        event: { type: string, enum: [login_online, login_offline, pin_ok, pin_fail, rejudge, override_model, wipe, purge, model_activate, model_rollback, selftest_failed] }
+        session_id: { type: [string, 'null'], format: uuid }
+        detail: { type: [object, 'null'], additionalProperties: true }

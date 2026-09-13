@@ -1,0 +1,21 @@
+{
+  "etag": "W/\"pol-14\"",
+  "retention_days": 60,
+  "sync_network": "wifi",
+  "image": {
+    "max_edge_px": 1600,
+    "jpeg_quality": 85,
+    "upload_pass_images": true
+  },
+  "gps_enabled": false,
+  "offline_days": 30,
+  "low_space": {
+    "warn_pct": 20,
+    "critical_pct": 10
+  },
+  "wipe_requested": false,
+  "allowed_share_targets": [
+    "com.microsoft.teams",
+    "com.google.android.gm"
+  ]
+}

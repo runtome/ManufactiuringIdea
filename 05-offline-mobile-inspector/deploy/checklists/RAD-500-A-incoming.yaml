@@ -1,0 +1,49 @@
+# PocketQC checklist — RAD-500-A incoming inspection (SRS-05 Appendix A, completed to the 20-step form used by NFR-02)
+# Validated against deploy/schemas/checklist.schema.json (TEST-05 TC-004). Published by the platform in the bootstrap bundle.
+checklist: RAD-500-A-incoming
+version: 3
+sku_pattern: "^RAD-500-A"
+title_th: "ตรวจรับหม้อน้ำ RAD-500-A"
+title_ja: "RAD-500-A 受入検査"
+title_en: "RAD-500-A incoming inspection"
+identity:
+  pattern: "^(?P<sku>RAD-500-A-[0-9]{2});(?P<lot>L[0-9]{6}-[0-9]{2})$"
+  formats: [CODE128, QR]
+
+steps:
+  - { "no": 1,  kind: barcode, title_th: "สแกนฉลากล็อต", title_ja: "ロットラベルをスキャン", title_en: "Scan lot label" }
+  - { "no": 2,  kind: ocr, title_en: "Read lot marking", pattern: "^L[0-9]{6}-[0-9]{2}$" }
+
+  # thirteen photo_ai views — the model and accept rule are set on the first and inherited by the rest in the app;
+  # in the file every photo_ai step is explicit so the schema can validate it
+  - "no": 3
+    kind: photo_ai
+    title_th: "ถ่ายด้านหน้า"
+    title_ja: "正面を撮影"
+    title_en: "Front view"
+    guide: { shape: rect, aspect: 1.5, text_en: "Fill the frame with the core" }
+    quality_gate: { min_blur_variance: 120, exposure_range: [60, 200], max_glare_ratio: 0.05 }
+    model: defect-yolo11n-int8
+    classes: [scratch, dent, missing_fin]
+    accept: { no_class_above: { scratch: 0.4, dent: 0.4, missing_fin: 0.25 }, review_band: 0.1 }
+  - { "no": 4,  kind: photo_ai, title_en: "Rear view",           model: defect-yolo11n-int8, classes: [scratch, dent, missing_fin], accept: { no_class_above: { scratch: 0.4, dent: 0.4, missing_fin: 0.25 } } }
+  - { "no": 5,  kind: photo_ai, title_en: "Left tank",           model: defect-yolo11n-int8, classes: [scratch, dent],              accept: { no_class_above: { scratch: 0.4, dent: 0.4 } } }
+  - { "no": 6,  kind: photo_ai, title_en: "Right tank",          model: defect-yolo11n-int8, classes: [scratch, dent],              accept: { no_class_above: { scratch: 0.4, dent: 0.4 } } }
+  - { "no": 7,  kind: photo_ai, title_en: "Top edge",            model: defect-yolo11n-int8, classes: [dent, missing_fin],         accept: { no_class_above: { dent: 0.4, missing_fin: 0.25 } } }
+  - { "no": 8,  kind: photo_ai, title_en: "Bottom edge",         model: defect-yolo11n-int8, classes: [dent, missing_fin],         accept: { no_class_above: { dent: 0.4, missing_fin: 0.25 } } }
+  - { "no": 9,  kind: photo_ai, title_en: "Inlet",               model: defect-yolo11n-int8, classes: [scratch, dent],              accept: { no_class_above: { scratch: 0.4, dent: 0.4 } } }
+  - { "no": 10, kind: photo_ai, title_en: "Outlet",              model: defect-yolo11n-int8, classes: [scratch, dent],              accept: { no_class_above: { scratch: 0.4, dent: 0.4 } } }
+  - { "no": 11, kind: photo_ai, title_en: "Fin field, upper",    model: defect-yolo11n-int8, classes: [missing_fin, bent_fin],     accept: { no_class_above: { missing_fin: 0.25, bent_fin: 0.5 } } }
+  - { "no": 12, kind: photo_ai, title_en: "Fin field, lower",    model: defect-yolo11n-int8, classes: [missing_fin, bent_fin],     accept: { no_class_above: { missing_fin: 0.25, bent_fin: 0.5 } } }
+  - { "no": 13, kind: photo_ai, title_en: "Mounting bracket L",  model: defect-yolo11n-int8, classes: [dent],                      accept: { no_class_above: { dent: 0.4 } } }
+  - { "no": 14, kind: photo_ai, title_en: "Mounting bracket R",  model: defect-yolo11n-int8, classes: [dent],                      accept: { no_class_above: { dent: 0.4 } } }
+  - { "no": 15, kind: photo_ai, title_en: "Filler neck",         model: defect-yolo11n-int8, classes: [scratch, dent],              accept: { no_class_above: { scratch: 0.4, dent: 0.4 } } }
+
+  - { "no": 16, kind: measure, name: fin_pitch,  usl: 3.2,   lsl: 2.8,   unit: mm, method: aruco_reference, marker: { dictionary: DICT_4X4_50, size_mm: 20 }, title_en: "Fin pitch" }
+  - { "no": 17, kind: measure, name: fin_height, usl: 16.5,  lsl: 15.5,  unit: mm, method: aruco_reference, marker: { dictionary: DICT_4X4_50, size_mm: 20 }, title_en: "Fin height" }
+  - { "no": 18, kind: measure, name: core_width, usl: 402,   lsl: 398,   unit: mm, method: aruco_reference, marker: { dictionary: DICT_4X4_50, size_mm: 50 }, title_en: "Core width" }
+
+  - { "no": 19, kind: check, title_th: "บรรจุภัณฑ์สมบูรณ์", title_ja: "包装に破損なし", title_en: "Packaging intact" }
+  - { "no": 20, kind: check, title_th: "ฉลากตรงกับ PO",   title_ja: "ラベルがPOと一致", title_en: "Label matches PO" }
+
+verdict_rule: "FAIL if any step FAIL; REVIEW if any step REVIEW; else PASS"

@@ -1,0 +1,20 @@
+{
+  "server_url": "https://factorybrain.plant.local",
+  "cert_pins": [
+    "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "sha256/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+  ],
+  "device_id": "TAB-07",
+  "sync_network": "wifi",
+  "offline_days": 30,
+  "gps_enabled": false,
+  "allowed_share_targets": [
+    "com.microsoft.teams",
+    "com.google.android.gm"
+  ],
+  "require_device_lock": true,
+  "lang_default": "th",
+  "low_space_warn_pct": 20,
+  "low_space_crit_pct": 10,
+  "debug_diagnostics": false
+}

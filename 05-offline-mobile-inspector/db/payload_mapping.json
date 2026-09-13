@@ -1,0 +1,48 @@
+{
+  "_comment": "Local store → IF-11 MobileSession payload → platform landing. The MobileSession fields are the platform's (API-00, verbatim); MobileSessionStep is the proposed v1.1 typed step (API-05). Verified by TEST-05 TC-006 against ../../00-factorybrain-platform/api/openapi.yaml and against the executed schema.",
+  "contract": "MobileSession",
+  "contract_source": "../../00-factorybrain-platform/api/openapi.yaml",
+  "fields": {
+    "id":            { "local": "session.uuid",              "platform": "vision.inspection.id (one row per photo_ai step, source = mobile) / session id kept in detail" },
+    "checklist_id":  { "local": "session.checklist_id",      "platform": "recipe/checklist reference; version travels in steps[].checklist_version" },
+    "sku":           { "local": "session.sku",               "platform": "vision.inspection.sku_id (resolved by code)" },
+    "lot":           { "local": "session.lot",               "platform": "vision.inspection.lot" },
+    "started_at":    { "local": "session.started_at",        "platform": "vision.inspection.ts (session start)" },
+    "finished_at":   { "local": "session.finished_at",       "platform": "detail" },
+    "verdict":       { "local": "session.verdict",           "platform": "session verdict; per-step verdicts land per row" },
+    "steps":         { "local": "step_result.* + measurement.* + image.{uuid,sha256,bytes,captured_at}", "platform": "vision.inspection / vision.detection / vision.measurement / vision.verdict_override (model vs human)" }
+  },
+  "step_contract": "MobileSessionStep (proposed v1.1, API-05)",
+  "step_fields": {
+    "uuid":             { "local": "step_result.uuid" },
+    "step_no":          { "local": "step_result.step_no" },
+    "kind":             { "local": "step_result.kind" },
+    "model_name":       { "local": "step_result.model_name" },
+    "model_version":    { "local": "step_result.model_version" },
+    "model_result":     { "local": "step_result.model_result_json" },
+    "suggested_result": { "local": "step_result.suggested_result" },
+    "human_result":     { "local": "step_result.human_result" },
+    "decided_at":       { "local": "step_result.decided_at" },
+    "note":             { "local": "step_result.note" },
+    "defect_code":      { "local": "step_result.defect_code" },
+    "severity":         { "local": "step_result.severity" },
+    "text_value":       { "local": "step_result.text_value" },
+    "text_raw":         { "local": "step_result.text_raw" },
+    "latency_ms":       { "local": "step_result.latency_ms" },
+    "image":            { "local": "image.uuid, image.sha256, image.bytes, image.captured_at, image.torch_on" },
+    "measurements":     { "local": "measurement.name, measurement.value, measurement.unit, measurement.usl, measurement.lsl, measurement.tolerance, measurement.in_spec, measurement.method" }
+  },
+  "session_extra_fields_proposed": {
+    "checklist_version": { "local": "session.checklist_version" },
+    "user_id":           { "local": "session.user_id" },
+    "device_id":         { "local": "session.device_id" },
+    "lang":              { "local": "session.lang" },
+    "gps":               { "local": "session.gps_lat, session.gps_lon" },
+    "note":              { "local": "session.note" }
+  },
+  "local_only_never_sent": [
+    "session.current_step", "session.synced_at", "session.sync_attempts", "session.last_sync_error",
+    "image.path_encrypted", "image.upload_offset", "image.uploaded_at", "image.quality_json", "image.burst_index",
+    "step_result.created_at", "measurement.marker_id", "measurement.px_per_mm"
+  ]
+}

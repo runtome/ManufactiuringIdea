@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.plant.local/schemas/pocketqc/checklist.schema.json",
+  "title": "PocketQC checklist definition",
+  "description": "A versioned checklist per SKU family (SRS-05 FR-13, Appendix A). Delivered in the bootstrap bundle and validated on the device before caching. Step kinds are closed; there is no scripting.",
+  "type": "object",
+  "required": [
+    "checklist",
+    "version",
+    "steps",
+    "verdict_rule"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "checklist": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{2,60}$"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "sku_pattern": {
+      "type": "string",
+      "maxLength": 200,
+      "description": "Regex over SKU codes for auto-selection (FR-08)"
+    },
+    "title_th": {
+      "type": "string"
+    },
+    "title_ja": {
+      "type": "string"
+    },
+    "title_en": {
+      "type": "string"
+    },
+    "identity": {
+      "type": "object",
+      "description": "How the barcode maps to sku and lot (named groups)",
+      "properties": {
+        "pattern": {
+          "type": "string"
+        },
+        "formats": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "CODE128",
+              "CODE39",
+              "EAN13",
+              "QR",
+              "DATAMATRIX"
+            ]
+          }
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 60,
+      "items": {
+        "$ref": "#/$defs/step"
+      }
+    },
+    "verdict_rule": {
+      "type": "string",
+      "enum": [
+        "FAIL if any step FAIL; REVIEW if any step REVIEW; else PASS"
+      ]
+    }
+  },
+  "$defs": {
+    "step": {
+      "type": "object",
+      "required": [
+        "no",
+        "kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "no": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "photo_ai",
+            "photo",
+            "barcode",
+            "ocr",
+            "measure",
+            "check"
+          ]
+        },
+        "title_th": {
+          "type": "string"
+        },
+        "title_ja": {
+          "type": "string"
+        },
+        "title_en": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean",
+          "default": true
+        },
+        "guide": {
+          "type": "object",
+          "properties": {
+            "shape": {
+              "type": "string",
+              "enum": [
+                "rect",
+                "circle",
+                "none"
+              ]
+            },
+            "aspect": {
+              "type": "number"
+            },
+            "text_th": {
+              "type": "string"
+            },
+            "text_ja": {
+              "type": "string"
+            },
+            "text_en": {
+              "type": "string"
+            }
+          }
+        },
+        "quality_gate": {
+          "type": "object",
+          "properties": {
+            "min_blur_variance": {
+              "type": "number"
+            },
+            "exposure_range": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "max_glare_ratio": {
+              "type": "number"
+            }
+          }
+        },
+        "model": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{2,40}$"
+        },
+        "classes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "accept": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "no_class_above": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              }
+            },
+            "review_band": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.5,
+              "default": 0.1
+            }
+          }
+        },
+        "pattern": {
+          "type": "string",
+          "description": "ocr: regex the text must match"
+        },
+        "name": {
+          "type": "string"
+        },
+        "usl": {
+          "type": "number"
+        },
+        "lsl": {
+          "type": "number"
+        },
+        "unit": {
+          "type": "string",
+          "default": "mm"
+        },
+        "method": {
+          "type": "string",
+          "enum": [
+            "aruco_reference",
+            "fixed_distance",
+            "manual"
+          ]
+        },
+        "marker": {
+          "type": "object",
+          "properties": {
+            "dictionary": {
+              "type": "string"
+            },
+            "size_mm": {
+              "type": "number"
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "photo_ai"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "model",
+              "classes",
+              "accept"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "measure"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "name",
+              "usl",
+              "lsl",
+              "method"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "ocr"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "pattern"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

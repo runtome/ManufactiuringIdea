@@ -1,0 +1,34 @@
+{
+  "name": "defect-yolo11n-int8",
+  "version": "1.0.0",
+  "task": "detection",
+  "sha256": "00000000000000000000000000000000000000000000000000000000000003e8",
+  "url": "https://factorybrain.plant.local/api/v1/mobile/models/defect-yolo11n-int8/1.0.0/download",
+  "size_bytes": 22100000,
+  "input_size": 640,
+  "precision": "int8",
+  "class_map": {
+    "0": "scratch",
+    "1": "dent",
+    "2": "missing_fin",
+    "3": "bent_fin"
+  },
+  "samples_url": "https://factorybrain.plant.local/api/v1/mobile/models/defect-yolo11n-int8/1.0.0/samples.zip",
+  "samples_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "min_app_version": "1.0.0",
+  "expected_metrics": {
+    "map50": 0.81,
+    "recall_critical": 0.97,
+    "int8_delta_map": 0.02,
+    "holdout_images": 1240
+  },
+  "selftest": {
+    "min_recall": 0.95,
+    "max_latency_ms": 500
+  },
+  "device_classes": [
+    "arm64-nnapi",
+    "arm64-gpu",
+    "arm64-cpu"
+  ]
+}

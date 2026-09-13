@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.plant.local/schemas/pocketqc/policy.schema.json",
+  "title": "PocketQC device policy (GET /mobile/policy)",
+  "type": "object",
+  "required": [
+    "etag",
+    "retention_days",
+    "sync_network",
+    "offline_days"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "etag": {
+      "type": "string"
+    },
+    "retention_days": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 365
+    },
+    "sync_network": {
+      "type": "string",
+      "enum": [
+        "wifi",
+        "any"
+      ]
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_edge_px": {
+          "type": "integer",
+          "minimum": 640,
+          "maximum": 4096
+        },
+        "jpeg_quality": {
+          "type": "integer",
+          "minimum": 40,
+          "maximum": 100
+        },
+        "upload_pass_images": {
+          "type": "boolean"
+        }
+      }
+    },
+    "gps_enabled": {
+      "type": "boolean"
+    },
+    "offline_days": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 90
+    },
+    "low_space": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "warn_pct": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 50
+        },
+        "critical_pct": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30
+        }
+      }
+    },
+    "wipe_requested": {
+      "type": "boolean"
+    },
+    "allowed_share_targets": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+      }
+    }
+  }
+}
