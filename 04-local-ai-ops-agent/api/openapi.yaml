@@ -1,0 +1,941 @@
+openapi: 3.1.0
+info:
+  title: OpsPilot API
+  version: 1.0.0
+  summary: Ask, diagnose, propose, approve, verify, audit — the API behind the Discord bot and the web console.
+  description: |
+    **Scope.** The internal API of OpsPilot (SRS-04 §4.1, extended). Consumers are the
+    Discord bot, the web console and automation (`opsctl`). Targets (Docker hosts,
+    databases, git repos) are *not* clients of this API — the agent reaches them
+    through IF-25…IF-29.
+
+    **The two contracts that matter (API-Specification.md §3, §4):**
+    - **Approval**: a proposal is approved by `POST /proposals/{id}/approve`. The server
+      re-checks, *at approval time*, that the proposal is still `pending`, not expired
+      (≤ 10 min), that the caller's role ≥ the policy's `require_role`, that no change
+      freeze is active and the rate limit is not exceeded, and that `args_hash` still
+      equals the hash of the stored arguments. Any failure is a 409/403/429 with a stable
+      `code` and an audit row. Approval is single-use.
+    - **Verification**: an `executed` proposal always carries `before`, `after` and
+      `verification_ok` from the tool's verifier. The API never returns "executed" without
+      them (FR-16, FR-20).
+
+    **Deterministic mode.** `POST /diag/{target}` and runbooks work with the LLM down;
+    responses carry `deterministic: true`. `POST /ask` degrades to a deterministic
+    report with `outcome: partial` and `code: LLM_UNAVAILABLE` in `warnings`.
+
+    **Never available through this API:** free-form commands, raw tool results
+    (only redacted), deny-listed actions (refused before a proposal exists), editing
+    or deleting audit rows.
+
+    Errors are RFC 7807 `application/problem+json` with a stable `code`.
+  contact: { name: Suphot N. }
+  license: { name: Proprietary }
+  x-document-id: API-04-OpsPilot
+
+servers:
+  - url: http://opspilot.internal/api/v1
+    description: Internal network only (never exposed to the internet)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - { name: ask,        description: "Natural-language operations questions and deterministic diagnostics" }
+  - { name: runs,       description: "Run history, tool calls, timelines" }
+  - { name: proposals,  description: "The approval gate: list, approve, deny, dry-run, abort" }
+  - { name: tools,      description: "The registry" }
+  - { name: policy,     description: "Policies and change freezes" }
+  - { name: runbooks,   description: "Named runbooks" }
+  - { name: alerts,     description: "Proactive alerts, rules, daily sweeps" }
+  - { name: incidents,  description: "Incident log and post-incident summaries" }
+  - { name: targets,    description: "Things the agent may observe or act on" }
+  - { name: audit,      description: "Append-only audit trail and export" }
+  - { name: auth,       description: "Console login" }
+  - { name: system,     description: "Health" }
+
+paths:
+  # --------------------------------------------------------------------- ask
+  /ask:
+    post:
+      tags: [ask]
+      summary: Ask an operations question
+      description: |
+        Enqueues a run. The deterministic plan for the question class runs first
+        (containers → logs → resources → dependencies → health), then the LLM narrates,
+        hypothesises and may propose one action. Poll `GET /runs/{id}` or stream
+        `GET /runs/{id}/events`. Role `viewer`+.
+      operationId: ask
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question]
+              properties:
+                question: { type: string, maxLength: 2000 }
+                target: { type: string, description: Optional target code to scope the plan }
+                env: { type: string, enum: [prod, staging, dev], default: prod }
+                lang: { type: string, enum: [th, ja, en] }
+                channel: { type: string, enum: [discord, web, api], default: api }
+                conversation_id: { type: string, format: uuid }
+            example: { question: "Check why the backend is down.", target: vps-1 }
+      responses:
+        '202':
+          description: Run queued
+          content:
+            application/json:
+              schema: { type: object, properties: { run_id: { type: string, format: uuid }, status_url: { type: string }, events_url: { type: string } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /diag/{target}:
+    post:
+      tags: [ask]
+      summary: Deterministic diagnostics for a target — works with the LLM down
+      description: "Runs the fixed plan (FR-11) and returns the evidence bundle as a structured report. `deterministic: true` always; no proposal is generated (AC-08, NFR-06). Role `viewer`+."
+      operationId: diag
+      parameters:
+        - { name: target, in: path, required: true, schema: { type: string } }
+        - { name: since, in: query, schema: { type: string, default: 10m } }
+      responses:
+        '200':
+          description: Report (synchronous, ≤ 30 s)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiagReport' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '504': { description: Tool budget exceeded (60 s), content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # -------------------------------------------------------------------- runs
+  /runs:
+    get:
+      tags: [runs]
+      summary: Run history
+      operationId: listRuns
+      parameters:
+        - { name: kind, in: query, schema: { type: string, enum: [ask, diag, runbook, sweep, verify] } }
+        - { name: outcome, in: query, schema: { type: string, enum: [ok, partial, refused, grounding_failed, error, budget_exceeded] } }
+        - { name: user_id, in: query, schema: { type: string, format: uuid } }
+        - { name: q, in: query, schema: { type: string }, description: Trigram search on the question }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page
+          content:
+            application/json:
+              schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/RunSummary' } }, next_cursor: { type: [string, 'null'] } } }
+
+  /runs/{runId}:
+    get:
+      tags: [runs]
+      summary: Run detail — diagnosis, evidence, grounding, proposals
+      operationId: getRun
+      parameters: [ { $ref: '#/components/parameters/RunId' } ]
+      responses:
+        '200': { description: Run, content: { application/json: { schema: { $ref: '#/components/schemas/Run' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /runs/{runId}/tool-calls:
+    get:
+      tags: [runs]
+      summary: Tool calls of a run (redacted results)
+      operationId: listRunToolCalls
+      parameters: [ { $ref: '#/components/parameters/RunId' } ]
+      responses:
+        '200': { description: Tool calls, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/ToolCall' } } } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /runs/{runId}/timeline:
+    get:
+      tags: [runs]
+      summary: Reconstructed timeline (v_run_timeline) — AC-07
+      operationId: getRunTimeline
+      parameters: [ { $ref: '#/components/parameters/RunId' } ]
+      responses:
+        '200': { description: Timeline, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/TimelineEvent' } } } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /runs/{runId}/events:
+    get:
+      tags: [runs]
+      summary: Live events of a run (SSE)
+      description: "`text/event-stream` with events `plan`, `tool_call`, `evidence`, `diagnosis`, `proposal`, `done`, `error` (API-Specification.md §8)."
+      operationId: streamRunEvents
+      parameters: [ { $ref: '#/components/parameters/RunId' } ]
+      responses:
+        '200': { description: Event stream, content: { text/event-stream: { schema: { type: string } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # --------------------------------------------------------------- proposals
+  /proposals:
+    get:
+      tags: [proposals]
+      summary: Proposals (default pending)
+      operationId: listProposals
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [pending, approved, denied, expired, executed, failed, aborted], default: pending } }
+        - { name: risk, in: query, schema: { type: string, enum: [low, medium, high] } }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200': { description: Page, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Proposal' } }, next_cursor: { type: [string, 'null'] } } } } } }
+
+  /proposals/{proposalId}:
+    get:
+      tags: [proposals]
+      summary: Proposal detail with decision record, dry-run, before/after
+      operationId: getProposal
+      parameters: [ { $ref: '#/components/parameters/ProposalId' } ]
+      responses:
+        '200': { description: Proposal, content: { application/json: { schema: { $ref: '#/components/schemas/Proposal' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /proposals/{proposalId}/approve:
+    post:
+      tags: [proposals]
+      summary: Approve — re-checked at approval time, single-use, then executed and verified
+      description: |
+        Checks in order: pending → not expired → caller role ≥ `require_role` → no freeze →
+        rate limit → `args_hash` matches. Passes → `approved`, execution enqueued; the
+        response returns immediately with `status: approved`; poll for `executed` with
+        before/after/verification. Every outcome is audited (FR-31).
+      operationId: approveProposal
+      parameters: [ { $ref: '#/components/parameters/ProposalId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { note: { type: string, maxLength: 500 } } }
+      responses:
+        '200': { description: Approved and queued for execution, content: { application/json: { schema: { $ref: '#/components/schemas/Proposal' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Not pending, expired, hash mismatch, or change freeze
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                expired: { value: { type: "urn:opspilot:problem:approval-expired", title: Approval expired, status: 409, code: APPROVAL_EXPIRED, detail: "Proposal expired at 14:30:18; ask again to get a fresh proposal" } }
+                freeze:  { value: { type: "urn:opspilot:problem:change-freeze", title: Change freeze, status: 409, code: CHANGE_FREEZE, detail: "prod is frozen until 2026-09-21T06:00+07:00 (Quarter-end close)" } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /proposals/{proposalId}/deny:
+    post:
+      tags: [proposals]
+      summary: Deny — no state change, audited (AC-03)
+      operationId: denyProposal
+      parameters: [ { $ref: '#/components/parameters/ProposalId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { note: { type: string, maxLength: 500 } } }
+      responses:
+        '200': { description: Denied, content: { application/json: { schema: { $ref: '#/components/schemas/Proposal' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Not pending, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /proposals/{proposalId}/dry-run:
+    post:
+      tags: [proposals]
+      summary: Show what would happen without executing (FR-22)
+      description: Runs the tool's dry-run hook (no state change) and stores `dry_run_json`. Available to the roles that could approve.
+      operationId: dryRunProposal
+      parameters: [ { $ref: '#/components/parameters/ProposalId' } ]
+      responses:
+        '200': { description: Dry-run result, content: { application/json: { schema: { type: object, properties: { would: { type: string }, affects: { type: array, items: { type: string } }, details: { type: object, additionalProperties: true } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Tool does not support dry-run or proposal not pending, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /proposals/{proposalId}/abort:
+    post:
+      tags: [proposals]
+      summary: Abort a pending or approved-but-running action; partial outcome recorded (FR-23)
+      operationId: abortProposal
+      parameters: [ { $ref: '#/components/parameters/ProposalId' } ]
+      responses:
+        '200': { description: Aborted, content: { application/json: { schema: { $ref: '#/components/schemas/Proposal' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Already terminal, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # ------------------------------------------------------------------- tools
+  /tools:
+    get:
+      tags: [tools]
+      summary: The registry with risk, required role, schema, verifier and proxy endpoints
+      operationId: listTools
+      parameters:
+        - { name: kind, in: query, schema: { type: string, enum: [read, write] } }
+      responses:
+        '200': { description: Tools, content: { application/json: { schema: { type: object, properties: { registry_version: { type: string }, items: { type: array, items: { $ref: '#/components/schemas/Tool' } } } } } } }
+
+  /tools/{name}:
+    get:
+      tags: [tools]
+      summary: One tool
+      operationId: getTool
+      parameters: [ { name: name, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200': { description: Tool, content: { application/json: { schema: { $ref: '#/components/schemas/Tool' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [tools]
+      summary: Enable or disable a tool (owner). Nothing else about a tool is editable through the API — schema, risk and deny-list are code.
+      operationId: patchTool
+      parameters: [ { name: name, in: path, required: true, schema: { type: string } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [enabled], properties: { enabled: { type: boolean } } }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Tool' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------ policy
+  /policies:
+    get:
+      tags: [policy]
+      summary: Effective policies per tool and environment
+      operationId: listPolicies
+      parameters:
+        - { name: env, in: query, schema: { type: string, enum: [prod, staging, dev] } }
+      responses:
+        '200': { description: Policies, content: { application/json: { schema: { type: object, properties: { policy_version: { type: string }, items: { type: array, items: { $ref: '#/components/schemas/Policy' } } } } } } }
+    put:
+      tags: [policy]
+      summary: Load a policy file (owner) — validated against policy.schema.json, applied atomically
+      operationId: loadPolicies
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PolicyFile' }
+      responses:
+        '200': { description: Applied, content: { application/json: { schema: { type: object, properties: { policy_version: { type: string }, rows: { type: integer }, warnings: { type: array, items: { type: string } } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422':
+          description: Invalid — including auto_execute on a high-risk tool
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: "urn:opspilot:problem:policy-invalid", title: Policy invalid, status: 422, code: POLICY_INVALID, detail: "auto_execute: true is not allowed for high-risk tool 'stop_container' in prod (C-03)" }
+
+  /freezes:
+    get:
+      tags: [policy]
+      summary: Change freezes (active and scheduled)
+      operationId: listFreezes
+      responses:
+        '200': { description: Freezes, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Freeze' } } } } } } }
+    post:
+      tags: [policy]
+      summary: Declare a change freeze (admin+)
+      operationId: createFreeze
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [env, starts_at, ends_at, reason]
+              properties:
+                env: { type: string, enum: [prod, staging, dev] }
+                starts_at: { type: string, format: date-time }
+                ends_at: { type: string, format: date-time }
+                reason: { type: string, maxLength: 200 }
+      responses:
+        '201': { description: Declared, content: { application/json: { schema: { $ref: '#/components/schemas/Freeze' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /freezes/{freezeId}:
+    delete:
+      tags: [policy]
+      summary: End a freeze early (admin+)
+      operationId: deleteFreeze
+      parameters: [ { name: freezeId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '204': { description: Ended }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- runbooks
+  /runbooks:
+    get:
+      tags: [runbooks]
+      summary: Runbooks
+      operationId: listRunbooks
+      responses:
+        '200': { description: Runbooks, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Runbook' } } } } } } }
+
+  /runbooks/{name}/run:
+    post:
+      tags: [runbooks]
+      summary: Execute a runbook (deterministic; write steps go through the approval gate)
+      operationId: runRunbook
+      parameters: [ { name: name, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { target: { type: string }, env: { type: string, enum: [prod, staging, dev], default: prod }, params: { type: object, additionalProperties: true } } }
+      responses:
+        '202': { description: Started, content: { application/json: { schema: { type: object, properties: { run_id: { type: string, format: uuid }, runbook_run_id: { type: string, format: uuid } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /runbooks/{name}/runs:
+    get:
+      tags: [runbooks]
+      summary: Executions of a runbook
+      operationId: listRunbookRuns
+      parameters: [ { name: name, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/Limit' } ]
+      responses:
+        '200': { description: Runs, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/RunbookRun' } } } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------ alerts
+  /alerts:
+    get:
+      tags: [alerts]
+      summary: Alerts (default open + acknowledged)
+      operationId: listAlerts
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [open, acknowledged, resolved, all], default: open } }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200': { description: Alerts, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Alert' } } } } } } }
+
+  /alerts/{alertId}/ack:
+    post:
+      tags: [alerts]
+      summary: Acknowledge (operator+)
+      operationId: ackAlert
+      parameters: [ { name: alertId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Acknowledged, content: { application/json: { schema: { $ref: '#/components/schemas/Alert' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /alert-rules:
+    get:
+      tags: [alerts]
+      summary: Alert rules
+      operationId: listAlertRules
+      responses:
+        '200': { description: Rules, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/AlertRule' } } } } } } }
+
+  /sweeps:
+    get:
+      tags: [alerts]
+      summary: Daily sweep summaries (FR-25)
+      operationId: listSweeps
+      parameters: [ { $ref: '#/components/parameters/From' }, { $ref: '#/components/parameters/To' } ]
+      responses:
+        '200': { description: Sweeps, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Sweep' } } } } } } }
+
+  # --------------------------------------------------------------- incidents
+  /incidents:
+    get:
+      tags: [incidents]
+      summary: Incidents
+      operationId: listIncidents
+      parameters:
+        - { name: open, in: query, schema: { type: boolean } }
+        - { name: q, in: query, schema: { type: string }, description: Trigram search on title and cause }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200': { description: Page, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Incident' } }, next_cursor: { type: [string, 'null'] } } } } } }
+    post:
+      tags: [incidents]
+      summary: Open an incident (operator+)
+      operationId: createIncident
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [title, severity], properties: { title: { type: string }, severity: { type: string, enum: [low, medium, high, critical] }, run_ids: { type: array, items: { type: string, format: uuid } } } }
+      responses:
+        '201': { description: Opened, content: { application/json: { schema: { $ref: '#/components/schemas/Incident' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /incidents/{incidentId}:
+    get:
+      tags: [incidents]
+      summary: Incident with timeline
+      operationId: getIncident
+      parameters: [ { $ref: '#/components/parameters/IncidentId' } ]
+      responses:
+        '200': { description: Incident, content: { application/json: { schema: { $ref: '#/components/schemas/Incident' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [incidents]
+      summary: Close or edit (admin+)
+      operationId: patchIncident
+      parameters: [ { $ref: '#/components/parameters/IncidentId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { closed: { type: boolean }, cause: { type: string }, summary: { type: string }, severity: { type: string, enum: [low, medium, high, critical] } } }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Incident' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /incidents/{incidentId}/summary:
+    post:
+      tags: [incidents]
+      summary: Generate the post-incident summary (FR-27)
+      description: The timeline is built from `v_run_timeline` (data). The LLM, if available, writes the prose *around* it and every sentence must cite a timeline event id; otherwise the structured timeline is the summary.
+      operationId: summarizeIncident
+      parameters: [ { $ref: '#/components/parameters/IncidentId' } ]
+      responses:
+        '200': { description: Summary, content: { application/json: { schema: { type: object, properties: { timeline: { type: array, items: { $ref: '#/components/schemas/TimelineEvent' } }, prose: { type: [string, 'null'] }, deterministic: { type: boolean } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ----------------------------------------------------------------- targets
+  /targets:
+    get:
+      tags: [targets]
+      summary: Targets with kind, env, tags and enabled flag
+      operationId: listTargets
+      parameters: [ { name: env, in: query, schema: { type: string, enum: [prod, staging, dev] } } ]
+      responses:
+        '200': { description: Targets, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Target' } } } } } } }
+
+  /targets/{code}:
+    patch:
+      tags: [targets]
+      summary: Enable/disable or retag a target (owner). Endpoint aliases and secrets are provisioning-time configuration, not editable here.
+      operationId: patchTarget
+      parameters: [ { name: code, in: path, required: true, schema: { type: string } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { enabled: { type: boolean }, tags: { type: array, items: { type: string, enum: [critical, ot, plc] } } } }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Target' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------- audit
+  /audit:
+    get:
+      tags: [audit]
+      summary: Audit rows (admin+)
+      operationId: listAudit
+      parameters:
+        - { name: entity, in: query, schema: { type: string } }
+        - { name: entity_id, in: query, schema: { type: string } }
+        - { name: correlation_id, in: query, schema: { type: string } }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200': { description: Page, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/AuditRow' } }, next_cursor: { type: [string, 'null'] } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /audit/export:
+    post:
+      tags: [audit]
+      summary: Export audit + runs + tool calls + proposals for a window as NDJSON with a signed manifest (FR-32, AC-07)
+      operationId: exportAudit
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [from, to], properties: { from: { type: string, format: date-time }, to: { type: string, format: date-time }, include_results: { type: boolean, default: true, description: Redacted tool results } } }
+      responses:
+        '202': { description: Export job started, content: { application/json: { schema: { type: object, properties: { job_id: { type: string, format: uuid }, download_url: { type: string } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # -------------------------------------------------------------------- auth
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Console login
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [username, password], properties: { username: { type: string }, password: { type: string, format: password }, mfa_code: { type: string } } }
+      responses:
+        '200': { description: Tokens, content: { application/json: { schema: { type: object, properties: { access_token: { type: string }, refresh_token: { type: string }, role: { type: string, enum: [viewer, operator, admin, owner] } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: Refresh
+      operationId: refresh
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [refresh_token], properties: { refresh_token: { type: string } } }
+      responses:
+        '200': { description: Tokens, content: { application/json: { schema: { type: object, properties: { access_token: { type: string }, refresh_token: { type: string } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /me:
+    get:
+      tags: [auth]
+      summary: Current user and role
+      operationId: me
+      responses:
+        '200': { description: User, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
+
+  # ------------------------------------------------------------------ system
+  /healthz:
+    get:
+      tags: [system]
+      summary: Liveness
+      operationId: healthz
+      security: []
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { ok: { type: boolean } } } } } }
+
+  /readyz:
+    get:
+      tags: [system]
+      summary: Readiness — DB, Redis, worker, LLM (LLM being down does not fail readiness)
+      operationId: readyz
+      security: []
+      responses:
+        '200':
+          description: Ready (possibly with LLM unavailable)
+          content:
+            application/json:
+              schema: { type: object, properties: { db: { type: boolean }, redis: { type: boolean }, worker: { type: boolean }, llm: { type: boolean }, deterministic_only: { type: boolean }, registry_version: { type: string }, policy_version: { type: string } } }
+        '503': { description: "DB, Redis or worker unavailable", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /metrics:
+    get:
+      tags: [system]
+      summary: Prometheus metrics of the agent stack (runs, tool latency, denials by reason, redaction_count, LLM breaker)
+      operationId: metrics
+      security: []
+      responses:
+        '200': { description: Metrics, content: { text/plain: { schema: { type: string } } } }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 15-minute access token with `role`; 12-hour rotating refresh. The Discord bot uses a service token and forwards the mapped user id.
+
+  parameters:
+    RunId: { name: runId, in: path, required: true, schema: { type: string, format: uuid } }
+    ProposalId: { name: proposalId, in: path, required: true, schema: { type: string, format: uuid } }
+    IncidentId: { name: incidentId, in: path, required: true, schema: { type: string, format: uuid } }
+    From: { name: from, in: query, schema: { type: string, format: date-time } }
+    To: { name: to, in: query, schema: { type: string, format: date-time } }
+    Cursor: { name: cursor, in: query, schema: { type: string } }
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+    IdempotencyKey: { name: Idempotency-Key, in: header, schema: { type: string, maxLength: 64 }, description: Replays return the original response for 24 h }
+
+  responses:
+    BadRequest: { description: Malformed request, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    Unauthorized: { description: Missing or invalid token, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    Forbidden:
+      description: Role insufficient
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' }, example: { type: "urn:opspilot:problem:role", title: Role insufficient, status: 403, code: ROLE_INSUFFICIENT, detail: "redeploy_last_good in prod requires admin; you are operator" } } }
+    NotFound: { description: Not found, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    ValidationFailed: { description: Validation failed, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    TooManyRequests:
+      description: Rate limited
+      headers: { Retry-After: { schema: { type: integer } } }
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' }, example: { type: "urn:opspilot:problem:rate", title: Rate limited, status: 429, code: RATE_LIMITED, detail: "restart_container on vps-1/backend: 3/3 in the last 60 min; next allowed at 11:06:25" } } }
+
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string, description: "Stable code — API-Specification.md §7" }
+        correlation_id: { type: string }
+        errors: { type: array, items: { type: object, properties: { field: { type: string }, message: { type: string } } } }
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+        display_name: { type: string }
+        role: { type: string, enum: [viewer, operator, admin, owner] }
+        lang: { type: string, enum: [th, ja, en] }
+        discord_linked: { type: boolean }
+
+    Target:
+      type: object
+      properties:
+        code: { type: string }
+        kind: { type: string, enum: [docker_host, systemd_host, database, http, git] }
+        env: { type: string, enum: [prod, staging, dev] }
+        tags: { type: array, items: { type: string } }
+        enabled: { type: boolean }
+
+    Tool:
+      type: object
+      properties:
+        name: { type: string }
+        kind: { type: string, enum: [read, write] }
+        risk: { type: string, enum: [low, medium, high] }
+        min_role: { type: string, enum: [viewer, operator, admin, owner] }
+        schema: { type: object, additionalProperties: true, description: JSON Schema of the arguments (AI-03) }
+        verify_with: { type: [string, 'null'] }
+        dry_run_supported: { type: boolean }
+        proxy_endpoints: { type: array, items: { type: string } }
+        enabled: { type: boolean }
+        registry_version: { type: string }
+
+    Policy:
+      type: object
+      properties:
+        tool_name: { type: string }
+        env: { type: string, enum: [prod, staging, dev] }
+        allow: { type: boolean }
+        require_role: { type: string, enum: [operator, admin, owner] }
+        rate_limit: { type: object, properties: { max: { type: integer }, window_s: { type: integer }, key: { type: string, enum: [target, "target+service"] } } }
+        auto_execute: { type: boolean, description: Never true for high risk (C-03) }
+        targets_allow: { type: [array, 'null'], items: { type: string } }
+        policy_version: { type: string }
+
+    PolicyFile:
+      type: object
+      description: The content of deploy/policy.yaml (validated against deploy/schemas/policy.schema.json)
+      required: [version, environments, actions]
+      properties:
+        version: { type: string }
+        environments: { type: array, items: { type: string, enum: [prod, staging, dev] } }
+        defaults: { type: object, additionalProperties: true }
+        actions: { type: object, additionalProperties: { type: object, additionalProperties: true } }
+
+    Freeze:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        env: { type: string }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        reason: { type: string }
+        declared_by: { type: [string, 'null'] }
+        active: { type: boolean }
+
+    RunSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        kind: { type: string, enum: [ask, diag, runbook, sweep, verify] }
+        channel: { type: string }
+        user: { type: [string, 'null'] }
+        question: { type: [string, 'null'] }
+        outcome: { type: string }
+        deterministic: { type: boolean }
+        confidence: { type: [string, 'null'], enum: [low, medium, high, null] }
+        tool_call_count: { type: integer }
+        latency_ms: { type: integer }
+        proposals: { type: integer }
+
+    Run:
+      allOf:
+        - $ref: '#/components/schemas/RunSummary'
+        - type: object
+          properties:
+            model: { type: string, description: "'none' when deterministic" }
+            prompt_version: { type: [string, 'null'] }
+            registry_version: { type: string }
+            iterations: { type: integer, maximum: 8 }
+            probable_cause: { type: [string, 'null'] }
+            answer: { type: [string, 'null'] }
+            evidence: { type: array, items: { type: object, properties: { id: { type: string, description: "tc-NN" }, tool_call_id: { type: string, format: uuid }, tool_name: { type: string } } } }
+            next_checks: { type: array, items: { type: string }, description: FR-15 — present when inconclusive }
+            grounding: { type: object, properties: { claims: { type: integer }, grounded: { type: integer }, ungrounded: { type: array, items: { type: string } } } }
+            proposals: { type: array, items: { $ref: '#/components/schemas/Proposal' } }
+            warnings: { type: array, items: { type: string }, description: "e.g. LLM_UNAVAILABLE, ITERATION_CAP, TOOL_TIMEOUT" }
+
+    ToolCall:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ordinal: { type: integer }
+        tool_name: { type: string }
+        args: { type: object, additionalProperties: true }
+        target: { type: [string, 'null'] }
+        result: { type: [object, 'null'], additionalProperties: true, description: Redacted (NFR-05); nulled after 90 days }
+        result_digest: { type: [string, 'null'] }
+        redaction_count: { type: integer }
+        truncated: { type: boolean }
+        duration_ms: { type: integer }
+        ok: { type: boolean }
+        error: { type: [string, 'null'] }
+
+    Proposal:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        run_id: { type: [string, 'null'], format: uuid }
+        tool_name: { type: string }
+        args: { type: object, additionalProperties: true }
+        args_hash: { type: string, description: sha256 the approval binds to }
+        target: { type: [string, 'null'] }
+        risk: { type: string, enum: [low, medium, high] }
+        require_role: { type: string, enum: [operator, admin, owner] }
+        status: { type: string, enum: [pending, approved, denied, expired, executed, failed, aborted] }
+        denied_reason: { type: [string, 'null'], enum: [DENYLISTED, TOOL_NOT_IN_REGISTRY, SCHEMA_INVALID, POLICY_DENIED, CHANGE_FREEZE, RATE_LIMITED, ROLE_INSUFFICIENT, TARGET_NOT_ALLOWED, USER_DENIED, null] }
+        expected_effect: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        seconds_left: { type: integer }
+        approver: { type: [string, 'null'] }
+        decided_at: { type: [string, 'null'], format: date-time }
+        decision: { type: object, additionalProperties: true, description: The policy engine's decision record }
+        dry_run: { type: [object, 'null'], additionalProperties: true }
+        before: { type: [object, 'null'], additionalProperties: true }
+        after: { type: [object, 'null'], additionalProperties: true }
+        verification_ok: { type: [boolean, 'null'] }
+        executed_at: { type: [string, 'null'], format: date-time }
+
+    DiagReport:
+      type: object
+      required: [run_id, deterministic, target, checks]
+      properties:
+        run_id: { type: string, format: uuid }
+        deterministic: { type: boolean, const: true }
+        target: { type: string }
+        plan: { type: array, items: { type: string } }
+        checks:
+          type: array
+          items:
+            type: object
+            properties:
+              step: { type: string, enum: [containers, logs, resources, dependencies, health] }
+              tool_name: { type: string }
+              tool_call_id: { type: string, format: uuid }
+              status: { type: string, enum: [ok, warn, crit, error] }
+              summary: { type: string }
+              result: { type: object, additionalProperties: true }
+        findings: { type: array, items: { type: string }, description: Rule-based findings (no LLM) }
+        llm: { type: object, properties: { available: { type: boolean }, note: { type: string } } }
+        latency_ms: { type: integer }
+
+    TimelineEvent:
+      type: object
+      properties:
+        run_id: { type: string, format: uuid }
+        event_ts: { type: string, format: date-time }
+        event: { type: string, enum: [run.started, tool_call, proposal.created, proposal.approved, proposal.denied, proposal.executed] }
+        detail: { type: [string, 'null'] }
+        ref: { type: [string, 'null'] }
+
+    Runbook:
+      type: object
+      properties:
+        name: { type: string }
+        version: { type: integer }
+        description: { type: [string, 'null'] }
+        steps: { type: array, items: { type: object, properties: { id: { type: string }, tool: { type: string }, when: { type: [string, 'null'] }, approval: { type: boolean } } } }
+        yaml_sha256: { type: string }
+        enabled: { type: boolean }
+
+    RunbookRun:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        status: { type: string, enum: [running, waiting_approval, completed, failed, aborted] }
+        steps_done: { type: integer }
+        last_step: { type: [string, 'null'] }
+
+    AlertRule:
+      type: object
+      properties:
+        code: { type: string }
+        description: { type: string }
+        tool_name: { type: string }
+        condition: { type: string }
+        severity: { type: string, enum: [info, warning, critical] }
+        cooldown_s: { type: integer }
+        enabled: { type: boolean }
+
+    Alert:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        rule_code: { type: string }
+        severity: { type: string }
+        target: { type: [string, 'null'] }
+        status: { type: string, enum: [open, acknowledged, resolved] }
+        opened_at: { type: string, format: date-time }
+        acked_at: { type: [string, 'null'], format: date-time }
+        resolved_at: { type: [string, 'null'], format: date-time }
+        value: { type: object, additionalProperties: true }
+        incident_id: { type: [string, 'null'], format: uuid }
+
+    Sweep:
+      type: object
+      properties:
+        sweep_date: { type: string, format: date }
+        run_id: { type: string, format: uuid }
+        targets_ok: { type: integer }
+        targets_warn: { type: integer }
+        targets_crit: { type: integer }
+        summary: { type: object, additionalProperties: true }
+        posted_at: { type: [string, 'null'], format: date-time }
+
+    Incident:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        opened_at: { type: string, format: date-time }
+        closed_at: { type: [string, 'null'], format: date-time }
+        title: { type: string }
+        severity: { type: string, enum: [low, medium, high, critical] }
+        summary: { type: [string, 'null'] }
+        cause: { type: [string, 'null'] }
+        actions: { type: array, items: { type: string, format: uuid }, description: Proposal ids }
+        run_ids: { type: array, items: { type: string, format: uuid } }
+        timeline: { type: [array, 'null'], items: { $ref: '#/components/schemas/TimelineEvent' } }
+
+    AuditRow:
+      type: object
+      properties:
+        id: { type: integer }
+        ts: { type: string, format: date-time }
+        user_id: { type: [string, 'null'], format: uuid }
+        actor: { type: string, enum: [user, policy, agent, scheduler] }
+        correlation_id: { type: [string, 'null'] }
+        action: { type: string }
+        entity: { type: string }
+        entity_id: { type: [string, 'null'] }
+        before: { type: [object, 'null'], additionalProperties: true }
+        after: { type: [object, 'null'], additionalProperties: true }

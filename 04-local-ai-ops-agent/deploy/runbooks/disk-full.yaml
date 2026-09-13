@@ -1,0 +1,26 @@
+# Runbook: disk-full — rotate logs, then prune dangling images. Both are write tools -> approval gate.
+# What this runbook will never contain: docker system prune -a, rm -rf, volume removal (deny-listed; schema refuses the names).
+name: disk-full
+version: 1
+description: "Disk > 85 %: metrics -> rotate logs (approval) -> prune dangling images (approval) -> verify"
+params:
+  target: { type: string, default: vps-1 }
+  threshold: { type: integer, default: 85 }
+steps:
+  - id: mem
+    tool: host_metrics
+    args: { target: "{{ params.target }}" }
+  - id: rotate
+    tool: rotate_logs
+    args: { target: "{{ params.target }}" }
+    when: "max(mem.disk[*].used_pct) > params.threshold"
+    approval: true
+    on_fail: continue
+  - id: prune
+    tool: prune_dangling_images
+    args: { target: "{{ params.target }}" }
+    when: "max(mem.disk[*].used_pct) > params.threshold"
+    approval: true
+  - id: verify
+    tool: host_metrics
+    args: { target: "{{ params.target }}" }

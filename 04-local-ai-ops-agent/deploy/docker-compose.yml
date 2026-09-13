@@ -1,0 +1,252 @@
+# OpsPilot — docker-compose.yml (the agent stack; OPS-04 §4)
+#
+# Principles visible in this file (TEST-04 TC-004 asserts them):
+#   - NO service mounts /var/run/docker.sock. Docker access goes to per-TARGET-host socket proxies (ICD-04 IF-25),
+#     which are deployed ON THE TARGET HOSTS (see deploy/target-proxy.compose.yml) — never here.
+#   - Every OpsPilot container: non-root, read-only rootfs, cap_drop ALL, no-new-privileges (NFR-03, SEC-O33).
+#   - Only `api` and `console` publish ports, bound to the internal interface (${BIND_ADDR}) via the `frontend` network.
+#     Postgres, Redis, Ollama are on the `internal` (no-route-out) network only (SEC-O61, O63).
+#   - Secrets are files mounted read-only from ${SECRETS_DIR} (NFR-05, SEC-O50); nothing secret is in this file or .env.
+#   - Ollama has no egress (C-06).
+#
+# Profiles:  sources  — optional Prometheus/Loki *as read sources* (IF-14, IF-29). Not the monitoring stack of record.
+
+name: opspilot
+
+x-hardened: &hardened
+  restart: unless-stopped
+  user: "10001:10001"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: { max-size: "50m", max-file: "5" }
+  env_file: .env
+  tmpfs: ["/tmp:size=64m,mode=1777"]
+
+services:
+
+  # --------------------------------------------------------------------- api
+  api:
+    <<: *hardened
+    image: ${OPSPILOT_REGISTRY}/opspilot-api:${OPSPILOT_VERSION}
+    container_name: op-api
+    networks: [internal, frontend]            # frontend: publishes on ${BIND_ADDR} only; internal networks cannot publish ports
+    ports:
+      - "${BIND_ADDR}:${API_PORT}:8000"          # internal interface only (SEC-O23)
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      DISCORD_SERVICE_TOKEN_FILE: /run/secrets/discord_service_token
+      ACCESS_TOKEN_MINUTES: ${ACCESS_TOKEN_MINUTES}
+      REFRESH_TOKEN_HOURS: ${REFRESH_TOKEN_HOURS}
+      MFA_REQUIRED_ROLES: ${MFA_REQUIRED_ROLES}
+      ASK_RATE_PER_MIN: ${ASK_RATE_PER_MIN}
+      APPROVE_RATE_PER_MIN: ${APPROVE_RATE_PER_MIN}
+      LOGIN_RATE_PER_10MIN: ${LOGIN_RATE_PER_10MIN}
+      TZ: ${TZ}
+    volumes:
+      - ${SECRETS_DIR}/database_url:/run/secrets/database_url:ro
+      - ${SECRETS_DIR}/jwt_secret:/run/secrets/jwt_secret:ro
+      - ${SECRETS_DIR}/discord_service_token:/run/secrets/discord_service_token:ro
+      - exports:/var/lib/opspilot/exports
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/v1/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    depends_on: [postgres, redis]
+
+  # ------------------------------------------------------------------- agent
+  agent:
+    <<: *hardened
+    image: ${OPSPILOT_REGISTRY}/opspilot-agent:${OPSPILOT_VERSION}
+    container_name: op-agent
+    # The ONLY executor of tools (ADR-O02). Reaches targets through tunnels/proxies on the egress network.
+    # No docker socket. No shell tool. Registry + policy engine live here.
+    networks: [internal, egress]
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      REDIS_URL: redis://redis:6379/0
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+      PROMPT_VERSION: ${PROMPT_VERSION}
+      REGISTRY_VERSION: ${REGISTRY_VERSION}
+      MAX_ITERATIONS: ${MAX_ITERATIONS}
+      TOOL_BUDGET_S: ${TOOL_BUDGET_S}
+      TOOL_TIMEOUT_S: ${TOOL_TIMEOUT_S}
+      LLM_TIMEOUT_S: ${LLM_TIMEOUT_S}
+      LLM_BREAKER_FAILURES: ${LLM_BREAKER_FAILURES}
+      LOG_MAX_LINES: ${LOG_MAX_LINES}
+      LOG_MAX_BYTES: ${LOG_MAX_BYTES}
+      TARGETS_FILE: /etc/opspilot/targets.yaml
+      SECRETS_DIR: /run/secrets
+      PROMETHEUS_URL: ${PROMETHEUS_URL}
+      LOKI_URL: ${LOKI_URL}
+      TZ: ${TZ}
+    volumes:
+      - ${SECRETS_DIR}/database_url:/run/secrets/database_url:ro
+      - ${SECRETS_DIR}/targets:/run/secrets/targets:ro          # per-target DSNs, tunnel keys, deploy key (0400)
+      - ${CONFIG_DIR}/targets.yaml:/etc/opspilot/targets.yaml:ro
+      - ${CONFIG_DIR}/runbooks:/etc/opspilot/runbooks:ro
+      - repos:/var/lib/opspilot/repos                              # shallow clones for git_* (rw, non-secret)
+    depends_on: [postgres, redis, ollama]
+
+  # --------------------------------------------------------------- scheduler
+  scheduler:
+    <<: *hardened
+    image: ${OPSPILOT_REGISTRY}/opspilot-scheduler:${OPSPILOT_VERSION}
+    container_name: op-scheduler
+    networks: [internal, egress]
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      REDIS_URL: redis://redis:6379/0
+      SWEEP_CRON: ${SWEEP_CRON}
+      ALERT_EVAL_INTERVAL_S: ${ALERT_EVAL_INTERVAL_S}
+      PROPOSAL_EXPIRY_S: "600"                  # FR-19: fixed, not configurable
+      RETENTION_RESULTS_DAYS: ${RETENTION_RESULTS_DAYS}
+      RETENTION_METADATA_DAYS: ${RETENTION_METADATA_DAYS}
+      SMTP_URL_FILE: /run/secrets/smtp_url
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL}
+      ALERT_WEBHOOK_HMAC_FILE: /run/secrets/alert_webhook_hmac
+      TZ: ${TZ}
+    volumes:
+      - ${SECRETS_DIR}/database_url:/run/secrets/database_url:ro
+      - ${SECRETS_DIR}/smtp_url:/run/secrets/smtp_url:ro
+      - ${SECRETS_DIR}/alert_webhook_hmac:/run/secrets/alert_webhook_hmac:ro
+    depends_on: [postgres, redis]
+
+  # ------------------------------------------------------------- discord-bot
+  discord-bot:
+    <<: *hardened
+    image: ${OPSPILOT_REGISTRY}/opspilot-discord:${OPSPILOT_VERSION}
+    container_name: op-discord
+    networks: [internal, egress]              # egress: Discord gateway only (firewalled)
+    environment:
+      DISCORD_BOT_TOKEN_FILE: /run/secrets/discord_bot_token
+      DISCORD_SERVICE_TOKEN_FILE: /run/secrets/discord_service_token
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID}
+      DISCORD_CHANNEL_IDS: ${DISCORD_CHANNEL_IDS}
+      OPSPILOT_API_URL: http://api:8000/api/v1
+      TZ: ${TZ}
+    volumes:
+      - ${SECRETS_DIR}/discord_bot_token:/run/secrets/discord_bot_token:ro
+      - ${SECRETS_DIR}/discord_service_token:/run/secrets/discord_service_token:ro
+    depends_on: [api]
+
+  # ----------------------------------------------------------------- console
+  console:
+    <<: *hardened
+    image: ${OPSPILOT_REGISTRY}/opspilot-console:${OPSPILOT_VERSION}
+    container_name: op-console
+    networks: [internal, frontend]
+    ports:
+      - "${BIND_ADDR}:${CONSOLE_PORT}:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://${BIND_ADDR}:${API_PORT}/api/v1
+      TZ: ${TZ}
+    tmpfs: ["/tmp:size=64m,mode=1777", "/app/.next/cache:size=128m"]
+    depends_on: [api]
+
+  # ---------------------------------------------------------------- postgres
+  postgres:
+    image: postgres:16-alpine
+    container_name: op-postgres
+    restart: unless-stopped
+    networks: [internal]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ${SECRETS_DIR}/postgres_password:/run/secrets/postgres_password:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }
+
+  # ------------------------------------------------------------------- redis
+  redis:
+    image: redis:7-alpine
+    container_name: op-redis
+    restart: unless-stopped
+    networks: [internal]
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    user: "999:999"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/data:size=64m"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # ------------------------------------------------------------------ ollama
+  ollama:
+    image: ollama/ollama:${OLLAMA_VERSION}
+    container_name: op-ollama
+    restart: unless-stopped
+    networks: [internal]                      # no egress; models are pulled at install time (OPS-04 §4.3)
+    environment:
+      OLLAMA_KEEP_ALIVE: 30m
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    volumes:
+      - ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT}
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ------------------------------------------------------ optional sources
+  prometheus:
+    profiles: [sources]
+    image: prom/prometheus:${PROMETHEUS_VERSION}
+    container_name: op-prometheus
+    restart: unless-stopped
+    networks: [internal, egress]
+    volumes:
+      - ${CONFIG_DIR}/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=15d"]
+
+  loki:
+    profiles: [sources]
+    image: grafana/loki:${LOKI_VERSION}
+    container_name: op-loki
+    restart: unless-stopped
+    networks: [internal, egress]
+    volumes:
+      - lokidata:/loki
+
+volumes:
+  pgdata: {}
+  ollama: {}
+  repos: {}
+  exports: {}
+  promdata: {}
+  lokidata: {}
+
+networks:
+  internal:
+    internal: true          # postgres, redis, ollama: no route out; api/console/agent reach them here
+  frontend: {}              # api, console: published on ${BIND_ADDR} (internal interface) only
+  egress: {}                # agent (tunnels/proxies/targets), scheduler (alert sinks), discord-bot (Discord)

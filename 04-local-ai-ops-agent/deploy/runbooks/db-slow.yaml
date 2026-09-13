@@ -1,0 +1,18 @@
+# Runbook: db-slow — read-only investigation; no write step. Produces an evidence report.
+name: db-slow
+version: 1
+description: "DB slow: db_health (probe role) -> app logs -> host resources -> report; no action"
+params:
+  db:      { type: string, default: fb-postgres }
+  target:  { type: string, default: factorybrain-host }
+  service: { type: string, default: api }
+steps:
+  - id: db
+    tool: db_health
+    args: { target: "{{ params.db }}" }
+  - id: logs
+    tool: docker_logs
+    args: { target: "{{ params.target }}", service: "{{ params.service }}", since: "15m", grep: "timeout|slow|deadlock" }
+  - id: mem
+    tool: host_metrics
+    args: { target: "{{ params.target }}" }

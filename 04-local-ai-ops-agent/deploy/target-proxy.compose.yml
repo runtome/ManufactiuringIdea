@@ -1,0 +1,61 @@
+# OpsPilot — target-proxy.compose.yml
+# Deployed ON EACH TARGET HOST (not on the OpsPilot host). ICD-04 IF-25 · OPS-04 §5 onboarding step 2.
+#
+# The only process that touches /var/run/docker.sock. Exposes exactly the endpoints the v1 tools need,
+# on 127.0.0.1 only; the OpsPilot agent reaches it through a WireGuard/SSH tunnel (never plaintext on the LAN).
+#
+# Flag set = union of ops.tool.proxy_endpoints (TEST-04 TC-080 verifies each denied section returns 403):
+#   CONTAINERS=1  list / inspect / logs / restart / start / stop           (docker_ps, docker_logs, restart/start/stop)
+#   POST=1        required for restart/start/stop/create/prune
+#   INFO=1        host_metrics
+#   IMAGES=1      prune_dangling_images — set to 0 if that action is `allow: false` in policy (narrower is better)
+#   SERVICES=0    only Swarm hosts need 1 (scale_service on Swarm)
+#   EXEC=0 VOLUMES=0 SYSTEM=0 SWARM=0 BUILD=0 NETWORKS=0 SECRETS=0 CONFIGS=0 PLUGINS=0 NODES=0 TASKS=0
+#   COMMIT=0 DISTRIBUTION=0 AUTH=0 SESSION=0 EVENTS=0   — never
+#   PING=1 VERSION=1                                    — health only
+
+services:
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    container_name: opspilot-socket-proxy
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ["/run:size=8m"]
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "127.0.0.1:2375:2375"        # loopback only; reached via the opspilot-tunnel unit
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      LOG_LEVEL: info
+      CONTAINERS: "1"
+      POST: "1"
+      INFO: "1"
+      IMAGES: "${OPSPILOT_PROXY_IMAGES:-1}"
+      SERVICES: "${OPSPILOT_PROXY_SERVICES:-0}"
+      ALLOW_RESTARTS: "1"
+      ALLOW_START: "1"
+      ALLOW_STOP: "1"
+      PING: "1"
+      VERSION: "1"
+      EXEC: "0"
+      VOLUMES: "0"
+      SYSTEM: "0"
+      SWARM: "0"
+      BUILD: "0"
+      NETWORKS: "0"
+      SECRETS: "0"
+      CONFIGS: "0"
+      PLUGINS: "0"
+      NODES: "0"
+      TASKS: "0"
+      COMMIT: "0"
+      DISTRIBUTION: "0"
+      AUTH: "0"
+      SESSION: "0"
+      EVENTS: "0"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2375/_ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opspilot.internal/schemas/runbook.schema.json",
+  "title": "OpsPilot runbook",
+  "description": "A named sequence of REGISTRY tools with conditions (FR-24). Every step names a tool; write steps go through the same approval gate as a model proposal (SEC-O15). There is no free-form step type.",
+  "type": "object",
+  "required": ["name", "version", "steps"],
+  "additionalProperties": false,
+  "properties": {
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,40}$" },
+    "version": { "type": "integer", "minimum": 1 },
+    "description": { "type": "string", "maxLength": 300 },
+    "params": {
+      "type": "object",
+      "description": "Runtime parameters the caller may supply (e.g. target, service); referenced as {{ params.x }}",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+          "type": { "type": "string", "enum": ["string", "integer"] },
+          "default": {},
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "required": ["id", "tool"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,30}$" },
+          "tool": {
+            "type": "string",
+            "description": "Registry tool name. Deny-listed names are invalid by schema as a first line; the loader also checks the live registry.",
+            "pattern": "^[a-z][a-z0-9_]{2,40}$",
+            "not": { "pattern": "(shell|exec|eval|sql|query_raw|volume_rm|system_prune|force_push|drop_|truncate)" }
+          },
+          "args": { "type": "object", "additionalProperties": { "type": ["string", "integer", "boolean"] } },
+          "when": { "type": "string", "maxLength": 200, "description": "Condition over prior step results, e.g. health.status != 200 or mem.disk_pct > 85. Not SQL, not shell." },
+          "approval": { "type": "boolean", "description": "Informational: write tools ALWAYS go through the gate; setting false on a write tool is rejected by the loader." },
+          "on_fail": { "type": "string", "enum": ["stop", "continue"], "default": "stop" },
+          "timeout_s": { "type": "integer", "minimum": 1, "maximum": 60 }
+        }
+      }
+    }
+  }
+}

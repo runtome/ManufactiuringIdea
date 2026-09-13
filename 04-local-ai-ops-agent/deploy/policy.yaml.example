@@ -1,0 +1,78 @@
+# OpsPilot policy — deploy/policy.yaml.example
+# Loaded with:  opsctl policy load policy.yaml   (owner; PUT /policies; validated against schemas/policy.schema.json)
+#
+# What this file CAN do: allow/deny a registered write tool per environment, name the approver role,
+# set rate limits, restrict targets, and opt in to auto-execution for low/medium risk.
+# What this file CANNOT do: add a tool, change a tool's risk (that is the registry, i.e. code), enable a
+# deny-listed action, or auto-execute a high-risk action (C-03 — refused by schema, API and DB trigger).
+#
+# Environments: prod never auto-executes anything. staging auto-executes low-risk actions only.
+
+version: "2026-09-01"
+environments: [prod, staging]
+
+defaults:
+  allow: true
+  require_role: operator
+  auto_execute: false
+  rate_limit: { max: 3, window_s: 3600, key: target }
+  targets_allow: null            # null = any enabled target of the environment
+
+actions:
+
+  restart_container:
+    risk: low
+    default:
+      require_role: operator
+      rate_limit: { max: 3, window_s: 3600, key: target+service }   # AC-06: the 4th restart of the same service within an hour is blocked
+    environments:
+      staging: { auto_execute: true }
+
+  start_container:
+    risk: low
+    environments:
+      staging: { auto_execute: true }
+
+  stop_container:
+    risk: medium
+    default:
+      require_role: admin
+      targets_allow: [vps-1, factorybrain-host]      # never the database host; 'critical' tags are refused regardless
+
+  scale_service:
+    risk: medium
+    default:
+      require_role: admin
+      rate_limit: { max: 2, window_s: 3600, key: target+service }
+
+  clear_cache:
+    risk: low
+    environments:
+      staging: { auto_execute: true }
+
+  rotate_logs:
+    risk: low
+    default:
+      rate_limit: { max: 2, window_s: 86400, key: target }
+    environments:
+      staging: { auto_execute: true }
+
+  prune_dangling_images:
+    risk: medium
+    default:
+      require_role: admin
+      rate_limit: { max: 1, window_s: 86400, key: target }
+      allow: true                # requires IMAGES=1 on the host's socket proxy (ICD-04 IF-25); set allow: false where the proxy has IMAGES=0
+
+  rerun_failed_job:
+    risk: low
+    default:
+      rate_limit: { max: 3, window_s: 3600, key: target+service }
+
+  redeploy_last_good:
+    risk: medium
+    default:
+      require_role: admin
+      rate_limit: { max: 2, window_s: 3600, key: target+service }
+    environments:
+      prod: { targets_allow: [vps-1, factorybrain-host] }
