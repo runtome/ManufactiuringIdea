@@ -1,0 +1,264 @@
+# PawTrace — docker-compose.yml (single host; OPS-07 §4)
+# Profiles:  gpu (worker-vision on CUDA) | cpu (worker-vision on CPU, NFR-08 low-volume mode) | dev (mailpit)
+#   docker compose --profile gpu up -d        production with a GPU
+#   docker compose --profile cpu --profile dev up -d
+# Networks:  frontend (reverse proxy → api/web) · internal (no egress: db, redis, minio, workers) · egress (api, worker-match, scheduler → push, mail, CAPTCHA, geocoder)
+# Secrets are FILES under ${SECRETS_DIR} (OPS-07 §4.2) — never in this file or in .env (TEST-07 TC-007).
+
+x-hardened: &hardened
+  user: "10001:10001"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp]
+  restart: unless-stopped
+  logging: { driver: json-file, options: { max-size: "20m", max-file: "5" } }
+
+x-app-env: &app-env
+  TZ: ${TZ}
+  DATABASE_URL_FILE: /run/secrets/database_url
+  PUBLIC_DATABASE_URL_FILE: /run/secrets/public_database_url      # public_ro pool (ADR-T06)
+  REDIS_URL: redis://redis:6379/0
+  S3_ENDPOINT: http://minio:9000
+  S3_REGION: ${S3_REGION}
+  S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+  S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+  S3_BUCKET_DERIVATIVES: ${S3_BUCKET_DERIVATIVES}
+  S3_BUCKET_CROPS: ${S3_BUCKET_CROPS}
+  S3_BUCKET_EXPORTS: ${S3_BUCKET_EXPORTS}
+  S3_BUCKET_INTAKE: ${S3_BUCKET_INTAKE}
+  CONFIG_DIR: /etc/pawtrace
+  LOG_LEVEL: ${LOG_LEVEL}
+
+services:
+  # ------------------------------------------------------------------ edge
+  web:
+    <<: *hardened
+    image: ${PT_REGISTRY}/web:${PT_VERSION}
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL}
+      API_URL: http://api:8080
+      MAP_TILES_URL: ${MAP_TILES_URL}
+      MAP_TILES_KEY: ${MAP_TILES_KEY}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY}
+      CAPTCHA_SITE_KEY: ${CAPTCHA_SITE_KEY}
+      DEFAULT_LOCALE: ${DEFAULT_LOCALE}
+    ports: ["${BIND_ADDR}:${WEB_PORT}:3000"]
+    depends_on: [api]
+    networks: [frontend]
+
+  api:
+    <<: *hardened
+    image: ${PT_REGISTRY}/api:${PT_VERSION}
+    environment:
+      <<: *app-env
+      PUBLIC_URL: ${PUBLIC_URL}
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      SESSION_DAYS: ${SESSION_DAYS}
+      MAGIC_LINK_TTL_S: ${MAGIC_LINK_TTL_S}
+      URL_SIGNING_KEY_FILE: /run/secrets/url_signing_key
+      CAPTCHA_PROVIDER: ${CAPTCHA_PROVIDER}
+      CAPTCHA_SECRET_FILE: /run/secrets/captcha_secret
+      GEOCODER_URL: ${GEOCODER_URL}
+      SMTP_URL_FILE: /run/secrets/smtp_url
+      MAIL_FROM: ${MAIL_FROM}
+      RELAY_DOMAIN: ${RELAY_DOMAIN}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB}
+      PUBLIC_ROUTES_ENABLED: ${PUBLIC_ROUTES_ENABLED}
+      METRICS_ENABLED: "true"
+    secrets: [database_url, public_database_url, s3_access_key, s3_secret_key, jwt_secret, url_signing_key, captcha_secret, smtp_url]
+    volumes:
+      - ${CONFIG_DIR}:/etc/pawtrace:ro
+    ports: ["${BIND_ADDR}:${API_PORT}:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+      minio-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/v1/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    networks: [frontend, internal, egress]
+
+  # ------------------------------------------------------------------ workers
+  worker-vision-gpu:
+    <<: *hardened
+    image: ${PT_REGISTRY}/worker-vision:${PT_VERSION}-cuda
+    profiles: [gpu]
+    environment:
+      <<: *app-env
+      WORKER: vision
+      DEVICE: cuda
+      MODELS_DIR: /models
+      BATCH_SIZE: ${VISION_BATCH_GPU}
+      REEMBED_BATCH: ${REEMBED_BATCH_GPU}
+      NSFW_AUTO_HIDE: ${NSFW_AUTO_HIDE}
+    secrets: [database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - models:/models:ro
+      - ${CONFIG_DIR}:/etc/pawtrace:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT}
+              capabilities: [gpu]
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal]
+
+  worker-vision-cpu:
+    <<: *hardened
+    image: ${PT_REGISTRY}/worker-vision:${PT_VERSION}
+    profiles: [cpu]
+    environment:
+      <<: *app-env
+      WORKER: vision
+      DEVICE: cpu
+      MODELS_DIR: /models
+      BATCH_SIZE: ${VISION_BATCH_CPU}
+      REEMBED_BATCH: ${REEMBED_BATCH_CPU}
+      NSFW_AUTO_HIDE: ${NSFW_AUTO_HIDE}
+      OMP_NUM_THREADS: ${CPU_THREADS}
+    secrets: [database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - models:/models:ro
+      - ${CONFIG_DIR}:/etc/pawtrace:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal]
+
+  worker-match:
+    <<: *hardened
+    image: ${PT_REGISTRY}/worker-match:${PT_VERSION}
+    environment:
+      <<: *app-env
+      WORKER: match
+      VAPID_PRIVATE_KEY_FILE: /run/secrets/vapid_private
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY}
+      VAPID_SUBJECT: ${VAPID_SUBJECT}
+      FCM_SERVER_KEY_FILE: /run/secrets/fcm_server_key
+      SMTP_URL_FILE: /run/secrets/smtp_url
+      MAIL_FROM: ${MAIL_FROM}
+      URL_SIGNING_KEY_FILE: /run/secrets/url_signing_key
+    secrets: [database_url, s3_access_key, s3_secret_key, vapid_private, fcm_server_key, smtp_url, url_signing_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/pawtrace:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal, egress]
+
+  scheduler:
+    <<: *hardened
+    image: ${PT_REGISTRY}/scheduler:${PT_VERSION}
+    environment:
+      <<: *app-env
+      MATCH_RERUN_CRON: ${MATCH_RERUN_CRON}
+      EXPIRY_CRON: ${EXPIRY_CRON}
+      DIGEST_CRON: ${DIGEST_CRON}
+      RETENTION_CRON: ${RETENTION_CRON}
+      CALIBRATION_CRON: ${CALIBRATION_CRON}
+      DELETION_SWEEP_CRON: ${DELETION_SWEEP_CRON}
+      RATE_LIMIT_MIRROR_CRON: ${RATE_LIMIT_MIRROR_CRON}
+      SMTP_URL_FILE: /run/secrets/smtp_url
+      MAIL_FROM: ${MAIL_FROM}
+    secrets: [database_url, s3_access_key, s3_secret_key, smtp_url]
+    volumes:
+      - ${CONFIG_DIR}:/etc/pawtrace:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal, egress]
+
+  # ------------------------------------------------------------------ data
+  postgres:
+    build: { context: ./postgres }                      # postgis/postgis:16-3.4 + postgresql-16-pgvector (no official combined image)
+    image: ${PT_REGISTRY}/postgres-postgis-pgvector:${POSTGRES_IMAGE_TAG}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+      TZ: ${TZ}
+    command: ["postgres", "-c", "shared_buffers=${PG_SHARED_BUFFERS}", "-c", "maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM}", "-c", "max_parallel_maintenance_workers=4", "-c", "log_min_duration_statement=500"]
+    secrets: [postgres_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks: [internal]
+
+  redis:
+    image: redis:${REDIS_VERSION}
+    command: ["redis-server", "--save", "60", "1000", "--maxmemory", "${REDIS_MAXMEMORY}", "--maxmemory-policy", "allkeys-lru"]
+    volumes: [redisdata:/data]
+    restart: unless-stopped
+    networks: [internal]
+
+  minio:
+    image: minio/minio:${MINIO_VERSION}
+    command: ["server", "/data"]                          # console disabled: administration through mc in minio-init / OPS-07
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/s3_access_key
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/s3_secret_key
+      MINIO_BROWSER: "off"
+    secrets: [s3_access_key, s3_secret_key]
+    volumes: [objects:/data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks: [internal]
+
+  minio-init:                                             # creates the four PRIVATE buckets and the lifecycle rules (IF-10); no anonymous policy anywhere
+    image: minio/mc:${MINIO_MC_VERSION}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://minio:9000 "$(cat /run/secrets/s3_access_key)" "$(cat /run/secrets/s3_secret_key)" &&
+        for b in ${S3_BUCKET_DERIVATIVES} ${S3_BUCKET_CROPS} ${S3_BUCKET_EXPORTS} ${S3_BUCKET_INTAKE}; do mc mb -p local/$$b; mc anonymous set none local/$$b; done &&
+        mc ilm rule add local/${S3_BUCKET_EXPORTS} --expire-days 2 &&
+        mc ilm rule add local/${S3_BUCKET_INTAKE} --expire-days 7 &&
+        echo buckets ready
+    secrets: [s3_access_key, s3_secret_key]
+    depends_on:
+      minio: { condition: service_healthy }
+    networks: [internal]
+
+  mailpit:                                                # dev only: catches magic links, candidate mails, digests
+    image: axllent/mailpit:${MAILPIT_VERSION}
+    profiles: [dev]
+    ports: ["${BIND_ADDR}:8025:8025"]
+    networks: [internal, frontend]
+
+secrets:
+  database_url:         { file: "${SECRETS_DIR}/database_url" }
+  public_database_url:  { file: "${SECRETS_DIR}/public_database_url" }
+  postgres_password:    { file: "${SECRETS_DIR}/postgres_password" }
+  jwt_secret:           { file: "${SECRETS_DIR}/jwt_secret" }
+  url_signing_key:      { file: "${SECRETS_DIR}/url_signing_key" }
+  s3_access_key:        { file: "${SECRETS_DIR}/s3_access_key" }
+  s3_secret_key:        { file: "${SECRETS_DIR}/s3_secret_key" }
+  vapid_private:        { file: "${SECRETS_DIR}/vapid_private" }
+  fcm_server_key:       { file: "${SECRETS_DIR}/fcm_server_key" }
+  captcha_secret:       { file: "${SECRETS_DIR}/captcha_secret" }
+  smtp_url:             { file: "${SECRETS_DIR}/smtp_url" }
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  objects: {}
+  models: {}                                              # model artefacts pulled at install (OPS-07 §4.3); read-only in workers
+
+networks:
+  frontend: {}
+  internal: { internal: true }                            # no route out: db, redis, minio, vision workers
+  egress: {}                                              # push, mail, CAPTCHA verification, geocoder

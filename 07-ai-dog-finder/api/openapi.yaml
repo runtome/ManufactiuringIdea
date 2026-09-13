@@ -1,0 +1,1220 @@
+openapi: 3.1.0
+info:
+  title: PawTrace API
+  version: 1.0.0
+  summary: Lost and found dogs — photos in, ranked candidates out, humans decide, locations fuzzed.
+  description: |
+    **Scope.** The PawTrace public API (separate deployment; not a FactoryBrain module).
+    The SRS-07 §4.1 paths are kept verbatim. The `Problem` schema is copied byte-for-byte
+    from API-00 and diffed by TEST-07 TC-008; nothing else is shared with the platform.
+
+    **Three contracts (API-Specification.md §3–§5):**
+    - **Privacy** — anonymous and public callers receive `ReportPublic` (a geohash cell, an
+      hour, coarse attributes). Owners receive their own exact coordinates. A matched
+      counterpart receives exact coordinates only after both sides consented in the thread
+      (`ThreadConsent`). Photo bytes are never served by this API: every image field is a
+      signed, expiring URL to a private bucket, minted only for approved photos.
+    - **Candidate** — `MatchCandidate.calibrated_precision` is an empirical confirm rate,
+      never a cosine; `status` is `candidate` until a human `Decision` is posted. No field,
+      value or wording says "match" before that.
+    - **Anonymous** — sightings need no account: a `DeviceToken` is issued on first post;
+      rate limits are per device and IP (429 + `Retry-After`); a CAPTCHA is demanded only
+      when the device's trust score falls (`428` with `CaptchaChallenge`).
+
+    Errors are RFC 7807 `application/problem+json` with a stable `code`.
+  contact: { name: Suphot N. }
+  license: { name: Proprietary }
+  x-document-id: API-07-PawTrace
+
+servers:
+  - url: https://pawtrace.example/api/v1
+    description: Production
+  - url: http://localhost:8080/api/v1
+    description: Local compose
+
+security:
+  - bearerAuth: []
+  - deviceToken: []
+
+tags:
+  - { name: auth,          description: "Magic link / OTP sign-in; anonymous device tokens" }
+  - { name: reports,       description: "LOST and FOUND/SIGHTING reports and their photos" }
+  - { name: matches,       description: "Ranked candidates, decisions, reunions" }
+  - { name: contact,       description: "Relay threads between the two sides of a candidate" }
+  - { name: search,        description: "Browse, text/semantic search, photo-first search" }
+  - { name: map,           description: "Fuzzed map cells" }
+  - { name: notifications, description: "Area subscriptions, push registration, inbox" }
+  - { name: moderation,    description: "Queue, hide/remove, merge duplicates, abuse reports" }
+  - { name: privacy,       description: "Export and delete my data" }
+  - { name: admin,         description: "Models, regions, thresholds, calibration, bias report" }
+  - { name: shelters,      description: "Bulk intake for shelters" }
+  - { name: system,        description: "Health and metrics" }
+
+paths:
+  # ------------------------------------------------------------------ SRS-07 §4.1 (verbatim paths)
+  /reports:
+    post:
+      tags: [reports]
+      summary: Create a LOST or FOUND/SIGHTING report (SRS §4.1). LOST requires an account; SIGHTING works with a device token.
+      operationId: createReport
+      security: [ { bearerAuth: [] }, { deviceToken: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReportCreate' }
+      responses:
+        '201': { description: "Created — photos are added with POST /reports/{id}/photos", content: { application/json: { schema: { $ref: '#/components/schemas/Report' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '428': { $ref: '#/components/responses/CaptchaRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      tags: [reports]
+      summary: My reports (owner or device)
+      operationId: listMyReports
+      security: [ { bearerAuth: [] }, { deviceToken: [] } ]
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/ReportStatus' } }
+      responses:
+        '200': { description: Reports with exact locations (the caller's own), content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Report' } } } } }
+
+  /reports/{id}/photos:
+    post:
+      tags: [reports]
+      summary: Add a photo (SRS §4.1) — EXIF is stripped in memory before anything is stored; triggers the vision pipeline
+      description: |
+        Multipart upload, ≤ 12 MB, JPEG/PNG/HEIC. The response is immediate (`processing_state: queued`);
+        the reporting path never waits for the GPU worker (NFR-08). Idempotent by sha256 of the stripped bytes.
+        If `consent_coarse_location` is true on the report and the EXIF carried GPS, the report's location may be
+        set from it **rounded to ≥ 1 km** — the photo itself never keeps it (C-04).
+      operationId: addPhoto
+      security: [ { bearerAuth: [] }, { deviceToken: [] } ]
+      parameters: [ { $ref: '#/components/parameters/ReportId' } ]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                position: { type: integer, minimum: 1, maximum: 10 }
+      responses:
+        '202': { description: Stored and queued, content: { application/json: { schema: { $ref: '#/components/schemas/Photo' } } } }
+        '200': { description: Same bytes already on this report (idempotent), content: { application/json: { schema: { $ref: '#/components/schemas/Photo' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { description: File too large, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '422': { description: "Not an image, more than 10 photos, or rejected by the pipeline (NO_DOG, CROP_TOO_SMALL, LOW_QUALITY — reported asynchronously on the Photo)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /reports/{id}/matches:
+    get:
+      tags: [matches]
+      summary: Ranked candidates for a LOST report (SRS §4.1) — owner only
+      operationId: listMatches
+      parameters:
+        - { $ref: '#/components/parameters/ReportId' }
+        - { name: include_rejected, in: query, schema: { type: boolean, default: false } }
+      responses:
+        '200':
+          description: Candidates ordered by rank. `processing` tells the owner whether photos are still being embedded (P-2).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  processing: { type: object, properties: { photos_queued: { type: integer }, photos_done: { type: integer } } }
+                  candidates: { type: array, items: { $ref: '#/components/schemas/MatchCandidate' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /matches/{id}/decision:
+    post:
+      tags: [matches]
+      summary: Confirm or reject a candidate (SRS §4.1) — the only way a candidate changes status (C-03, FR-19)
+      operationId: decideMatch
+      parameters: [ { $ref: '#/components/parameters/MatchId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Decision' }
+      responses:
+        '200': { description: Decision recorded (append-only); on confirm a relay thread is opened, content: { application/json: { schema: { $ref: '#/components/schemas/MatchCandidate' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Already decided, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /search:
+    get:
+      tags: [search]
+      summary: Browse / search public reports (SRS §4.1) — cells only, never coordinates
+      operationId: search
+      security: []
+      parameters:
+        - { name: lat, in: query, required: true, schema: { type: number } }
+        - { name: lng, in: query, required: true, schema: { type: number } }
+        - { name: radius, in: query, description: "km, ≤ 50", schema: { type: number, minimum: 0.5, maximum: 50, default: 5 } }
+        - { name: days, in: query, schema: { type: integer, minimum: 1, maximum: 30, default: 3 } }
+        - { name: q, in: query, description: "Free text (TH/EN) — semantic over attributes + description (FR-21, AI-09)", schema: { type: string, maxLength: 200 } }
+        - { name: kind, in: query, schema: { $ref: '#/components/schemas/ReportKind' } }
+        - { name: size_class, in: query, schema: { $ref: '#/components/schemas/SizeClass' } }
+        - { name: color, in: query, schema: { $ref: '#/components/schemas/CoatColor' } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200': { description: Public reports in the area, content: { application/json: { schema: { $ref: '#/components/schemas/SearchResult' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /search/by-photo:
+    post:
+      tags: [search]
+      summary: Photo-first search (SRS §4.1) — one photo, no report; returns public candidates with calibrated scores
+      operationId: searchByPhoto
+      security: [ { bearerAuth: [] }, { deviceToken: [] } ]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, lat, lng]
+              properties:
+                file: { type: string, format: binary }
+                lat: { type: number }
+                lng: { type: number }
+                radius: { type: number, minimum: 0.5, maximum: 50, default: 5 }
+                days: { type: integer, minimum: 1, maximum: 30, default: 3 }
+      responses:
+        '200': { description: Synchronous when a worker is available (≤ 15 s), content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/PhotoSearchHit' } } } } }
+        '202': { description: Worker busy — poll `Location`, headers: { Location: { schema: { type: string } } } }
+        '422': { description: "No dog detected or crop too small", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '428': { $ref: '#/components/responses/CaptchaRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /geocode:
+    get:
+      tags: [search]
+      summary: Address search proxy (FR-03, ICD-07 IF-39) — the client never calls the geocoder directly; queries are not logged with identities
+      operationId: geocode
+      security: []
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 3, maxLength: 120 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 10, default: 5 } }
+      responses:
+        '200': { description: Candidates, content: { application/json: { schema: { type: array, items: { type: object, properties: { label: { type: string }, lat: { type: number }, lng: { type: number } } } } } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { description: Geocoder unavailable — GPS and pin still work, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /map/cells:
+    get:
+      tags: [map]
+      summary: Fuzzed map data (SRS §4.1) — geohash-5 cells with counts (C-01, FR-24, AC-04)
+      operationId: mapCells
+      security: []
+      parameters:
+        - { name: bbox, in: query, required: true, description: "minLng,minLat,maxLng,maxLat", schema: { type: string, pattern: '^-?\d+(\.\d+)?,-?\d+(\.\d+)?,-?\d+(\.\d+)?,-?\d+(\.\d+)?$' } }
+        - { name: days, in: query, schema: { type: integer, minimum: 1, maximum: 30, default: 7 } }
+        - { name: kind, in: query, schema: { $ref: '#/components/schemas/ReportKind' } }
+        - { name: color, in: query, schema: { $ref: '#/components/schemas/CoatColor' } }
+      responses:
+        '200': { description: Cells, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/MapCell' } } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /subscriptions:
+    post:
+      tags: [notifications]
+      summary: Subscribe to an area (SRS §4.1, FR-23) — alerts carry cells only
+      operationId: createSubscription
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubscriptionCreate' }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Subscription' } } } }
+        '422': { description: "Area larger than 20,000 km² or invalid polygon", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      tags: [notifications]
+      summary: My subscriptions
+      operationId: listSubscriptions
+      responses:
+        '200': { description: Subscriptions, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Subscription' } } } } }
+
+  # ------------------------------------------------------------------ auth and devices (IF-41)
+  /auth/magic-link:
+    post:
+      tags: [auth]
+      summary: Request a sign-in link / OTP by email (no passwords)
+      operationId: requestMagicLink
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [email, locale], properties: { email: { type: string, format: email }, locale: { type: string, enum: [th, en] } } }
+      responses:
+        '202': { description: Sent if the address is valid (always 202 — no account enumeration) }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /auth/verify:
+    post:
+      tags: [auth]
+      summary: Exchange the link token or OTP for a session; records the consent version accepted
+      operationId: verifyMagicLink
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [token, consent_version], properties: { token: { type: string }, consent_version: { type: string }, display_name: { type: string } } }
+      responses:
+        '200': { description: Session, content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/device:
+    post:
+      tags: [auth]
+      summary: Issue an anonymous device token (C-02) — returned once, stored hashed
+      operationId: issueDeviceToken
+      security: []
+      responses:
+        '201': { description: Token, content: { application/json: { schema: { $ref: '#/components/schemas/DeviceToken' } } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /auth/captcha:
+    post:
+      tags: [auth]
+      summary: Submit a CAPTCHA solution for a challenged device (FR-28)
+      operationId: solveCaptcha
+      security: [ { deviceToken: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [challenge_id, solution], properties: { challenge_id: { type: string }, solution: { type: string } } }
+      responses:
+        '204': { description: Device cleared }
+        '422': { description: Wrong solution, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # ------------------------------------------------------------------ reports
+  /reports/{id}:
+    get:
+      tags: [reports]
+      summary: One report — exact location for the owner/device; ReportPublic for everyone else
+      operationId: getReport
+      security: [ { bearerAuth: [] }, { deviceToken: [] }, {} ]
+      parameters: [ { $ref: '#/components/parameters/ReportId' } ]
+      responses:
+        '200':
+          description: Representation depends on the caller (API-Specification §3)
+          content:
+            application/json:
+              schema: { oneOf: [ { $ref: '#/components/schemas/Report' }, { $ref: '#/components/schemas/ReportPublic' } ] }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410': { description: Deleted, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    patch:
+      tags: [reports]
+      summary: Edit description, attributes, search radius/days, re-loss flag (owner)
+      operationId: updateReport
+      security: [ { bearerAuth: [] }, { deviceToken: [] } ]
+      parameters: [ { $ref: '#/components/parameters/ReportId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReportUpdate' }
+      responses:
+        '200': { description: Updated; matching re-runs, content: { application/json: { schema: { $ref: '#/components/schemas/Report' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /reports/{id}/status:
+    post:
+      tags: [reports]
+      summary: Close, re-open or mark reunited outside the app (FR-05, FR-20)
+      operationId: setReportStatus
+      security: [ { bearerAuth: [] }, { deviceToken: [] } ]
+      parameters: [ { $ref: '#/components/parameters/ReportId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [status], properties: { status: { type: string, enum: [active, reunited, closed] }, story: { type: string, maxLength: 2000 }, story_public: { type: boolean } } }
+      responses:
+        '200': { description: Status changed, content: { application/json: { schema: { $ref: '#/components/schemas/Report' } } } }
+        '409': { description: Transition not allowed (REPORT_TRANSITION), content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /reports/{id}/photos/{photoId}:
+    get:
+      tags: [reports]
+      summary: Photo status and signed URLs (approved photos only for non-owners)
+      operationId: getPhoto
+      security: [ { bearerAuth: [] }, { deviceToken: [] }, {} ]
+      parameters: [ { $ref: '#/components/parameters/ReportId' }, { $ref: '#/components/parameters/PhotoId' } ]
+      responses:
+        '200': { description: Photo, content: { application/json: { schema: { $ref: '#/components/schemas/Photo' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [reports]
+      summary: Remove a photo and its crops and embeddings (owner)
+      operationId: deletePhoto
+      security: [ { bearerAuth: [] }, { deviceToken: [] } ]
+      parameters: [ { $ref: '#/components/parameters/ReportId' }, { $ref: '#/components/parameters/PhotoId' } ]
+      responses:
+        '204': { description: Removed }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ------------------------------------------------------------------ matches, reunions
+  /matches/{id}:
+    get:
+      tags: [matches]
+      summary: One candidate with components and side-by-side photos (either side)
+      operationId: getMatch
+      parameters: [ { $ref: '#/components/parameters/MatchId' } ]
+      responses:
+        '200': { description: Candidate, content: { application/json: { schema: { $ref: '#/components/schemas/MatchCandidate' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /matches/{id}/reunion:
+    post:
+      tags: [matches]
+      summary: Record the reunion (FR-20) — closes the lost report, supersedes other candidates
+      operationId: recordReunion
+      parameters: [ { $ref: '#/components/parameters/MatchId' } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { story: { type: string, maxLength: 2000 }, story_public: { type: boolean, default: false } } }
+      responses:
+        '201': { description: Reunion recorded, content: { application/json: { schema: { $ref: '#/components/schemas/Reunion' } } } }
+        '409': { description: Candidate not confirmed, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # ------------------------------------------------------------------ contact relay (FR-07)
+  /matches/{id}/thread:
+    get:
+      tags: [contact]
+      summary: The relay thread of a confirmed candidate (both sides; moderators)
+      operationId: getThread
+      parameters: [ { $ref: '#/components/parameters/MatchId' } ]
+      responses:
+        '200': { description: Thread with messages and consent state, content: { application/json: { schema: { $ref: '#/components/schemas/Thread' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: No thread — the candidate is not confirmed, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /threads/{threadId}/messages:
+    post:
+      tags: [contact]
+      summary: Send a message through the relay — no email or phone is exchanged by the system
+      operationId: postMessage
+      security: [ { bearerAuth: [] }, { deviceToken: [] } ]
+      parameters: [ { $ref: '#/components/parameters/ThreadId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [body], properties: { body: { type: string, minLength: 1, maxLength: 2000 } } }
+      responses:
+        '201': { description: Sent; the other side is notified (budget applies), content: { application/json: { schema: { $ref: '#/components/schemas/Message' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /threads/{threadId}/consent:
+    post:
+      tags: [contact]
+      summary: Consent to share my exact location with the other side (NFR-05) — coordinates appear only when both consented
+      operationId: consentExactLocation
+      security: [ { bearerAuth: [] }, { deviceToken: [] } ]
+      parameters: [ { $ref: '#/components/parameters/ThreadId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [consent], properties: { consent: { type: boolean } } }
+      responses:
+        '200': { description: Consent state, content: { application/json: { schema: { $ref: '#/components/schemas/ThreadConsent' } } } }
+
+  # ------------------------------------------------------------------ notifications
+  /subscriptions/{id}:
+    delete:
+      tags: [notifications]
+      summary: Unsubscribe
+      operationId: deleteSubscription
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '204': { description: Removed }
+  /push/subscriptions:
+    post:
+      tags: [notifications]
+      summary: Register a Web Push / FCM endpoint (IF-40)
+      operationId: registerPush
+      security: [ { bearerAuth: [] }, { deviceToken: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [provider, endpoint], properties: { provider: { type: string, enum: [webpush, fcm] }, endpoint: { type: string }, keys: { type: object, properties: { p256dh: { type: string }, auth: { type: string } } } } }
+      responses:
+        '201': { description: Registered }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /notifications:
+    get:
+      tags: [notifications]
+      summary: My inbox — including digest entries created when the daily budget was exceeded (FR-25)
+      operationId: listNotifications
+      security: [ { bearerAuth: [] }, { deviceToken: [] } ]
+      parameters: [ { name: cursor, in: query, schema: { type: string } } ]
+      responses:
+        '200': { description: Notifications, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Notification' } }, next_cursor: { type: string } } } } } }
+
+  # ------------------------------------------------------------------ moderation (FR-26…29)
+  /abuse-reports:
+    post:
+      tags: [moderation]
+      summary: Report a post, photo, message or device (FR-27) — anyone, including anonymous
+      operationId: createAbuseReport
+      security: [ { bearerAuth: [] }, { deviceToken: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [entity, entity_id, reason], properties: { entity: { type: string, enum: [report, photo, message, device] }, entity_id: { type: string, format: uuid }, reason: { type: string, enum: [fake, abuse, spam, not_a_dog, privacy, other] }, detail: { type: string, maxLength: 1000 } } }
+      responses:
+        '201': { description: Queued for a moderator }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /moderation/queue:
+    get:
+      tags: [moderation]
+      summary: Pending photos, open abuse reports, duplicate clusters (moderator)
+      operationId: moderationQueue
+      responses:
+        '200': { description: Queue, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ModerationItem' } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /moderation/{entity}/{entityId}:
+    post:
+      tags: [moderation]
+      summary: approve / hide / remove / restore / ban_device (moderator) — audited
+      operationId: moderate
+      parameters:
+        - { name: entity, in: path, required: true, schema: { type: string, enum: [report, photo, message, device] } }
+        - { name: entityId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [action, reason], properties: { action: { type: string, enum: [approve, hide, remove, restore, ban_device, unban_device] }, reason: { type: string, minLength: 3, maxLength: 500 } } }
+      responses:
+        '200': { description: Applied, content: { application/json: { schema: { $ref: '#/components/schemas/ModerationEvent' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: "approve refused — photo not stripped/processed (PHOTO_NOT_PROCESSED)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /moderation/duplicates/{clusterId}:
+    post:
+      tags: [moderation]
+      summary: Merge or dismiss a duplicate cluster (FR-29)
+      operationId: resolveDuplicate
+      parameters: [ { name: clusterId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [action], properties: { action: { type: string, enum: [merge, dismiss] } } }
+      responses:
+        '200': { description: Resolved }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ------------------------------------------------------------------ privacy rights (NFR-06)
+  /me:
+    get:
+      tags: [privacy]
+      summary: My profile, consent version, locale
+      operationId: getMe
+      responses:
+        '200': { description: Profile, content: { application/json: { schema: { $ref: '#/components/schemas/Me' } } } }
+  /me/export:
+    post:
+      tags: [privacy]
+      summary: Export my data (reports, photos, decisions, messages) — signed URL valid 24 h
+      operationId: requestExport
+      responses:
+        '202': { description: Export being prepared, content: { application/json: { schema: { $ref: '#/components/schemas/ExportStatus' } } } }
+  /me/delete:
+    post:
+      tags: [privacy]
+      summary: Delete my data including crops and embeddings (AC-06) — irreversible; SLA 72 h
+      operationId: requestDeletion
+      security: [ { bearerAuth: [] }, { deviceToken: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [confirm], properties: { confirm: { type: string, const: DELETE } } }
+      responses:
+        '202': { description: Database rows removed immediately; objects within the SLA, content: { application/json: { schema: { $ref: '#/components/schemas/DeletionStatus' } } } }
+  /me/delete/{requestId}:
+    get:
+      tags: [privacy]
+      summary: Deletion progress
+      operationId: getDeletionStatus
+      security: []
+      parameters: [ { name: requestId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Status, content: { application/json: { schema: { $ref: '#/components/schemas/DeletionStatus' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------ admin
+  /admin/models:
+    get:
+      tags: [admin]
+      summary: Model versions with benchmark, activation and re-embed status (AI-06)
+      operationId: listModels
+      responses:
+        '200': { description: Versions, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ModelVersion' } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [admin]
+      summary: Register a model version (creates its partial vector indexes); a benchmark run is required before activation
+      operationId: registerModel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModelVersionCreate' }
+      responses:
+        '201': { description: Registered, content: { application/json: { schema: { $ref: '#/components/schemas/ModelVersion' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /admin/models/{modelId}/reembed:
+    post:
+      tags: [admin]
+      summary: Start the background re-embed from the active version to this one (AC-08)
+      operationId: startReembed
+      parameters: [ { $ref: '#/components/parameters/ModelId' } ]
+      responses:
+        '202': { description: Job started, content: { application/json: { schema: { $ref: '#/components/schemas/ReembedJob' } } } }
+        '409': { description: A job is already running, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /admin/models/{modelId}/activate:
+    post:
+      tags: [admin]
+      summary: Make this version search_active — one transaction; refused until its re-embed job completed (REEMBED_INCOMPLETE)
+      operationId: activateModel
+      parameters: [ { $ref: '#/components/parameters/ModelId' } ]
+      responses:
+        '200': { description: Activated, content: { application/json: { schema: { $ref: '#/components/schemas/ModelVersion' } } } }
+        '409': { description: REEMBED_INCOMPLETE or BENCHMARK_MISSING, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /admin/models/{modelId}/benchmark:
+    post:
+      tags: [admin]
+      summary: Record a benchmark run with per-colour/size slices (AI-03, AI-08)
+      operationId: recordBenchmark
+      parameters: [ { $ref: '#/components/parameters/ModelId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BenchmarkRun' }
+      responses:
+        '201': { description: Recorded, content: { application/json: { schema: { $ref: '#/components/schemas/BiasReport' } } } }
+  /admin/bias-report:
+    get:
+      tags: [admin]
+      summary: Latest retrieval quality per coat colour and size class; rebalance_required when the gap exceeds 15 % (AI-08)
+      operationId: biasReport
+      responses:
+        '200': { description: Report, content: { application/json: { schema: { $ref: '#/components/schemas/BiasReport' } } } }
+  /admin/calibration:
+    get:
+      tags: [admin]
+      summary: Calibration curve of the active version (AI-04)
+      operationId: getCalibration
+      responses:
+        '200': { description: Bins, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/CalibrationBin' } } } } }
+    post:
+      tags: [admin]
+      summary: Recompute the curve from decisions now (also nightly)
+      operationId: refreshCalibration
+      responses:
+        '200': { description: Recomputed, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/CalibrationBin' } } } } }
+  /admin/config:
+    get:
+      tags: [admin]
+      summary: Current configuration (fusion weights, thresholds, rate limits, regions) with its version
+      operationId: getConfig
+      responses:
+        '200': { description: Config, content: { application/json: { schema: { $ref: '#/components/schemas/ConfigVersion' } } } }
+    put:
+      tags: [admin]
+      summary: Load a configuration document (validated against deploy/schemas/pawtrace-config.schema.json); versioned
+      operationId: putConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: Loaded, content: { application/json: { schema: { $ref: '#/components/schemas/ConfigVersion' } } } }
+        '422': { description: "Schema violation — e.g. weights not summing to 1, public fuzz finer than geohash-5, radius > 50 km", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /admin/regions:
+    get:
+      tags: [admin]
+      summary: Regions with fuzz precision and notification settings
+      operationId: listRegions
+      responses:
+        '200': { description: Regions, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Region' } } } } }
+  /admin/deletions:
+    get:
+      tags: [admin]
+      summary: Deletion requests with SLA status (NFR-06)
+      operationId: listDeletions
+      responses:
+        '200': { description: Requests, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/DeletionStatus' } } } } }
+  /admin/notify-budget:
+    get:
+      tags: [admin]
+      summary: Who hit the daily cap today (FR-25)
+      operationId: notifyBudget
+      responses:
+        '200': { description: Rows, content: { application/json: { schema: { type: array, items: { type: object, properties: { user_id: { type: string, format: uuid }, sent_today: { type: integer }, digested_today: { type: integer }, can_notify: { type: boolean } } } } } } }
+
+  # ------------------------------------------------------------------ shelters (IF-43)
+  /shelters/intake:
+    post:
+      tags: [shelters]
+      summary: Bulk intake — CSV + photos zip; each row becomes a FOUND report owned by the shelter account
+      operationId: shelterIntake
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [csv, photos]
+              properties:
+                csv: { type: string, format: binary }
+                photos: { type: string, format: binary, description: "zip of photos named as in the CSV" }
+      responses:
+        '202': { description: Accepted; per-row results at Location, headers: { Location: { schema: { type: string } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /shelters/intake/{batchId}:
+    get:
+      tags: [shelters]
+      summary: Per-row intake results
+      operationId: getIntakeBatch
+      parameters: [ { name: batchId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Rows, content: { application/json: { schema: { $ref: '#/components/schemas/IntakeBatch' } } } }
+
+  # ------------------------------------------------------------------ system
+  /healthz:
+    get:
+      tags: [system]
+      summary: Liveness
+      operationId: healthz
+      security: []
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { ok: { type: boolean } } } } } }
+  /readyz:
+    get:
+      tags: [system]
+      summary: Readiness — DB, Redis, object store, vision backlog (a stopped GPU worker does not fail readiness, NFR-08)
+      operationId: readyz
+      security: []
+      responses:
+        '200': { description: Ready, content: { application/json: { schema: { type: object, properties: { db: { type: boolean }, redis: { type: boolean }, object_store: { type: boolean }, vision_backlog: { type: integer }, vision_oldest_age_s: { type: integer }, active_embedding_version: { type: string } } } } } }
+        '503': { description: "DB, Redis or object store unavailable", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /metrics:
+    get:
+      tags: [system]
+      summary: Prometheus metrics (ICD-07 IF-14) — internal network only
+      operationId: metrics
+      security: []
+      responses:
+        '200': { description: Metrics, content: { text/plain: { schema: { type: string } } } }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Session from /auth/verify (roles user, shelter, moderator, admin)
+    deviceToken:
+      type: apiKey
+      in: header
+      name: X-Device-Token
+      description: Anonymous device token from /auth/device (C-02, IF-41). Stored hashed; carries a trust score.
+
+  parameters:
+    ReportId: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    MatchId: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    PhotoId: { name: photoId, in: path, required: true, schema: { type: string, format: uuid } }
+    ThreadId: { name: threadId, in: path, required: true, schema: { type: string, format: uuid } }
+    ModelId: { name: modelId, in: path, required: true, schema: { type: integer } }
+
+  responses:
+    BadRequest: { description: Malformed request, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    Unauthorized: { description: Missing or invalid session or device token, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    Forbidden: { description: Not the owner / role insufficient, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    NotFound: { description: Not found, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    ValidationFailed: { description: Validation failed, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    TooManyRequests:
+      description: Rate limited (per device, IP and route — FR-28)
+      headers: { Retry-After: { schema: { type: integer } } }
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    CaptchaRequired:
+      description: The device must solve a CAPTCHA before posting again (FR-28, IF-41)
+      content: { application/json: { schema: { $ref: '#/components/schemas/CaptchaChallenge' } } }
+
+  schemas:
+    # ------------------------------------------------ identical to API-00 (TC-008)
+    Problem:
+      type: object
+      description: RFC 7807 problem details with a stable machine-readable `code`.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          description: Stable error code — see API-Specification.md §7
+        correlation_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+
+    # ------------------------------------------------ enums
+    ReportKind: { type: string, enum: [lost, found, sighting] }
+    ReportStatus: { type: string, enum: [draft, active, matched, reunited, expired, closed] }
+    MatchStatus: { type: string, enum: [candidate, confirmed, rejected, superseded], description: "candidate until a human decision; never 'match'" }
+    SizeClass: { type: string, enum: [small, medium, large, giant] }
+    CoatColor: { type: string, enum: [black, white, brown, tan, golden, grey, red, cream, brindle, merle, spotted] }
+    CoatLen: { type: string, enum: [short, medium, long, wire, hairless] }
+    BreedGroup: { type: string, enum: [toy, terrier, hound, working, herding, sporting, non_sporting, mixed, unknown] }
+    ProcessingState: { type: string, enum: [queued, processing, done, rejected, failed] }
+    ModerationStatus: { type: string, enum: [pending, approved, hidden, removed] }
+
+    # ------------------------------------------------ auth
+    Session:
+      type: object
+      required: [access_token, expires_in, role, consent_version]
+      properties:
+        access_token: { type: string }
+        expires_in: { type: integer }
+        role: { type: string, enum: [user, shelter, moderator, admin] }
+        consent_version: { type: string }
+    DeviceToken:
+      type: object
+      required: [token, device_id]
+      properties:
+        token: { type: string, description: "Send as X-Device-Token. Shown once." }
+        device_id: { type: string, format: uuid }
+    CaptchaChallenge:
+      type: object
+      required: [challenge_id, provider, site_key]
+      properties:
+        challenge_id: { type: string }
+        provider: { type: string, enum: [turnstile, hcaptcha] }
+        site_key: { type: string }
+        reason: { type: string, description: "burst | duplicate_photo | abuse_reports | low_trust" }
+
+    # ------------------------------------------------ reports
+    Location:
+      type: object
+      description: Exact coordinates — only in Report (owner) and in a thread after mutual consent.
+      required: [lat, lng, precision_m, source]
+      properties:
+        lat: { type: number }
+        lng: { type: number }
+        precision_m: { type: integer, minimum: 5 }
+        source: { type: string, enum: [gps, pin, address, exif_coarse] }
+    Cell:
+      type: object
+      description: The public form of a location (C-01) — a geohash cell and its centre.
+      required: [geohash, center_lat, center_lng, approx_size_m]
+      properties:
+        geohash: { type: string, minLength: 3, maxLength: 6 }
+        center_lat: { type: number }
+        center_lng: { type: number }
+        approx_size_m: { type: integer, description: "≈ 4,900 for geohash-5, ≈ 1,200 for geohash-6" }
+    Attributes:
+      type: object
+      properties:
+        size_class: { $ref: '#/components/schemas/SizeClass' }
+        color_primary: { $ref: '#/components/schemas/CoatColor' }
+        color_secondary: { $ref: '#/components/schemas/CoatColor' }
+        coat_len: { $ref: '#/components/schemas/CoatLen' }
+        breed_group: { $ref: '#/components/schemas/BreedGroup' }
+        has_markings: { type: boolean }
+        user_declared: { type: boolean }
+    ReportCreate:
+      type: object
+      required: [kind, event_at, location]
+      properties:
+        kind: { $ref: '#/components/schemas/ReportKind' }
+        title: { type: string, maxLength: 120 }
+        description: { type: string, maxLength: 2000 }
+        event_at: { type: string, format: date-time, description: "time lost (lost) or time seen (found/sighting); FR-04 lets EXIF pre-fill it" }
+        is_reloss: { type: boolean, default: false }
+        location: { $ref: '#/components/schemas/Location' }
+        consent_coarse_location: { type: boolean, default: false, description: "allow EXIF GPS (rounded to ≥ 1 km) to set the location (C-04)" }
+        attributes: { $ref: '#/components/schemas/Attributes' }
+        search_radius_km: { type: number, minimum: 0.5, maximum: 50 }
+        search_days: { type: integer, minimum: 1, maximum: 30 }
+        locale: { type: string, enum: [th, en] }
+    ReportUpdate:
+      type: object
+      properties:
+        title: { type: string, maxLength: 120 }
+        description: { type: string, maxLength: 2000 }
+        is_reloss: { type: boolean }
+        attributes: { $ref: '#/components/schemas/Attributes' }
+        search_radius_km: { type: number, minimum: 0.5, maximum: 50 }
+        search_days: { type: integer, minimum: 1, maximum: 30 }
+    Report:
+      type: object
+      description: The owner's view — exact location, all photos with states.
+      required: [id, kind, status, event_at, location, region, created_at, expires_at]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/ReportKind' }
+        status: { $ref: '#/components/schemas/ReportStatus' }
+        title: { type: string }
+        description: { type: string }
+        event_at: { type: string, format: date-time }
+        is_reloss: { type: boolean }
+        location: { $ref: '#/components/schemas/Location' }
+        region: { type: string }
+        attributes: { $ref: '#/components/schemas/Attributes' }
+        photos: { type: array, items: { $ref: '#/components/schemas/Photo' } }
+        search_radius_km: { type: number }
+        search_days: { type: integer }
+        candidate_count: { type: integer }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+    ReportPublic:
+      type: object
+      description: What anyone else sees (C-01, C-05) — a cell, an hour, coarse attributes, approved photos as signed thumbnails. No coordinates, no poster.
+      required: [id, kind, status, cell, event_hour, approved_photos]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/ReportKind' }
+        status: { $ref: '#/components/schemas/ReportStatus' }
+        title: { type: string }
+        cell: { $ref: '#/components/schemas/Cell' }
+        event_hour: { type: string, format: date-time }
+        attributes: { $ref: '#/components/schemas/Attributes' }
+        approved_photos: { type: integer }
+        cover_thumb_url: { type: string, format: uri, description: "signed, expires in 15 min" }
+        created_day: { type: string, format: date }
+    Photo:
+      type: object
+      required: [id, report_id, position, exif_stripped, processing_state, moderation_status]
+      properties:
+        id: { type: string, format: uuid }
+        report_id: { type: string, format: uuid }
+        position: { type: integer }
+        width: { type: integer }
+        height: { type: integer }
+        exif_stripped: { type: boolean, const: true }
+        capture_time_exif: { type: string, format: date-time, description: "time only — GPS is never kept" }
+        processing_state: { $ref: '#/components/schemas/ProcessingState' }
+        processing_error: { type: string, enum: [NO_DOG, CROP_TOO_SMALL, LOW_QUALITY, NSFW, FAILED] }
+        moderation_status: { $ref: '#/components/schemas/ModerationStatus' }
+        instances: { type: array, items: { type: object, properties: { id: { type: string, format: uuid }, bbox: { type: object }, quality_score: { type: number }, crop_url: { type: string, format: uri } } } }
+        urls: { type: object, description: "signed, expiring; absent unless approved (or the caller is the owner)", properties: { thumb: { type: string, format: uri }, card: { type: string, format: uri }, full: { type: string, format: uri }, expires_at: { type: string, format: date-time } } }
+
+    # ------------------------------------------------ matching
+    ScoreComponents:
+      type: object
+      description: Every term of Appendix A, stored with the candidate and shown to the user (FR-18).
+      required: [cosine, sim_visual, attr_compat, spatial, temporal, distance_m, hours_after]
+      properties:
+        cosine: { type: number, description: "raw similarity — shown only in the details panel, never as 'the score'" }
+        sim_visual: { type: number }
+        attr_compat: { type: number }
+        spatial: { type: number, description: "exp(−d / 3 km)" }
+        temporal: { type: number }
+        penalty: { type: number }
+        distance_m: { type: number, description: "exact metres only for the owner; others get distance_band" }
+        hours_after: { type: number }
+        weights: { type: object, properties: { visual: { type: number }, attr: { type: number }, spatial: { type: number }, temporal: { type: number } } }
+    MatchCandidate:
+      type: object
+      description: |
+        A ranked candidate. `calibrated_precision` reads as "of past candidates with this score, this fraction were
+        confirmed by their owners" (AI-04). The UI wording is "possible sighting", never "match" (C-03).
+      required: [id, lost_report_id, found_report_id, rank, status, calibrated_precision, components, model_version, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        lost_report_id: { type: string, format: uuid }
+        found_report_id: { type: string, format: uuid }
+        rank: { type: integer, minimum: 1 }
+        status: { $ref: '#/components/schemas/MatchStatus' }
+        calibrated_precision: { type: number, minimum: 0, maximum: 1 }
+        calibration_provisional: { type: boolean, description: "true while the model version has < 200 decisions" }
+        score: { type: number, description: "fusion score 0–1 (details panel)" }
+        components: { $ref: '#/components/schemas/ScoreComponents' }
+        distance_band: { type: string, enum: ["under 1 km", "1–3 km", "3–10 km", "over 10 km"] }
+        found_cell: { $ref: '#/components/schemas/Cell' }
+        side_by_side: { type: object, properties: { lost_photo_url: { type: string, format: uri }, found_photo_url: { type: string, format: uri }, lost_crop_url: { type: string, format: uri }, found_crop_url: { type: string, format: uri } } }
+        model_version: { type: string }
+        notified_at: { type: string, format: date-time }
+        decided_at: { type: string, format: date-time }
+        thread_id: { type: string, format: uuid, description: "present once confirmed" }
+        created_at: { type: string, format: date-time }
+    Decision:
+      type: object
+      required: [decision, consent_version]
+      properties:
+        decision: { type: string, enum: [confirm, reject] }
+        consent_version: { type: string, description: "the terms under which this decision may be used as training data (AI-07)" }
+        note: { type: string, maxLength: 500 }
+    Reunion:
+      type: object
+      required: [id, lost_report_id, confirmed_at]
+      properties:
+        id: { type: string, format: uuid }
+        lost_report_id: { type: string, format: uuid }
+        found_report_id: { type: string, format: uuid }
+        match_id: { type: string, format: uuid }
+        confirmed_at: { type: string, format: date-time }
+        story: { type: string }
+        story_public: { type: boolean }
+    PhotoSearchHit:
+      type: object
+      required: [report, calibrated_precision, components]
+      properties:
+        report: { $ref: '#/components/schemas/ReportPublic' }
+        calibrated_precision: { type: number }
+        components: { $ref: '#/components/schemas/ScoreComponents' }
+    SearchResult:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ReportPublic' } }
+        next_cursor: { type: string }
+        semantic: { type: boolean, description: "true when `q` was used (AI-09)" }
+
+    # ------------------------------------------------ contact
+    Thread:
+      type: object
+      required: [id, match_id, opened_at, consent, messages]
+      properties:
+        id: { type: string, format: uuid }
+        match_id: { type: string, format: uuid }
+        opened_at: { type: string, format: date-time }
+        closed_at: { type: string, format: date-time }
+        consent: { $ref: '#/components/schemas/ThreadConsent' }
+        messages: { type: array, items: { $ref: '#/components/schemas/Message' } }
+    ThreadConsent:
+      type: object
+      description: Exact locations are included only when both flags are true (NFR-05).
+      required: [mine, theirs, exact_locations_shared]
+      properties:
+        mine: { type: boolean }
+        theirs: { type: boolean }
+        exact_locations_shared: { type: boolean }
+        lost_location: { $ref: '#/components/schemas/Location' }
+        found_location: { $ref: '#/components/schemas/Location' }
+    Message:
+      type: object
+      required: [id, sender, body, created_at]
+      properties:
+        id: { type: integer }
+        sender: { type: string, enum: [lost_side, found_side, moderator, system] }
+        body: { type: string }
+        created_at: { type: string, format: date-time }
+
+    # ------------------------------------------------ notifications, map
+    SubscriptionCreate:
+      type: object
+      required: [area]
+      properties:
+        area: { type: object, description: "GeoJSON Polygon, ≤ 20,000 km²", properties: { type: { type: string, const: Polygon }, coordinates: { type: array, items: { type: array, items: { type: array, items: { type: number }, minItems: 2, maxItems: 2 } } } } }
+        filters: { type: object, properties: { kind: { type: array, items: { $ref: '#/components/schemas/ReportKind' } }, color_primary: { type: array, items: { $ref: '#/components/schemas/CoatColor' } }, size_class: { type: array, items: { $ref: '#/components/schemas/SizeClass' } } } }
+    Subscription:
+      type: object
+      required: [id, area, active, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        area: { type: object }
+        filters: { type: object }
+        active: { type: boolean }
+        created_at: { type: string, format: date-time }
+    Notification:
+      type: object
+      required: [id, kind, channel, created_at]
+      properties:
+        id: { type: integer }
+        kind: { type: string, enum: [candidate, new_report_in_area, message, reunion, moderation, digest] }
+        channel: { type: string, enum: [push, email, sms, digest, in_app] }
+        payload: { type: object, description: "carries a cell, never coordinates (C-01)" }
+        created_at: { type: string, format: date-time }
+        sent_at: { type: string, format: date-time }
+    MapCell:
+      type: object
+      required: [cell, kind, n, last_event_hour]
+      properties:
+        cell: { $ref: '#/components/schemas/Cell' }
+        kind: { $ref: '#/components/schemas/ReportKind' }
+        n: { type: integer }
+        last_event_hour: { type: string, format: date-time }
+        colors_present: { type: array, items: { $ref: '#/components/schemas/CoatColor' } }
+
+    # ------------------------------------------------ moderation
+    ModerationItem:
+      type: object
+      required: [item, item_id, created_at, priority]
+      properties:
+        item: { type: string, enum: [photo, abuse_report, duplicate] }
+        item_id: { type: string, format: uuid }
+        report_id: { type: string, format: uuid }
+        reason: { type: string }
+        priority: { type: integer }
+        created_at: { type: string, format: date-time }
+        preview: { type: object, properties: { thumb_url: { type: string, format: uri }, nsfw_score: { type: number } } }
+    ModerationEvent:
+      type: object
+      required: [id, entity, entity_id, action, ts, reason]
+      properties:
+        id: { type: integer }
+        entity: { type: string }
+        entity_id: { type: string, format: uuid }
+        action: { type: string }
+        moderator_id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        reason: { type: string }
+
+    # ------------------------------------------------ privacy
+    Me:
+      type: object
+      required: [id, display_name, role, locale, consent_version]
+      properties:
+        id: { type: string, format: uuid }
+        display_name: { type: string }
+        role: { type: string }
+        locale: { type: string }
+        consent_version: { type: string }
+        email_masked: { type: string, description: "n***@example.th — the API never returns the full address to anyone else" }
+    ExportStatus:
+      type: object
+      required: [id, state]
+      properties:
+        id: { type: string, format: uuid }
+        state: { type: string, enum: [requested, ready, expired, failed] }
+        download_url: { type: string, format: uri, description: "signed, 24 h" }
+        expires_at: { type: string, format: date-time }
+    DeletionStatus:
+      type: object
+      required: [id, requested_at, due_at, state]
+      properties:
+        id: { type: string, format: uuid }
+        requested_at: { type: string, format: date-time }
+        due_at: { type: string, format: date-time }
+        state: { type: string, enum: [requested, db_done, completed, failed] }
+        completed_at: { type: string, format: date-time }
+        summary: { type: object, properties: { reports: { type: integer }, photos: { type: integer }, embeddings: { type: integer } } }
+        sla_breached: { type: boolean }
+
+    # ------------------------------------------------ admin
+    ModelVersionCreate:
+      type: object
+      required: [kind, name, version, checksum]
+      properties:
+        kind: { type: string, enum: [detector, embedding, attributes, nsfw, text] }
+        name: { type: string }
+        version: { type: string }
+        dims: { type: integer, description: "768 for embedding, 1024 for text" }
+        checksum: { type: string }
+    ModelVersion:
+      type: object
+      required: [id, kind, name, version, search_active, calibration_provisional]
+      properties:
+        id: { type: integer }
+        kind: { type: string }
+        name: { type: string }
+        version: { type: string }
+        dims: { type: integer }
+        search_active: { type: boolean }
+        calibration_provisional: { type: boolean }
+        benchmark_recall1: { type: number }
+        benchmark_recall10: { type: number }
+        n_embeddings: { type: integer }
+        reembed_pct: { type: number }
+        activated_at: { type: string, format: date-time }
+        retired_at: { type: string, format: date-time }
+    ReembedJob:
+      type: object
+      required: [id, from_version_id, to_version_id, total, done, state]
+      properties:
+        id: { type: integer }
+        from_version_id: { type: integer }
+        to_version_id: { type: integer }
+        total: { type: integer }
+        done: { type: integer }
+        state: { type: string, enum: [running, paused, completed, failed] }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+    BenchmarkRun:
+      type: object
+      required: [dataset, n_queries, recall1, recall10, slices]
+      properties:
+        dataset: { type: string }
+        n_queries: { type: integer, minimum: 1 }
+        recall1: { type: number, minimum: 0, maximum: 1 }
+        recall10: { type: number, minimum: 0, maximum: 1 }
+        filtered: { type: boolean, default: true, description: "under geo/time filter conditions (AI-03)" }
+        slices: { type: array, items: { type: object, required: [slice_kind, slice_value, n, recall10], properties: { slice_kind: { type: string, enum: [color, size] }, slice_value: { type: string }, n: { type: integer }, recall10: { type: number } } } }
+    BiasReport:
+      type: object
+      required: [model, run_at, overall_recall10, slices]
+      properties:
+        model: { type: string }
+        run_at: { type: string, format: date-time }
+        overall_recall10: { type: number }
+        slices: { type: array, items: { type: object, properties: { slice_kind: { type: string }, slice_value: { type: string }, n: { type: integer }, recall10: { type: number }, gap_pct: { type: number }, rebalance_required: { type: boolean } } } }
+    CalibrationBin:
+      type: object
+      required: [bin_low, bin_high, n, confirmed, precision]
+      properties:
+        bin_low: { type: number }
+        bin_high: { type: number }
+        n: { type: integer }
+        confirmed: { type: integer }
+        precision: { type: number }
+        computed_at: { type: string, format: date-time }
+    ConfigVersion:
+      type: object
+      required: [version, loaded_at, doc]
+      properties:
+        version: { type: string }
+        loaded_at: { type: string, format: date-time }
+        loaded_by: { type: string, format: uuid }
+        doc: { type: object }
+    Region:
+      type: object
+      required: [code, name, fuzz_public_precision, fuzz_subscriber_precision, notify_threshold, notify_daily_cap]
+      properties:
+        code: { type: string }
+        name: { type: string }
+        fuzz_public_precision: { type: integer, minimum: 3, maximum: 5 }
+        fuzz_subscriber_precision: { type: integer, minimum: 4, maximum: 6 }
+        default_radius_km: { type: number }
+        max_radius_km: { type: number, maximum: 50 }
+        default_days: { type: integer }
+        max_days: { type: integer, maximum: 30 }
+        notify_threshold: { type: number }
+        notify_rank_max: { type: integer }
+        notify_daily_cap: { type: integer }
+        active: { type: boolean }
+    IntakeBatch:
+      type: object
+      required: [id, state, rows]
+      properties:
+        id: { type: string, format: uuid }
+        state: { type: string, enum: [processing, done, failed] }
+        rows: { type: array, items: { type: object, properties: { row: { type: integer }, report_id: { type: string, format: uuid }, status: { type: string, enum: [created, rejected] }, error: { type: string } } } }

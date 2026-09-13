@@ -1,0 +1,96 @@
+# PawTrace configuration — deploy/pawtrace.example.yaml
+# Loaded with:  ptctl config load pawtrace.yaml   (admin; PUT /admin/config; validated against schemas/pawtrace-config.schema.json)
+# Every candidate and notification produced after a load carries the version (pawtrace.config_version).
+#
+# These are the values the seed's Appendix A candidate was computed with (DDS-07 §9):
+#   score = 0.55·sim_visual + 0.15·attr + 0.20·exp(−d/3 km) + 0.10·temporal − penalty   → 0.7736 → calibrated precision 0.68
+#   notify if calibrated_precision ≥ 0.25 AND rank ≤ 5, at most 5 per user per day (the rest become a digest)
+
+version: "2026-09-01"
+
+fusion:
+  weights:                        # SRS Appendix A defaults; must sum to 1.0 (loader rule, TC-006)
+    visual: 0.55
+    attr: 0.15
+    spatial: 0.20
+    temporal: 0.10
+  spatial_scale_km: 3             # spatial = exp(−d / 3 km)
+  quality_penalty: { threshold: 0.5, penalty: 0.05 }
+  cosine_calibration: { low: 0.35, high: 0.95 }    # cosine → sim_visual: 0.35 ≈ unrelated dogs, 0.95 ≈ identical crops
+  temporal:
+    full_hours: 24                # 0–24 h after the loss → 1.0
+    floor: 0.3                    # at the end of the window
+    before_loss: 0.1              # FR-16: sighting before the loss time
+    before_loss_reloss: 0.6       # unless the owner flagged a re-loss
+
+search:
+  default_radius_km: 5            # FR-14
+  max_radius_km: 50               # FR-14 — the schema refuses more
+  default_days: 3
+  max_days: 30
+  candidate_limit: 200
+  ef_search_wide: 100             # hnsw.ef_search for 50 km searches (TC-092)
+
+notify:
+  threshold: 0.25                 # AI-05 — calibrated precision, tuned for recall
+  rank_max: 5
+  daily_cap: 5                    # FR-25
+  digest_hour_local: 18
+  channels: [push, email]
+
+privacy:
+  fuzz:
+    public_precision: 5           # C-01: geohash-5 ≈ 4.9 × 4.9 km on the public map and public cards; the schema refuses finer
+    subscriber_precision: 6       # ≈ 1.2 × 0.6 km in area-subscription alerts and candidate cards
+  exact_location_audiences: [owner, counterpart_after_consent]   # NFR-05 — constant; here so a reviewer sees it
+  exif_coarse_min_m: 1000         # C-04
+  signed_url_ttl_s: { thumb: 900, card: 900, full: 300, export: 86400 }   # NFR-07
+  public_time_truncation: hour
+
+trust:                            # C-02 / FR-28 (ICD-07 IF-41)
+  initial: 0.5
+  captcha_below: 0.3
+  ban_below: 0.1
+  captcha_provider: turnstile
+  rate_limits:
+    posts_per_device_hour: 5
+    posts_per_ip_hour: 20
+    photo_search_per_device_hour: 3
+    public_reads_per_ip_minute: 120
+    url_mints_per_ip_minute: 300
+
+moderation:                       # C-05 / FR-26
+  nsfw_auto_hide: 0.90
+  nsfw_review_from: 0.60
+
+duplicate:                        # FR-29
+  cosine_min: 0.90
+  distance_m: 500
+  hours: 48
+
+retention:                        # SRS §10 cost mitigation
+  closed_thumb_only_days: 90
+  closed_delete_days: 365
+  sighting_expire_days: 30
+  audit_years: 3
+  rate_limit_days: 30
+
+deletion:
+  sla_hours: 72                   # NFR-06
+
+calibration:                      # AI-04
+  min_decisions: 200
+  bins: 10
+  refresh_cron: "15 3 * * *"
+
+regions:                          # the seed's four regions
+  - { code: BKK, name: Bangkok,    center: { lat: 13.7563, lng: 100.5018 }, active: true }
+  - { code: NON, name: Nonthaburi, center: { lat: 13.8591, lng: 100.5144 }, active: true }
+  - { code: CNX, name: Chiang Mai, center: { lat: 18.7883, lng: 98.9853 },  active: true }
+  - { code: HKT, name: Phuket,     center: { lat: 7.8804,  lng: 98.3923 },  active: true, notify_daily_cap: 5 }
+
+models:
+  embedding_dims: 768             # schema CHECK — a different model needs a new schema version
+  text_dims: 1024
+  min_crop_short_edge_px: 128     # AI-01
+  detector_min_confidence: 0.5

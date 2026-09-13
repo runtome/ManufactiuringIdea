@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pawtrace.example/schemas/pawtrace-config.schema.json",
+  "title": "PawTrace configuration (deploy/pawtrace.yaml)",
+  "description": "Fusion weights, search limits, notification budget, privacy fuzzing, trust/rate limits, moderation, retention, regions. Loaded by PUT /admin/config and versioned in pawtrace.config_version. Loader rules that a JSON Schema cannot express: fusion.weights must sum to 1.0; privacy.fuzz.subscriber_precision >= public_precision; retention.closed_delete_days >= closed_thumb_only_days.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "fusion", "search", "notify", "privacy", "trust", "moderation", "duplicate", "retention", "deletion", "calibration", "regions", "models"],
+  "properties": {
+    "version": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}(-[a-z0-9]+)?$" },
+    "fusion": {
+      "type": "object", "additionalProperties": false,
+      "required": ["weights", "spatial_scale_km", "quality_penalty", "cosine_calibration", "temporal"],
+      "properties": {
+        "weights": {
+          "type": "object", "additionalProperties": false,
+          "required": ["visual", "attr", "spatial", "temporal"],
+          "properties": {
+            "visual":   { "type": "number", "minimum": 0.3, "maximum": 0.8, "description": "SRS Appendix A w1; visual similarity must dominate" },
+            "attr":     { "type": "number", "minimum": 0, "maximum": 0.3 },
+            "spatial":  { "type": "number", "minimum": 0, "maximum": 0.4 },
+            "temporal": { "type": "number", "minimum": 0, "maximum": 0.3 }
+          }
+        },
+        "spatial_scale_km": { "type": "number", "minimum": 0.5, "maximum": 20, "description": "spatial = exp(-d / scale)" },
+        "quality_penalty": {
+          "type": "object", "additionalProperties": false, "required": ["threshold", "penalty"],
+          "properties": { "threshold": { "type": "number", "minimum": 0, "maximum": 1 }, "penalty": { "type": "number", "minimum": 0, "maximum": 0.2 } }
+        },
+        "cosine_calibration": {
+          "type": "object", "additionalProperties": false, "required": ["low", "high"],
+          "properties": { "low": { "type": "number", "minimum": 0, "maximum": 0.9 }, "high": { "type": "number", "minimum": 0.5, "maximum": 1 } }
+        },
+        "temporal": {
+          "type": "object", "additionalProperties": false, "required": ["full_hours", "floor", "before_loss", "before_loss_reloss"],
+          "properties": {
+            "full_hours": { "type": "integer", "minimum": 1, "maximum": 72 },
+            "floor": { "type": "number", "minimum": 0, "maximum": 1 },
+            "before_loss": { "type": "number", "minimum": 0, "maximum": 0.5, "description": "FR-16: a sighting before the loss is implausible" },
+            "before_loss_reloss": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        }
+      }
+    },
+    "search": {
+      "type": "object", "additionalProperties": false,
+      "required": ["default_radius_km", "max_radius_km", "default_days", "max_days", "candidate_limit", "ef_search_wide"],
+      "properties": {
+        "default_radius_km": { "type": "number", "minimum": 0.5, "maximum": 50 },
+        "max_radius_km":     { "type": "number", "minimum": 1, "maximum": 50, "description": "FR-14: user-adjustable up to 50 km — cannot exceed" },
+        "default_days":      { "type": "integer", "minimum": 1, "maximum": 30 },
+        "max_days":          { "type": "integer", "minimum": 1, "maximum": 30, "description": "FR-14: ≤ 30 days — cannot exceed" },
+        "candidate_limit":   { "type": "integer", "minimum": 20, "maximum": 1000 },
+        "ef_search_wide":    { "type": "integer", "minimum": 40, "maximum": 400 }
+      }
+    },
+    "notify": {
+      "type": "object", "additionalProperties": false,
+      "required": ["threshold", "rank_max", "daily_cap", "digest_hour_local", "channels"],
+      "properties": {
+        "threshold":  { "type": "number", "minimum": 0.05, "maximum": 0.9, "description": "AI-05: tuned for recall; calibrated precision, not cosine" },
+        "rank_max":   { "type": "integer", "minimum": 1, "maximum": 20 },
+        "daily_cap":  { "type": "integer", "minimum": 1, "maximum": 50, "description": "FR-25: max N per day per user" },
+        "digest_hour_local": { "type": "integer", "minimum": 0, "maximum": 23 },
+        "channels":   { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "enum": ["push", "email", "sms"] } }
+      }
+    },
+    "privacy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["fuzz", "exact_location_audiences", "exif_coarse_min_m", "signed_url_ttl_s", "public_time_truncation"],
+      "properties": {
+        "fuzz": {
+          "type": "object", "additionalProperties": false, "required": ["public_precision", "subscriber_precision"],
+          "properties": {
+            "public_precision":     { "type": "integer", "minimum": 3, "maximum": 5, "description": "geohash chars for public views (C-01); 5 ≈ 4.9 km — finer is not allowed" },
+            "subscriber_precision": { "type": "integer", "minimum": 4, "maximum": 6 }
+          }
+        },
+        "exact_location_audiences": {
+          "type": "array", "const": ["owner", "counterpart_after_consent"],
+          "description": "NFR-05 — not configurable; present so a reviewer sees it"
+        },
+        "exif_coarse_min_m": { "type": "integer", "minimum": 1000, "description": "C-04: EXIF-derived location is never finer than 1 km" },
+        "signed_url_ttl_s": {
+          "type": "object", "additionalProperties": false, "required": ["thumb", "card", "full", "export"],
+          "properties": {
+            "thumb":  { "type": "integer", "minimum": 60, "maximum": 900 },
+            "card":   { "type": "integer", "minimum": 60, "maximum": 900 },
+            "full":   { "type": "integer", "minimum": 60, "maximum": 300 },
+            "export": { "type": "integer", "minimum": 3600, "maximum": 86400 }
+          }
+        },
+        "public_time_truncation": { "type": "string", "enum": ["hour", "day"] }
+      }
+    },
+    "trust": {
+      "type": "object", "additionalProperties": false,
+      "required": ["initial", "captcha_below", "ban_below", "captcha_provider", "rate_limits"],
+      "properties": {
+        "initial":       { "type": "number", "minimum": 0, "maximum": 1 },
+        "captcha_below": { "type": "number", "minimum": 0, "maximum": 1 },
+        "ban_below":     { "type": "number", "minimum": 0, "maximum": 0.5 },
+        "captcha_provider": { "type": "string", "enum": ["turnstile", "hcaptcha"] },
+        "rate_limits": {
+          "type": "object", "additionalProperties": false,
+          "required": ["posts_per_device_hour", "posts_per_ip_hour", "photo_search_per_device_hour", "public_reads_per_ip_minute", "url_mints_per_ip_minute"],
+          "properties": {
+            "posts_per_device_hour":        { "type": "integer", "minimum": 1, "maximum": 100 },
+            "posts_per_ip_hour":            { "type": "integer", "minimum": 1, "maximum": 1000 },
+            "photo_search_per_device_hour": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "public_reads_per_ip_minute":   { "type": "integer", "minimum": 10, "maximum": 10000 },
+            "url_mints_per_ip_minute":      { "type": "integer", "minimum": 10, "maximum": 10000 }
+          }
+        }
+      }
+    },
+    "moderation": {
+      "type": "object", "additionalProperties": false, "required": ["nsfw_auto_hide", "nsfw_review_from"],
+      "properties": {
+        "nsfw_auto_hide":   { "type": "number", "minimum": 0.5, "maximum": 1 },
+        "nsfw_review_from": { "type": "number", "minimum": 0.1, "maximum": 0.9 }
+      }
+    },
+    "duplicate": {
+      "type": "object", "additionalProperties": false, "required": ["cosine_min", "distance_m", "hours"],
+      "properties": {
+        "cosine_min": { "type": "number", "minimum": 0.7, "maximum": 1 },
+        "distance_m": { "type": "integer", "minimum": 50, "maximum": 5000 },
+        "hours":      { "type": "integer", "minimum": 1, "maximum": 168 }
+      }
+    },
+    "retention": {
+      "type": "object", "additionalProperties": false,
+      "required": ["closed_thumb_only_days", "closed_delete_days", "sighting_expire_days", "audit_years", "rate_limit_days"],
+      "properties": {
+        "closed_thumb_only_days": { "type": "integer", "minimum": 7, "maximum": 365 },
+        "closed_delete_days":     { "type": "integer", "minimum": 30, "maximum": 1095 },
+        "sighting_expire_days":   { "type": "integer", "minimum": 7, "maximum": 90 },
+        "audit_years":            { "type": "integer", "minimum": 1, "maximum": 10 },
+        "rate_limit_days":        { "type": "integer", "minimum": 7, "maximum": 90 }
+      }
+    },
+    "deletion": {
+      "type": "object", "additionalProperties": false, "required": ["sla_hours"],
+      "properties": { "sla_hours": { "type": "integer", "minimum": 1, "maximum": 72, "description": "NFR-06 SLA; 72 h is the maximum" } }
+    },
+    "calibration": {
+      "type": "object", "additionalProperties": false, "required": ["min_decisions", "bins", "refresh_cron"],
+      "properties": {
+        "min_decisions": { "type": "integer", "minimum": 50, "maximum": 5000 },
+        "bins":          { "type": "integer", "minimum": 5, "maximum": 20 },
+        "refresh_cron":  { "type": "string" }
+      }
+    },
+    "regions": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["code", "name", "center"],
+        "properties": {
+          "code":   { "type": "string", "pattern": "^[A-Z]{3}$" },
+          "name":   { "type": "string" },
+          "center": { "type": "object", "additionalProperties": false, "required": ["lat", "lng"], "properties": { "lat": { "type": "number", "minimum": -90, "maximum": 90 }, "lng": { "type": "number", "minimum": -180, "maximum": 180 } } },
+          "fuzz_public_precision":     { "type": "integer", "minimum": 3, "maximum": 5 },
+          "fuzz_subscriber_precision": { "type": "integer", "minimum": 4, "maximum": 6 },
+          "default_radius_km": { "type": "number", "minimum": 0.5, "maximum": 50 },
+          "notify_daily_cap":  { "type": "integer", "minimum": 1, "maximum": 50 },
+          "active": { "type": "boolean" }
+        }
+      }
+    },
+    "models": {
+      "type": "object", "additionalProperties": false, "required": ["embedding_dims", "text_dims", "min_crop_short_edge_px", "detector_min_confidence"],
+      "properties": {
+        "embedding_dims": { "type": "integer", "const": 768 },
+        "text_dims":      { "type": "integer", "const": 1024 },
+        "min_crop_short_edge_px": { "type": "integer", "minimum": 128, "description": "AI-01" },
+        "detector_min_confidence": { "type": "number", "minimum": 0.3, "maximum": 0.95 }
+      }
+    }
+  }
+}
