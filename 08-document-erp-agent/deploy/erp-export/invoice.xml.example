@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  DocFlow export-file adapter — supplier invoice (ICD-08 IF-48). File name = <idem_key>.xml.
+  The ERP import MUST reject a Document whose idem_key was imported before. DocFlow re-exports the identical file on retry.
+  XSD (informal): Document{@idem_key, Header{DocNumber, DocDate, SupplierErpRef, Currency, PoNumber?, Subtotal, Tax, Total, ApprovedBy, ApprovedAt, SourceDocumentId, SourceSha256}, Lines{Line{@no, ItemCode, SupplierPartNo?, Description?, Qty, Unit, UnitPrice, Amount, TaxCode?}*}}
+  Amounts: decimal with '.', no thousands separators. Dates: ISO 8601. Free text ≤ 200 chars, sanitised (SEC-D23).
+-->
+<Document idem_key="d40000000000000000000000000000000000000000000000000000000000002209:csv-export:invoice" kind="invoice">
+  <Header>
+    <DocNumber>INV-2209</DocNumber>
+    <DocDate>2026-09-08</DocDate>
+    <SupplierErpRef>V-0021</SupplierErpRef>
+    <Currency>THB</Currency>
+    <PoNumber>PO-2026-004510</PoNumber>
+    <Subtotal>25000.00</Subtotal>
+    <Tax>1750.00</Tax>
+    <Total>26750.00</Total>
+    <ApprovedBy>ploy</ApprovedBy>
+    <ApprovedAt>2026-09-10T10:35:00+07:00</ApprovedAt>
+    <SourceDocumentId>d0c00000-0000-7000-8000-000000000004</SourceDocumentId>
+    <SourceSha256>d40000000000000000000000000000000000000000000000000000000000002209</SourceSha256>
+  </Header>
+  <Lines>
+    <Line no="1">
+      <ItemCode>ITM-2001</ItemCode>
+      <SupplierPartNo>CTN-400</SupplierPartNo>
+      <Description>Carton 400x300x200</Description>
+      <Qty>2000</Qty>
+      <Unit>pcs</Unit>
+      <UnitPrice>12.50</UnitPrice>
+      <Amount>25000.00</Amount>
+      <TaxCode>VAT7</TaxCode>
+    </Line>
+  </Lines>
+</Document>

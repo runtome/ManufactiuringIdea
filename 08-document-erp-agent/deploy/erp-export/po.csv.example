@@ -1,0 +1,9 @@
+# DocFlow export-file adapter — purchase order (ICD-08 IF-48). File name = <idem_key>.csv; UTF-8 with BOM; separator ';'.
+# One H (header) row, N L (line) rows, all keyed by idem_key. Amounts use '.' decimals and no thousands separators; dates ISO 8601.
+# The ERP import MUST reject a file whose idem_key was imported before; DocFlow re-exports the identical file on retry.
+# The import job answers with <idem_key>.ack (ERP reference) or <idem_key>.nak (reason).
+rec;idem_key;doc_kind;doc_number;doc_date;supplier_erp_ref;currency;subtotal;tax;total;delivery_date;incoterm;approved_by;approved_at;source_document_id;source_sha256
+H;a1f3c0ffee00000000000000000000000000000000000000000000000000004821:csv-export:purchase_order;purchase_order;PO-2026-004821;2026-09-10;V-0142;JPY;1284000;0;1284000;2026-10-15;FOB;yuki;2026-09-10T11:52:00+07:00;d0c00000-0000-7000-8000-000000000001;a1f3c0ffee00000000000000000000000000000000000000000000000000004821
+rec;idem_key;line_no;item_code;supplier_part_no;description;qty;unit;unit_price;amount;tax_code;delivery_date
+L;a1f3c0ffee00000000000000000000000000000000000000000000000000004821:csv-export:purchase_order;1;ITM-8891;RAD-500-A;Radiator core RAD-500 type A;1200;pcs;870;1044000;EXPORT0;2026-10-15
+L;a1f3c0ffee00000000000000000000000000000000000000000000000000004821:csv-export:purchase_order;2;ITM-8892;RAD-500-B;Radiator core RAD-500 type B;400;pcs;600;240000;EXPORT0;2026-10-15

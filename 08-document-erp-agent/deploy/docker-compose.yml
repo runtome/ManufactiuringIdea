@@ -1,0 +1,350 @@
+# DocFlow — docker-compose.yml (standalone; OPS-08 §4)
+# Profiles:  gpu (Ollama on CUDA) | cpu (Ollama on CPU) | paddle (PaddleOCR worker instead of Tesseract) | dev (mailpit, fake ERP)
+#   docker compose --profile gpu up -d
+#   docker compose --profile cpu --profile dev up -d
+# Networks:  frontend (reverse proxy → api/web) · internal (no egress: db, redis, minio, ollama, ocr, extract, validate)
+#            erp (ONLY poster and scheduler reach the ERP) · egress (api, intake-mail, poster, scheduler: IMAP, SMTP, SFTP; cloud model only when acknowledged)
+# Secrets are FILES under ${SECRETS_DIR} (OPS-08 §4.2) — never in this file or in .env (TEST-08 TC-007).
+
+x-hardened: &hardened
+  user: "10001:10001"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp]
+  restart: unless-stopped
+  logging: { driver: json-file, options: { max-size: "20m", max-file: "5" } }
+
+x-app-env: &app-env
+  TZ: ${TZ}
+  DATABASE_URL_FILE: /run/secrets/database_url
+  REDIS_URL: redis://redis:6379/0
+  S3_ENDPOINT: http://minio:9000
+  S3_REGION: ${S3_REGION}
+  S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+  S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+  S3_BUCKET_ORIGINALS: ${S3_BUCKET_ORIGINALS}
+  S3_BUCKET_PAGES: ${S3_BUCKET_PAGES}
+  S3_BUCKET_EXPORTS: ${S3_BUCKET_EXPORTS}
+  S3_BUCKET_INTAKE: ${S3_BUCKET_INTAKE}
+  CONFIG_DIR: /etc/docflow
+  LOG_LEVEL: ${LOG_LEVEL}
+
+services:
+  # ------------------------------------------------------------------ edge
+  web:
+    <<: *hardened
+    image: ${DF_REGISTRY}/web:${DF_VERSION}
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL}
+      API_URL: http://api:8080
+      DEFAULT_LOCALE: ${DEFAULT_LOCALE}
+    ports: ["${BIND_ADDR}:${WEB_PORT}:3000"]
+    depends_on: [api]
+    networks: [frontend]
+
+  api:
+    <<: *hardened
+    image: ${DF_REGISTRY}/api:${DF_VERSION}
+    environment:
+      <<: *app-env
+      PUBLIC_URL: ${PUBLIC_URL}
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      URL_SIGNING_KEY_FILE: /run/secrets/url_signing_key
+      SMTP_URL_FILE: /run/secrets/smtp_url
+      MAIL_FROM: ${MAIL_FROM}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB}
+      SIGNED_URL_PAGE_TTL_S: ${SIGNED_URL_PAGE_TTL_S}
+      SIGNED_URL_ORIGINAL_TTL_S: ${SIGNED_URL_ORIGINAL_TTL_S}
+      METRICS_ENABLED: "true"
+    secrets: [database_url, s3_access_key, s3_secret_key, jwt_secret, url_signing_key, smtp_url]
+    volumes:
+      - ${CONFIG_DIR}:/etc/docflow:ro
+    ports: ["${BIND_ADDR}:${API_PORT}:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+      minio-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/v1/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    networks: [frontend, internal, egress]
+
+  # ------------------------------------------------------------------ intake (IF-44 / IF-45)
+  intake-mail:
+    <<: *hardened
+    image: ${DF_REGISTRY}/intake:${DF_VERSION}
+    environment:
+      <<: *app-env
+      INTAKE: imap
+      IMAP_POLL_S: ${IMAP_POLL_S}
+      IMAP_CREDENTIAL_FILE: /run/secrets/imap_ap_inbox
+      MAIL_BODY_EXCERPT_CHARS: ${MAIL_BODY_EXCERPT_CHARS}
+    secrets: [database_url, s3_access_key, s3_secret_key, imap_ap_inbox]
+    volumes:
+      - ${CONFIG_DIR}:/etc/docflow:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal, egress]
+
+  intake-folder:
+    <<: *hardened
+    image: ${DF_REGISTRY}/intake:${DF_VERSION}
+    environment:
+      <<: *app-env
+      INTAKE: folder
+      FOLDER_POLL_S: ${FOLDER_POLL_S}
+      SFTP_KEY_FILE: /run/secrets/sftp_key
+    secrets: [database_url, s3_access_key, s3_secret_key, sftp_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/docflow:ro
+      - ${SCAN_HOT_FOLDER}:/mnt/scans/docflow
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal, egress]
+
+  # ------------------------------------------------------------------ pipeline workers
+  worker-ocr:                                             # opens untrusted files: no network beyond internal, read-only root, limits (SEC-D71)
+    <<: *hardened
+    image: ${DF_REGISTRY}/worker-ocr:${DF_VERSION}
+    environment:
+      <<: *app-env
+      WORKER: ocr
+      OCR_ENGINE: tesseract
+      OCR_LANGS: ${OCR_LANGS}
+      PAGE_DPI: ${PAGE_DPI}
+      OCR_TIMEOUT_S: ${OCR_TIMEOUT_S}
+      OMP_NUM_THREADS: ${OCR_THREADS}
+    secrets: [database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/docflow:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "${OCR_CPUS}"
+          memory: ${OCR_MEMORY}
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal]
+
+  worker-ocr-paddle:
+    <<: *hardened
+    image: ${DF_REGISTRY}/worker-ocr:${DF_VERSION}-paddle
+    profiles: [paddle]
+    environment:
+      <<: *app-env
+      WORKER: ocr
+      OCR_ENGINE: paddleocr
+      OCR_LANGS: ${OCR_LANGS}
+      PAGE_DPI: ${PAGE_DPI}
+      OCR_TIMEOUT_S: ${OCR_TIMEOUT_S}
+    secrets: [database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/docflow:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal]
+
+  worker-extract:                                         # schema-constrained extraction (IF-47) against the local model (IF-09); no egress unless the cloud flag is acknowledged
+    <<: *hardened
+    image: ${DF_REGISTRY}/worker-extract:${DF_VERSION}
+    environment:
+      <<: *app-env
+      WORKER: extract
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+      PROMPT_VERSION: ${PROMPT_VERSION}
+      REPAIR_ROUNDS_MAX: ${REPAIR_ROUNDS_MAX}
+      LLM_TIMEOUT_S: ${LLM_TIMEOUT_S}
+      CLOUD_MODEL_CREDENTIAL_FILE: /run/secrets/cloud_model_key
+      INJECTION_FLAG_SCORE: ${INJECTION_FLAG_SCORE}
+    secrets: [database_url, s3_access_key, s3_secret_key, cloud_model_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/docflow:ro
+      - models:/models:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal]
+
+  worker-validate:
+    <<: *hardened
+    image: ${DF_REGISTRY}/worker-validate:${DF_VERSION}
+    environment:
+      <<: *app-env
+      WORKER: validate
+    secrets: [database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/docflow:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal]
+
+  poster:                                                 # IF-07: the only container that writes to the ERP; runs as poster_rw (cannot approve or edit)
+    <<: *hardened
+    image: ${DF_REGISTRY}/poster:${DF_VERSION}
+    environment:
+      <<: *app-env
+      WORKER: poster
+      DATABASE_URL_FILE: /run/secrets/poster_database_url
+      ERP_CREDENTIAL_FILE: /run/secrets/erp_rest_token
+      ERP_TIMEOUT_S: ${ERP_TIMEOUT_S}
+      POSTING_MAX_ATTEMPTS: ${POSTING_MAX_ATTEMPTS}
+      SMTP_URL_FILE: /run/secrets/smtp_url
+      MAIL_FROM: ${MAIL_FROM}
+      WEBHOOK_HMAC_FILE: /run/secrets/webhook_hmac
+      SFTP_KEY_FILE: /run/secrets/sftp_key
+    secrets: [poster_database_url, s3_access_key, s3_secret_key, erp_rest_token, smtp_url, webhook_hmac, sftp_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/docflow:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal, erp, egress]
+
+  scheduler:                                              # master-data sync (ERP reads), retention, evaluation, template drift, digests
+    <<: *hardened
+    image: ${DF_REGISTRY}/scheduler:${DF_VERSION}
+    environment:
+      <<: *app-env
+      MASTER_SYNC_CRON: ${MASTER_SYNC_CRON}
+      RETENTION_CRON: ${RETENTION_CRON}
+      EVAL_CRON: ${EVAL_CRON}
+      DRIFT_CRON: ${DRIFT_CRON}
+      EXPORT_ACK_POLL_S: ${EXPORT_ACK_POLL_S}
+      ERP_CREDENTIAL_FILE: /run/secrets/erp_rest_token
+      SMTP_URL_FILE: /run/secrets/smtp_url
+      MAIL_FROM: ${MAIL_FROM}
+    secrets: [database_url, s3_access_key, s3_secret_key, erp_rest_token, smtp_url]
+    volumes:
+      - ${CONFIG_DIR}:/etc/docflow:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal, erp, egress]
+
+  # ------------------------------------------------------------------ data
+  postgres:
+    image: postgres:${POSTGRES_VERSION}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+      TZ: ${TZ}
+    command: ["postgres", "-c", "shared_buffers=${PG_SHARED_BUFFERS}", "-c", "log_min_duration_statement=500"]
+    secrets: [postgres_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks: [internal]
+
+  redis:
+    image: redis:${REDIS_VERSION}
+    command: ["redis-server", "--save", "60", "1000", "--maxmemory", "${REDIS_MAXMEMORY}", "--maxmemory-policy", "noeviction"]
+    volumes: [redisdata:/data]
+    restart: unless-stopped
+    networks: [internal]
+
+  minio:
+    image: minio/minio:${MINIO_VERSION}
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/s3_access_key
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/s3_secret_key
+      MINIO_BROWSER: "off"
+    secrets: [s3_access_key, s3_secret_key]
+    volumes: [objects:/data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks: [internal]
+
+  minio-init:                                             # private buckets; ORIGINALS with object lock (compliance, 7 years — C-06); lifecycle for exports/intake
+    image: minio/mc:${MINIO_MC_VERSION}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://minio:9000 "$(cat /run/secrets/s3_access_key)" "$(cat /run/secrets/s3_secret_key)" &&
+        mc mb -p --with-lock local/${S3_BUCKET_ORIGINALS} && mc retention set --default compliance ${ORIGINALS_RETENTION_DAYS}d local/${S3_BUCKET_ORIGINALS} &&
+        for b in ${S3_BUCKET_PAGES} ${S3_BUCKET_EXPORTS} ${S3_BUCKET_INTAKE}; do mc mb -p local/$$b; done &&
+        for b in ${S3_BUCKET_ORIGINALS} ${S3_BUCKET_PAGES} ${S3_BUCKET_EXPORTS} ${S3_BUCKET_INTAKE}; do mc anonymous set none local/$$b; done &&
+        mc ilm rule add local/${S3_BUCKET_EXPORTS} --expire-days ${EXPORT_FILES_DAYS} &&
+        mc ilm rule add local/${S3_BUCKET_INTAKE} --expire-days 7 &&
+        echo buckets ready
+    secrets: [s3_access_key, s3_secret_key]
+    depends_on:
+      minio: { condition: service_healthy }
+    networks: [internal]
+
+  ollama:                                                 # local model runtime (IF-09) — no egress; models pulled at install (OPS-08 §4.3)
+    image: ollama/ollama:${OLLAMA_VERSION}
+    profiles: [gpu]
+    environment: { OLLAMA_KEEP_ALIVE: "24h", OLLAMA_NUM_PARALLEL: "1" }
+    volumes: [ollama:/root/.ollama]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT}
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks: [internal]
+
+  ollama-cpu:
+    image: ollama/ollama:${OLLAMA_VERSION}
+    profiles: [cpu]
+    container_name: ollama                                # same hostname for the workers
+    environment: { OLLAMA_KEEP_ALIVE: "24h", OLLAMA_NUM_PARALLEL: "1", OLLAMA_NUM_THREADS: "${CPU_THREADS}" }
+    volumes: [ollama:/root/.ollama]
+    restart: unless-stopped
+    networks: [internal]
+
+  mailpit:                                                # dev only
+    image: axllent/mailpit:${MAILPIT_VERSION}
+    profiles: [dev]
+    ports: ["${BIND_ADDR}:8025:8025"]
+    networks: [internal, egress, frontend]
+
+  fake-erp:                                               # dev only: REST adapter target with fault injection for TC-070 (times out after creating)
+    image: ${DF_REGISTRY}/fake-erp:${DF_VERSION}
+    profiles: [dev]
+    environment: { FAULT_TIMEOUT_AFTER_CREATE: "4" }
+    networks: [erp]
+
+secrets:
+  database_url:        { file: "${SECRETS_DIR}/database_url" }
+  poster_database_url: { file: "${SECRETS_DIR}/poster_database_url" }
+  postgres_password:   { file: "${SECRETS_DIR}/postgres_password" }
+  jwt_secret:          { file: "${SECRETS_DIR}/jwt_secret" }
+  url_signing_key:     { file: "${SECRETS_DIR}/url_signing_key" }
+  s3_access_key:       { file: "${SECRETS_DIR}/s3_access_key" }
+  s3_secret_key:       { file: "${SECRETS_DIR}/s3_secret_key" }
+  imap_ap_inbox:       { file: "${SECRETS_DIR}/imap_ap_inbox" }
+  sftp_key:            { file: "${SECRETS_DIR}/sftp_key" }
+  erp_rest_token:      { file: "${SECRETS_DIR}/erp_rest_token" }
+  smtp_url:            { file: "${SECRETS_DIR}/smtp_url" }
+  webhook_hmac:        { file: "${SECRETS_DIR}/webhook_hmac" }
+  cloud_model_key:     { file: "${SECRETS_DIR}/cloud_model_key" }
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  objects: {}
+  ollama: {}
+  models: {}                                              # OCR packs, classifier, injection model — read-only in workers
+
+networks:
+  frontend: {}
+  internal: { internal: true }                            # db, redis, minio, ollama, ocr, extract, validate: no route out
+  erp:      { internal: false }                           # routed to the ERP segment only (firewall); poster + scheduler
+  egress:   {}                                            # IMAP, SMTP, SFTP; cloud model only when acknowledged

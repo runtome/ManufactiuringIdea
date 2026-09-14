@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docflow.example/schemas/docflow-config.schema.json",
+  "title": "DocFlow configuration (deploy/docflow.yaml)",
+  "description": "Approval policies, confidence gates, straight-through processing, tolerances, ERP adapters, intake sources, retention, model governance. Loaded by PUT /config, validated here, versioned in docflow.config_version. Loader rules a JSON Schema cannot express: policies must cover every amount (one row with max_amount_thb null); tolerance fail_pct >= warn_pct; STP evidence is checked against the database (stp_needs_evidence).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "approval", "gates", "stp", "tolerances", "posting", "intake", "extraction", "retention", "models"],
+  "properties": {
+    "version": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}(-[a-z0-9]+)?$" },
+    "approval": {
+      "type": "object", "additionalProperties": false, "required": ["policy_currency", "policies", "rejection_reason_required"],
+      "properties": {
+        "policy_currency": { "type": "string", "const": "THB", "description": "amounts are converted with fx_rate for the policy only; the ERP always receives the document currency" },
+        "policies": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["min_role", "sod_required", "priority"],
+            "properties": {
+              "doc_kind": { "type": "string", "enum": ["purchase_order", "invoice", "delivery_note", "quotation", "certificate", "other"] },
+              "max_amount_thb": { "type": ["number", "null"], "exclusiveMinimum": 0, "description": "null = no upper bound" },
+              "min_role": { "type": "string", "enum": ["inspector", "engineer", "manager", "admin"], "description": "inspector = purchasing clerk, engineer = AP / warehouse (SAD-08 §5)" },
+              "sod_required": { "type": "boolean", "description": "NFR-05 / SEC-117: approver must not have edited a field" },
+              "priority": { "type": "integer", "minimum": 1, "maximum": 1000 }
+            }
+          }
+        },
+        "sod_always_above_thb": { "type": "number", "minimum": 0, "description": "segregation of duties regardless of policy row above this amount" },
+        "rejection_reason_required": { "type": "boolean", "const": true, "description": "FR-27 — not configurable" },
+        "warnings_require_acknowledgement": { "type": "boolean" }
+      }
+    },
+    "gates": {
+      "type": "object", "additionalProperties": false, "required": ["default_min_confidence", "fields"],
+      "properties": {
+        "default_min_confidence": { "type": "number", "minimum": 0.5, "maximum": 1 },
+        "fields": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["doc_kind", "path", "min_confidence", "critical"],
+            "properties": {
+              "doc_kind": { "type": "string", "enum": ["purchase_order", "invoice", "delivery_note", "quotation"] },
+              "path": { "type": "string", "pattern": "^(header\\.[a-z_]+|lines\\[\\]\\.[a-z_]+)$" },
+              "min_confidence": { "type": "number", "minimum": 0.5, "maximum": 1 },
+              "critical": { "type": "boolean", "description": "AI-05: critical fields require review unless template-matched and arithmetic-consistent" }
+            }
+          }
+        },
+        "no_provenance_is_low_confidence": { "type": "boolean", "const": true, "description": "AI-04 — not configurable" }
+      }
+    },
+    "stp": {
+      "type": "object", "additionalProperties": false, "required": ["default_enabled", "min_accuracy", "min_documents", "pairs"],
+      "properties": {
+        "default_enabled": { "type": "boolean", "const": false, "description": "FR-29: straight-through processing is OFF by default — not configurable" },
+        "min_accuracy": { "type": "number", "minimum": 0.98, "maximum": 1, "description": "evidence needed to enable a pair (stp_needs_evidence)" },
+        "min_documents": { "type": "integer", "minimum": 50 },
+        "approval_still_required": { "type": "boolean", "const": true, "description": "C-01 — auto-clear skips review, never approval" },
+        "pairs": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["doc_kind", "supplier_code", "enabled", "enabled_by", "accuracy_measured", "n_measured"],
+            "properties": {
+              "doc_kind": { "type": "string", "enum": ["purchase_order", "invoice", "delivery_note"] },
+              "supplier_code": { "type": "string", "pattern": "^SUP-\\d{4}$" },
+              "enabled": { "type": "boolean" },
+              "enabled_by": { "type": "string", "minLength": 2 },
+              "accuracy_measured": { "type": "number", "minimum": 0, "maximum": 1 },
+              "n_measured": { "type": "integer", "minimum": 0 }
+            },
+            "if": { "properties": { "enabled": { "const": true } } },
+            "then": { "properties": { "accuracy_measured": { "minimum": 0.98 }, "n_measured": { "minimum": 50 } } }
+          }
+        }
+      }
+    },
+    "tolerances": {
+      "type": "object", "additionalProperties": false, "required": ["rules"],
+      "properties": {
+        "rules": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["doc_kind", "rule", "warn_pct", "fail_pct"],
+            "properties": {
+              "doc_kind": { "type": "string", "enum": ["purchase_order", "invoice", "delivery_note"] },
+              "rule": { "type": "string", "enum": ["price.contract", "match.2way.price", "match.2way.qty", "match.3way.qty"] },
+              "warn_pct": { "type": "number", "minimum": 0, "maximum": 20 },
+              "fail_pct": { "type": "number", "minimum": 0, "maximum": 20 }
+            }
+          }
+        },
+        "rounding": { "type": "object", "additionalProperties": { "type": "number", "minimum": 0 }, "description": "currency → rounding unit; default JPY/KRW 1, others 0.01" }
+      }
+    },
+    "posting": {
+      "type": "object", "additionalProperties": false, "required": ["adapters", "default_adapter", "retry"],
+      "properties": {
+        "adapters": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["name", "kind", "supports_idem", "credential_ref"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+              "kind": { "type": "string", "enum": ["rest", "soap", "staging_table", "file_export"] },
+              "supports_idem": { "type": "boolean", "const": true, "description": "IF-07: an adapter that cannot honour idem_key cannot be configured" },
+              "base_url": { "type": "string", "format": "uri" },
+              "timeout_s": { "type": "integer", "minimum": 5, "maximum": 120 },
+              "staging_table": { "type": "string" },
+              "export_path": { "type": "string" },
+              "export_format": { "type": "string", "enum": ["csv", "xml"] },
+              "credential_ref": { "type": ["string", "null"], "description": "secret file name — never the credential" }
+            }
+          }
+        },
+        "default_adapter": { "type": "string" },
+        "kind_adapter": { "type": "object", "additionalProperties": { "type": "string" } },
+        "retry": {
+          "type": "object", "additionalProperties": false, "required": ["max_attempts", "backoff_minutes"],
+          "properties": {
+            "max_attempts": { "type": "integer", "minimum": 1, "maximum": 5, "description": "FR-32; after this the exception queue" },
+            "backoff_minutes": { "type": "array", "minItems": 1, "items": { "type": "number", "minimum": 0.5 } }
+          }
+        },
+        "payload_text_max_chars": { "type": "integer", "minimum": 50, "maximum": 500 }
+      }
+    },
+    "intake": {
+      "type": "object", "additionalProperties": false, "required": ["allow_extensions", "max_size_mb", "sources"],
+      "properties": {
+        "allow_extensions": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["pdf", "tiff", "tif", "png", "jpg", "jpeg", "xlsx", "csv"] } },
+        "max_size_mb": { "type": "integer", "minimum": 1, "maximum": 50 },
+        "strip_macros": { "type": "boolean", "const": true },
+        "extract_archives": { "type": "boolean", "const": false, "description": "SEC-D70 — archives are never extracted" },
+        "mail_body_excerpt_chars": { "type": "integer", "minimum": 0, "maximum": 500, "description": "SEC-D35" },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["name", "kind"],
+            "properties": {
+              "name": { "type": "string" },
+              "kind": { "type": "string", "enum": ["imap", "folder", "sftp", "scanner"] },
+              "host": { "type": "string" },
+              "folder": { "type": "string" },
+              "path": { "type": "string" },
+              "poll_s": { "type": "integer", "minimum": 15, "maximum": 3600 },
+              "credential_ref": { "type": "string" },
+              "active": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    "extraction": {
+      "type": "object", "additionalProperties": false, "required": ["schemas", "repair_rounds_max", "text_layer_min_chars", "text_layer_min_page_share", "ocr_min_confidence"],
+      "properties": {
+        "schemas": { "type": "object", "additionalProperties": false, "required": ["purchase_order", "invoice", "delivery_note"], "properties": {
+          "purchase_order": { "type": "string", "pattern": "^po\\.v\\d+$" }, "invoice": { "type": "string", "pattern": "^invoice\\.v\\d+$" },
+          "delivery_note": { "type": "string", "pattern": "^delivery_note\\.v\\d+$" }, "quotation": { "type": "string", "pattern": "^po\\.v\\d+$" } } },
+        "repair_rounds_max": { "type": "integer", "minimum": 0, "maximum": 2, "description": "ADR-D01" },
+        "coerce_invalid_output": { "type": "boolean", "const": false, "description": "AI-02 — never coerce" },
+        "text_layer_min_chars": { "type": "integer", "minimum": 50 },
+        "text_layer_min_page_share": { "type": "number", "minimum": 0.5, "maximum": 1 },
+        "ocr_min_confidence": { "type": "number", "minimum": 0.3, "maximum": 0.9 },
+        "page_dpi": { "type": "integer", "enum": [100, 150, 200, 300] },
+        "languages": { "type": "array", "items": { "type": "string", "enum": ["th", "ja", "en"] } }
+      }
+    },
+    "retention": {
+      "type": "object", "additionalProperties": false, "required": ["originals_years", "extractions_years", "audit_years"],
+      "properties": {
+        "originals_years": { "type": "number", "minimum": 7, "description": "SRS §5 / C-06 — object lock; 7 years is the minimum" },
+        "extractions_years": { "type": "number", "minimum": 7 },
+        "audit_years": { "type": "number", "minimum": 7 },
+        "page_images_years": { "type": "number", "minimum": 1 },
+        "export_files_days": { "type": "integer", "minimum": 7, "maximum": 90 }
+      }
+    },
+    "models": {
+      "type": "object", "additionalProperties": false, "required": ["extraction", "cloud"],
+      "properties": {
+        "extraction": { "type": "object", "additionalProperties": false, "required": ["name", "version", "max_params_b"], "properties": {
+          "name": { "type": "string" }, "version": { "type": "string" }, "max_params_b": { "type": "number", "maximum": 9, "description": "SRS §2.3: local LLM ≤ 9 B" },
+          "temperature": { "type": "number", "const": 0 }, "num_ctx": { "type": "integer", "minimum": 4096 } } },
+        "ocr": { "type": "object", "additionalProperties": false, "properties": { "engine": { "type": "string", "enum": ["tesseract", "paddleocr"] }, "version": { "type": "string" } } },
+        "injection_classifier": { "type": "object", "additionalProperties": false, "properties": { "name": { "type": "string" }, "flag_score": { "type": "number", "minimum": 0.5, "maximum": 1 } } },
+        "cloud": {
+          "type": "object", "additionalProperties": false, "required": ["enabled"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "provider": { "type": "string" },
+            "model": { "type": "string" },
+            "acknowledged_by": { "type": "string" },
+            "acknowledged_at": { "type": "string", "format": "date-time" },
+            "statement": { "type": "string", "const": "I understand that document content including pricing will leave the premises." },
+            "credential_ref": { "type": "string" }
+          },
+          "if": { "properties": { "enabled": { "const": true } } },
+          "then": { "required": ["provider", "model", "acknowledged_by", "acknowledged_at", "statement", "credential_ref"] }
+        },
+        "evaluation": { "type": "object", "additionalProperties": false, "properties": {
+          "dataset": { "type": "string" }, "n_docs_min": { "type": "integer", "minimum": 200 },
+          "targets": { "type": "object", "additionalProperties": false, "properties": { "header_acc": { "type": "number", "minimum": 0.95 }, "line_acc": { "type": "number", "minimum": 0.9 }, "class_acc": { "type": "number", "minimum": 0.98 } } },
+          "max_drop_pts": { "type": "number", "maximum": 2, "description": "AI-09" } } }
+      }
+    }
+  }
+}

@@ -1,0 +1,104 @@
+# DocFlow configuration — deploy/docflow.example.yaml
+# Loaded with:  dfctl config load docflow.yaml   (admin; PUT /config; validated against schemas/docflow-config.schema.json)
+# Every approval, gate decision and posting made after a load carries the version (docflow.config_version).
+# These are the values the seed's documents were validated with (DDS-08 §9):
+#   Appendix A: 1,284,000 JPY × 0.2305 = 295,962 THB → manager + segregation of duties; price 870 vs 845 = +2.96 % → warning (2 % / 6 %)
+
+version: "2026-09-01"
+
+approval:                         # FR-26 / NFR-05 (SEC-117)
+  policy_currency: THB            # conversion for the policy only — the ERP receives the document currency
+  policies:
+    - { max_amount_thb: 100000, min_role: inspector, sod_required: false, priority: 10 }   # ≤ 100,000 THB: a purchasing clerk may approve
+    - { max_amount_thb: null,   min_role: manager,   sod_required: true,  priority: 20 }   # above: a manager who edited no field
+  sod_always_above_thb: 100000
+  rejection_reason_required: true # FR-27 — constant
+  warnings_require_acknowledgement: true
+
+gates:                            # AI-05
+  default_min_confidence: 0.80
+  no_provenance_is_low_confidence: true     # AI-04 — constant
+  fields:
+    - { doc_kind: purchase_order, path: header.po_number,     min_confidence: 0.90, critical: true }
+    - { doc_kind: purchase_order, path: header.supplier,      min_confidence: 0.90, critical: true }
+    - { doc_kind: purchase_order, path: header.currency,      min_confidence: 0.80, critical: false }
+    - { doc_kind: purchase_order, path: header.delivery_date, min_confidence: 0.80, critical: false }
+    - { doc_kind: purchase_order, path: header.total,         min_confidence: 0.90, critical: true }
+    - { doc_kind: purchase_order, path: "lines[].part_no",      min_confidence: 0.90, critical: true }
+    - { doc_kind: purchase_order, path: "lines[].qty",          min_confidence: 0.90, critical: true }
+    - { doc_kind: purchase_order, path: "lines[].unit_price",   min_confidence: 0.90, critical: true }
+    - { doc_kind: purchase_order, path: "lines[].amount",       min_confidence: 0.90, critical: false }
+    - { doc_kind: invoice, path: header.invoice_number, min_confidence: 0.90, critical: true }
+    - { doc_kind: invoice, path: header.supplier,       min_confidence: 0.90, critical: true }
+    - { doc_kind: invoice, path: header.currency,       min_confidence: 0.80, critical: false }
+    - { doc_kind: invoice, path: header.tax,            min_confidence: 0.85, critical: false }
+    - { doc_kind: invoice, path: header.total,          min_confidence: 0.90, critical: true }
+    - { doc_kind: invoice, path: "lines[].part_no",       min_confidence: 0.90, critical: true }
+    - { doc_kind: invoice, path: "lines[].qty",           min_confidence: 0.90, critical: true }
+    - { doc_kind: invoice, path: "lines[].unit_price",    min_confidence: 0.90, critical: true }
+    - { doc_kind: invoice, path: "lines[].amount",        min_confidence: 0.90, critical: false }
+    - { doc_kind: delivery_note, path: header.dn_number, min_confidence: 0.85, critical: true }
+    - { doc_kind: delivery_note, path: "lines[].qty",      min_confidence: 0.85, critical: true }
+
+stp:                              # FR-29 (ADR-D07): straight-through processing is OFF unless earned per (kind, supplier)
+  default_enabled: false          # constant
+  approval_still_required: true   # C-01 — constant
+  min_accuracy: 0.98
+  min_documents: 50
+  pairs:
+    - { doc_kind: invoice,        supplier_code: SUP-0021, enabled: true,  enabled_by: admin, accuracy_measured: 0.990, n_measured: 80 }
+    - { doc_kind: purchase_order, supplier_code: SUP-0055, enabled: true,  enabled_by: admin, accuracy_measured: 0.985, n_measured: 60 }
+    - { doc_kind: purchase_order, supplier_code: SUP-0142, enabled: false, enabled_by: admin, accuracy_measured: 0.970, n_measured: 120 }   # 97 % < 98 % — stays off
+
+tolerances:                       # FR-18, FR-19 (warn / fail in %)
+  rules:
+    - { doc_kind: purchase_order, rule: price.contract,   warn_pct: 2, fail_pct: 6 }
+    - { doc_kind: invoice,        rule: price.contract,   warn_pct: 1, fail_pct: 3 }
+    - { doc_kind: invoice,        rule: match.2way.price, warn_pct: 1, fail_pct: 3 }
+    - { doc_kind: invoice,        rule: match.2way.qty,   warn_pct: 2, fail_pct: 6 }
+    - { doc_kind: invoice,        rule: match.3way.qty,   warn_pct: 2, fail_pct: 6 }
+  rounding: { JPY: 1, KRW: 1, THB: 0.01, USD: 0.01, EUR: 0.01 }
+
+posting:                          # IF-07 / IF-48
+  adapters:
+    - { name: erp-rest,   kind: rest,        supports_idem: true, base_url: "https://erp.plant.local/api", timeout_s: 30, credential_ref: erp_rest_token }
+    - { name: csv-export, kind: file_export, supports_idem: true, export_path: "s3://exports/erp", export_format: csv, credential_ref: null }
+  default_adapter: erp-rest
+  kind_adapter: { purchase_order: erp-rest, invoice: erp-rest }
+  retry: { max_attempts: 5, backoff_minutes: [1, 2, 4, 8, 16] }     # FR-32
+  payload_text_max_chars: 200     # SEC-D23
+
+intake:                           # IF-44 / IF-45
+  allow_extensions: [pdf, tiff, tif, png, jpg, jpeg, xlsx, csv]
+  max_size_mb: 50
+  strip_macros: true              # constant
+  extract_archives: false         # constant (SEC-D70)
+  mail_body_excerpt_chars: 500    # SEC-D35
+  sources:
+    - { name: ap-inbox,    kind: imap,   host: mail.plant.local, folder: INBOX/DocFlow, poll_s: 60, credential_ref: imap_ap_inbox, active: true }
+    - { name: scanner-hot, kind: folder, path: /mnt/scans/docflow, poll_s: 30, active: true }
+
+extraction:                       # IF-46 / IF-47
+  schemas: { purchase_order: po.v2, invoice: invoice.v1, delivery_note: delivery_note.v1, quotation: po.v2 }
+  repair_rounds_max: 2            # ADR-D01
+  coerce_invalid_output: false    # AI-02 — constant
+  text_layer_min_chars: 200
+  text_layer_min_page_share: 0.95
+  ocr_min_confidence: 0.60
+  page_dpi: 150
+  languages: [th, ja, en]
+
+retention:                        # SRS §5, C-06
+  originals_years: 7              # object lock — the schema refuses less
+  extractions_years: 7
+  audit_years: 7
+  page_images_years: 2
+  export_files_days: 30
+
+models:                           # AI-08, NFR-07 (ADR-D09)
+  extraction: { name: qwen2.5-7b-instruct-q4_K_M, version: "2025.06", max_params_b: 7, temperature: 0, num_ctx: 8192 }
+  ocr: { engine: tesseract, version: "5.3.4" }
+  injection_classifier: { name: inj-regex+minilm, flag_score: 0.80 }
+  cloud:
+    enabled: false                # local by default (C-05); enabling requires every field below and an admin acknowledgement (audited)
+  evaluation: { dataset: eval-200-2026q3, n_docs_min: 200, targets: { header_acc: 0.95, line_acc: 0.90, class_acc: 0.98 }, max_drop_pts: 2 }
