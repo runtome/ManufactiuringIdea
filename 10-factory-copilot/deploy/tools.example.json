@@ -1,0 +1,87 @@
+{
+  "version": "tools.v1",
+  "description": "Tool registry seed for Factory Copilot (ICD-10 IF-16 as consumer). Loaded with `cpctl tools load`. Every entry is typed (JSON Schema), read-only, permission-filtered through `scope_param`, and executed only after schema validation. There is no free-form shell or SQL tool here; text-to-SQL lives in the sandbox behind its own flag (IF-54).",
+  "tools": [
+    {
+      "name": "query_production", "provider": "shiftbrief", "kind": "read", "risk": "low", "min_role": "viewer", "scope_param": "lines", "max_rows": 1000, "timeout_ms": 10000,
+      "intents": ["data_lookup", "trend_comparison", "cause_analysis"],
+      "description": "Production and NG quantities per day/shift/line/SKU from core.production_fact; returns rows plus derived defect_rate_pct per row",
+      "schema": { "type": "object", "additionalProperties": false, "required": ["date_from", "date_to"],
+                  "properties": { "date_from": { "type": "string", "format": "date" }, "date_to": { "type": "string", "format": "date" },
+                                  "lines": { "type": "array", "items": { "type": "string" }, "maxItems": 20 }, "sku": { "type": "string" }, "shift": { "type": "string", "enum": ["A", "B", "C", "OT"] } } },
+      "returns": { "rows": "array", "row_count": "integer", "digest": "sha256", "derived": ["defect_rate_pct"] }
+    },
+    {
+      "name": "query_defects", "provider": "shiftbrief", "kind": "read", "risk": "low", "min_role": "viewer", "scope_param": "lines", "max_rows": 1000, "timeout_ms": 10000,
+      "intents": ["data_lookup", "trend_comparison", "cause_analysis"],
+      "description": "Defect quantities grouped by defect / shift / line / SKU with share_pct (Pareto) from core.defect_fact",
+      "schema": { "type": "object", "additionalProperties": false, "required": ["date_from", "date_to", "group_by"],
+                  "properties": { "date_from": { "type": "string", "format": "date" }, "date_to": { "type": "string", "format": "date" },
+                                  "group_by": { "type": "string", "enum": ["defect", "shift", "line", "sku"] }, "lines": { "type": "array", "items": { "type": "string" }, "maxItems": 20 } } },
+      "returns": { "rows": "array", "row_count": "integer", "digest": "sha256", "derived": ["share_pct", "cumulative_pct"] }
+    },
+    {
+      "name": "get_spc", "provider": "qe_agent", "kind": "read", "risk": "low", "min_role": "viewer", "scope_param": "lines", "max_rows": 2000, "timeout_ms": 10000,
+      "intents": ["data_lookup", "trend_comparison"],
+      "description": "Control-chart points, limits and Nelson-rule violations for a characteristic (QE-Agent SPC engine)",
+      "schema": { "type": "object", "additionalProperties": false, "required": ["characteristic"],
+                  "properties": { "characteristic": { "type": "string" }, "lines": { "type": "array", "items": { "type": "string" } }, "window": { "type": "string", "pattern": "^[0-9]+d$" } } },
+      "returns": { "points": "array", "limits": "object", "violations": "array", "digest": "sha256" }
+    },
+    {
+      "name": "get_capability", "provider": "qe_agent", "kind": "read", "risk": "low", "min_role": "viewer", "scope_param": "lines", "max_rows": 50, "timeout_ms": 10000,
+      "intents": ["data_lookup"],
+      "description": "Cp/Cpk/Pp/Ppk with n, period, subgroup rule and normality result — never an index without its context (SRS-09 C-03)",
+      "schema": { "type": "object", "additionalProperties": false, "required": ["characteristic"],
+                  "properties": { "characteristic": { "type": "string" }, "lines": { "type": "array", "items": { "type": "string" } }, "period": { "type": "string" } } },
+      "returns": { "capability": "object", "digest": "sha256" }
+    },
+    {
+      "name": "get_machine_telemetry", "provider": "machinesense", "kind": "read", "risk": "low", "min_role": "inspector", "scope_param": "lines", "max_rows": 5000, "timeout_ms": 10000,
+      "intents": ["trend_comparison", "cause_analysis"],
+      "description": "A machine signal series and alerts over a window (MachineSense)",
+      "schema": { "type": "object", "additionalProperties": false, "required": ["machine_id", "signal", "window"],
+                  "properties": { "machine_id": { "type": "string" }, "signal": { "type": "string" }, "window": { "type": "string", "pattern": "^[0-9]+[hd]$" }, "lines": { "type": "array", "items": { "type": "string" } } } },
+      "returns": { "series": "array", "alerts": "array", "digest": "sha256" }
+    },
+    {
+      "name": "search_memory", "provider": "genba_memory", "kind": "read", "risk": "low", "min_role": "viewer", "scope_param": "lines", "max_rows": 10, "timeout_ms": 10000,
+      "intents": ["document_lookup", "how_to", "cause_analysis"],
+      "description": "Hybrid retrieval over past cases (knowledge.v_citable_case) and documents with citation metadata; ACL-filtered",
+      "schema": { "type": "object", "additionalProperties": false, "required": ["text"],
+                  "properties": { "text": { "type": "string", "maxLength": 500 }, "top_k": { "type": "integer", "minimum": 1, "maximum": 10 }, "kinds": { "type": "array", "items": { "type": "string", "enum": ["sop", "eight_d", "fmea", "manual", "work_instruction", "case"] } }, "lines": { "type": "array", "items": { "type": "string" } } } },
+      "returns": { "hits": "array (document_id, chunk_id, title, section, page, text, score)", "digest": "sha256" }
+    },
+    {
+      "name": "get_inspection_images", "provider": "vision", "kind": "read", "risk": "medium", "min_role": "inspector", "scope_param": "lines", "max_rows": 20, "timeout_ms": 10000,
+      "intents": ["image_lookup"],
+      "description": "Inspection records with defect detections and short-lived signed image URLs (15 min); optional visual similarity to an uploaded photo when the image_similarity flag is on",
+      "schema": { "type": "object", "additionalProperties": false, "required": ["date_from", "date_to"],
+                  "properties": { "date_from": { "type": "string", "format": "date" }, "date_to": { "type": "string", "format": "date" }, "lines": { "type": "array", "items": { "type": "string" } },
+                                  "defect": { "type": "string" }, "sku": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "maximum": 20 }, "similar_to_upload_id": { "type": "string", "format": "uuid" } } },
+      "returns": { "images": "array (inspection_id, ts, signed_url, detections)", "digest": "sha256" }
+    },
+    {
+      "name": "get_signals", "provider": "qe_agent", "kind": "read", "risk": "low", "min_role": "viewer", "scope_param": "lines", "max_rows": 100, "timeout_ms": 10000,
+      "intents": ["cause_analysis", "trend_comparison"],
+      "description": "Open/triaged QE-Agent signals with their statistic (rate now vs baseline, test, p-value, change point)",
+      "schema": { "type": "object", "additionalProperties": false,
+                  "properties": { "status": { "type": "string", "enum": ["open", "triaged", "case_opened", "dismissed"] }, "lines": { "type": "array", "items": { "type": "string" } }, "severity": { "type": "string", "enum": ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"] } } },
+      "returns": { "signals": "array", "digest": "sha256" }
+    },
+    {
+      "name": "get_case", "provider": "qe_agent", "kind": "read", "risk": "low", "min_role": "viewer", "scope_param": "lines", "max_rows": 1, "timeout_ms": 10000,
+      "intents": ["cause_analysis"],
+      "description": "A QE-Agent case board row (status, owner, containment, actions) by case id",
+      "schema": { "type": "object", "additionalProperties": false, "required": ["case_id"], "properties": { "case_id": { "type": "string" }, "lines": { "type": "array", "items": { "type": "string" } } } },
+      "returns": { "case": "object", "digest": "sha256" }
+    },
+    {
+      "name": "get_hypotheses", "provider": "qe_agent", "kind": "read", "risk": "low", "min_role": "inspector", "scope_param": "lines", "max_rows": 10, "timeout_ms": 10000,
+      "intents": ["cause_analysis"],
+      "description": "QE-Agent's ranked hypotheses for a case with score, status, supporting/contra evidence codes and verification step — Copilot repeats them with QE's wording (FR-21)",
+      "schema": { "type": "object", "additionalProperties": false, "required": ["case_id"], "properties": { "case_id": { "type": "string" }, "lines": { "type": "array", "items": { "type": "string" } } } },
+      "returns": { "hypotheses": "array", "digest": "sha256" }
+    }
+  ]
+}

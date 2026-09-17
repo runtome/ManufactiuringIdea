@@ -1,0 +1,35 @@
+kind,canonical_code,alias,lang
+line,L1,L1,en
+line,L1,line 1,en
+line,L1,ไลน์ 1,th
+line,L1,ライン1,ja
+line,L2,L2,en
+line,L2,line 2,en
+line,L2,ไลน์ 2,th
+line,L2,ライン2,ja
+line,L3,L3,en
+line,L3,line 3,en
+line,L3,line three,en
+line,L3,ไลน์ 3,th
+line,L3,สาย 3,th
+line,L3,ライン3,ja
+line,L3,3号ライン,ja
+line,L4,L4,en
+line,L4,line 4,en
+line,L4,ไลน์ 4,th
+line,L4,ライン4,ja
+machine,M-7,M-7,en
+machine,M-7,machine 7,en
+machine,M-7,เครื่อง 7,th
+machine,M-7,7号機,ja
+sku,RAD-500-A,RAD-500-A,en
+sku,RAD-500-A,RAD500A,en
+defect,MISSING_PART,missing part,en
+defect,MISSING_PART,部品欠品,ja
+defect,MISSING_PART,ชิ้นส่วนขาด,th
+defect,SCRATCH,scratch,en
+defect,SCRATCH,キズ,ja
+defect,SCRATCH,รอยขีดข่วน,th
+defect,SHORT_SHOT,short shot,en
+defect,SHORT_SHOT,ショートショット,ja
+defect,SHORT_SHOT,ฉีดไม่เต็ม,th

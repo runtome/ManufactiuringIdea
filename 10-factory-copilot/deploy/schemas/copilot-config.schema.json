@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://copilot.example/schemas/copilot-config.schema.json",
+  "title": "Factory Copilot configuration (deploy/copilot.yaml)",
+  "description": "Validated by `cpctl config load` and by PUT /config (API-10). Constants the SRS fixes (read-only tools, scope as predicate, grounding post-check that withholds, refusal over speculation, grounded-only sharing, LAN-only, visible queue, evaluation gates) are `const` so a configuration cannot switch them off. Discord and an external model can be enabled only with a policy/provider and are recorded by the feature-flag row.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "languages", "time", "entities", "intents", "planner", "tools", "text_to_sql", "retrieval", "composer", "charts", "masking", "sharing", "channels", "concurrency", "evaluation", "retention", "observability", "locale"],
+  "properties": {
+    "version": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}(-[0-9]{2})?$" },
+    "languages": {
+      "type": "object", "additionalProperties": false, "required": ["supported", "default_answer", "detection"],
+      "properties": { "supported": { "type": "array", "const": ["th", "ja", "en"] }, "default_answer": { "type": "string", "enum": ["question", "th", "ja", "en"] }, "detection": { "const": "script" } }
+    },
+    "time": {
+      "type": "object", "additionalProperties": false, "required": ["plant_timezone", "shift_source", "print_resolved_range"],
+      "properties": { "plant_timezone": { "type": "string", "pattern": "^[A-Za-z]+/[A-Za-z_]+$" }, "shift_source": { "const": "core.shift_calendar" }, "print_resolved_range": { "const": true } }
+    },
+    "entities": {
+      "type": "object", "additionalProperties": false, "required": ["alias_source", "trigram_min_similarity", "clarify_on_ambiguity"],
+      "properties": { "alias_source": { "type": "string", "pattern": "\\.csv$" }, "trigram_min_similarity": { "type": "number", "minimum": 0.3, "maximum": 0.9 }, "clarify_on_ambiguity": { "const": true } }
+    },
+    "intents": {
+      "type": "object", "additionalProperties": false, "required": ["set", "cause_analysis"],
+      "properties": {
+        "set": { "type": "array", "const": ["data_lookup", "trend_comparison", "cause_analysis", "document_lookup", "image_lookup", "how_to"] },
+        "cause_analysis": {
+          "type": "object", "additionalProperties": false, "required": ["delegate_to", "tools", "wording"],
+          "properties": { "delegate_to": { "const": "qe_agent" }, "tools": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["get_signals", "get_case", "get_hypotheses"] } }, "wording": { "const": "qe" } }
+        }
+      }
+    },
+    "planner": {
+      "type": "object", "additionalProperties": false, "required": ["max_tool_calls_per_turn", "per_tool_timeout_ms", "per_turn_wall_clock_s", "parallel_independent_calls", "prompt", "clarify_prompt", "validate_plan_against_registry"],
+      "properties": {
+        "max_tool_calls_per_turn": { "type": "integer", "minimum": 1, "maximum": 5, "description": "AI-08 default 5; never above" },
+        "per_tool_timeout_ms": { "type": "integer", "minimum": 500, "maximum": 10000 },
+        "per_turn_wall_clock_s": { "type": "integer", "minimum": 10, "maximum": 60 },
+        "parallel_independent_calls": { "type": "boolean" },
+        "prompt": { "$ref": "#/$defs/prompt_ref" },
+        "clarify_prompt": { "$ref": "#/$defs/prompt_ref" },
+        "validate_plan_against_registry": { "const": true }
+      }
+    },
+    "tools": {
+      "type": "object", "additionalProperties": false, "required": ["registry", "read_only", "scope_param_default", "scope_injection", "narrowed_answer_notice"],
+      "properties": { "registry": { "type": "string", "pattern": "\\.json$" }, "read_only": { "const": true }, "scope_param_default": { "type": "string" }, "scope_injection": { "const": "predicate" }, "narrowed_answer_notice": { "const": true } }
+    },
+    "text_to_sql": {
+      "type": "object", "additionalProperties": false, "required": ["enabled", "role", "parser", "whitelist", "max_limit", "statement_timeout_ms", "allowed_functions", "show_sql_toggle"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "role": { "const": "copilot_sql_ro" },
+        "parser": { "type": "string", "enum": ["pglast", "sqlglot"] },
+        "whitelist": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["relation", "scope_column"],
+            "properties": {
+              "relation": { "type": "string", "pattern": "^(core|vision|quality|knowledge)\\.v_[a-z_]+$", "not": { "enum": ["core.app_user", "core.user_line_scope", "audit.log", "audit.auth_event"] } },
+              "scope_column": { "type": "string" }
+            }
+          }
+        },
+        "max_limit": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "statement_timeout_ms": { "type": "integer", "minimum": 100, "maximum": 5000 },
+        "allowed_functions": { "type": "array", "items": { "type": "string", "pattern": "^[a-z_]+$", "not": { "enum": ["pg_sleep", "pg_read_file", "lo_import", "dblink", "current_setting", "set_config"] } } },
+        "show_sql_toggle": { "const": true }
+      }
+    },
+    "retrieval": {
+      "type": "object", "additionalProperties": false, "required": ["embedding_model", "embedding_dims", "chunk_tokens", "chunk_overlap_pct", "lexical", "fusion", "rrf_k", "candidates", "rerank", "curated_first", "citable_cases_only", "acl_as_predicate", "suspicious_chunks_excluded", "watch_interval_s"],
+      "properties": {
+        "embedding_model": { "type": "string" },
+        "embedding_dims": { "const": 1024 },
+        "chunk_tokens": { "type": "integer", "minimum": 200, "maximum": 800 },
+        "chunk_overlap_pct": { "type": "integer", "minimum": 5, "maximum": 25 },
+        "lexical": { "type": "string", "enum": ["trigram", "tsvector"] },
+        "fusion": { "const": "rrf" },
+        "rrf_k": { "type": "integer", "minimum": 10, "maximum": 100 },
+        "candidates": { "type": "integer", "minimum": 10, "maximum": 30 },
+        "rerank": { "type": "object", "additionalProperties": false, "required": ["enabled", "top_k"], "properties": { "enabled": { "const": true }, "model": { "type": "string" }, "top_k": { "type": "integer", "minimum": 1, "maximum": 10 } } },
+        "curated_first": { "type": "boolean" },
+        "citable_cases_only": { "const": true },
+        "acl_as_predicate": { "const": true },
+        "suspicious_chunks_excluded": { "const": true },
+        "watch_interval_s": { "type": "integer", "minimum": 60, "maximum": 86400 }
+      }
+    },
+    "composer": {
+      "type": "object", "additionalProperties": false, "required": ["model", "prompt", "evidence_schema", "grounding_post_check", "answer_order", "confidence_note_on_partial", "refuse_instead_of_speculate", "suggestions", "term_check"],
+      "properties": {
+        "model": {
+          "type": "object", "additionalProperties": false, "required": ["name", "parameters_b", "quantization", "tool_calling", "num_ctx"],
+          "properties": { "name": { "type": "string" }, "parameters_b": { "type": "number", "exclusiveMinimum": 0, "maximum": 9 }, "quantization": { "type": "string" }, "tool_calling": { "const": true }, "num_ctx": { "type": "integer", "minimum": 4096 } }
+        },
+        "prompt": { "$ref": "#/$defs/prompt_ref" },
+        "evidence_schema": { "const": "schemas/evidence-bundle.schema.json" },
+        "grounding_post_check": {
+          "type": "object", "additionalProperties": false, "required": ["enabled", "withhold_on_unmatched", "abs_tolerance", "rel_tolerance_pct"],
+          "properties": { "enabled": { "const": true }, "withhold_on_unmatched": { "const": true }, "abs_tolerance": { "type": "number", "minimum": 0, "maximum": 0.01 }, "rel_tolerance_pct": { "type": "number", "minimum": 0, "maximum": 1 } }
+        },
+        "answer_order": { "type": "array", "const": ["result", "detail", "sources"] },
+        "confidence_note_on_partial": { "const": true },
+        "refuse_instead_of_speculate": { "const": true },
+        "suggestions": { "type": "object", "additionalProperties": false, "required": ["enabled", "source"], "properties": { "enabled": { "type": "boolean" }, "source": { "const": "slots" } } },
+        "term_check": { "type": "object", "additionalProperties": false, "required": ["enabled", "languages"], "properties": { "enabled": { "const": true }, "languages": { "type": "array", "contains": { "const": "ja" }, "items": { "type": "string", "enum": ["ja", "th"] } }, "block_on_violation": { "type": "boolean" }, "flag_for_review": { "type": "boolean" } } }
+      }
+    },
+    "charts": {
+      "type": "object", "additionalProperties": false, "required": ["kinds", "renderer", "png_for_exports", "labels_localised"],
+      "properties": { "kinds": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["trend", "pareto", "control", "bar"] } }, "renderer": { "const": "vega-lite" }, "png_for_exports": { "type": "boolean" }, "labels_localised": { "const": true } }
+    },
+    "masking": {
+      "type": "object", "additionalProperties": false, "required": ["rules", "discord_always_masked"],
+      "properties": {
+        "rules": {
+          "type": "array", "minItems": 1,
+          "items": { "type": "object", "additionalProperties": false, "required": ["field_kind", "min_role_unmasked", "replacement"], "properties": { "field_kind": { "type": "string", "enum": ["operator_name", "employee_id", "email", "phone"] }, "min_role_unmasked": { "type": "string", "enum": ["inspector", "engineer", "manager", "admin"] }, "replacement": { "type": "string", "minLength": 1 } } },
+          "contains": { "properties": { "field_kind": { "const": "operator_name" } } }
+        },
+        "discord_always_masked": { "const": true }
+      }
+    },
+    "sharing": {
+      "type": "object", "additionalProperties": false, "required": ["formats", "max_expiry_days", "default_expiry_days", "grounded_only", "label", "lan_only"],
+      "properties": { "formats": { "type": "array", "items": { "type": "string", "enum": ["link", "png", "pdf"] } }, "max_expiry_days": { "type": "integer", "minimum": 1, "maximum": 30 }, "default_expiry_days": { "type": "integer", "minimum": 1, "maximum": 30 }, "grounded_only": { "const": true }, "label": { "const": "AI-generated answer — sources attached" }, "lan_only": { "const": true } }
+    },
+    "channels": {
+      "type": "object", "additionalProperties": false, "required": ["web", "embed", "discord", "external_model"],
+      "properties": {
+        "web": { "type": "object", "additionalProperties": false, "properties": { "enabled": { "const": true }, "tablet_min_width_px": { "type": "integer", "minimum": 320, "maximum": 480 } } },
+        "embed": { "type": "object", "additionalProperties": false, "required": ["enabled"], "properties": { "enabled": { "type": "boolean" }, "allowed_origins": { "type": "array", "items": { "type": "string", "pattern": "^https://" } } }, "if": { "properties": { "enabled": { "const": true } } }, "then": { "required": ["allowed_origins"], "properties": { "allowed_origins": { "minItems": 1 } } } },
+        "discord": {
+          "type": "object", "additionalProperties": false, "required": ["enabled"],
+          "properties": { "enabled": { "type": "boolean" }, "policy_ref": { "type": "string", "minLength": 3 }, "require_verified_binding": { "const": true }, "channel_allowlist": { "type": "array", "items": { "type": "string", "pattern": "^#" } }, "images": { "const": false }, "document_text": { "const": false } },
+          "if": { "properties": { "enabled": { "const": true } } },
+          "then": { "required": ["policy_ref", "require_verified_binding", "channel_allowlist", "images", "document_text"], "properties": { "channel_allowlist": { "minItems": 1 } } }
+        },
+        "external_model": {
+          "type": "object", "additionalProperties": false, "required": ["enabled"],
+          "properties": { "enabled": { "type": "boolean" }, "provider": { "type": "string" }, "reason": { "type": "string", "minLength": 20 }, "data_classes_allowed": { "type": "array", "items": { "type": "string" } } },
+          "if": { "properties": { "enabled": { "const": true } } }, "then": { "required": ["provider", "reason", "data_classes_allowed"] }
+        }
+      }
+    },
+    "concurrency": {
+      "type": "object", "additionalProperties": false, "required": ["max_concurrent_turns", "queue_visible", "queue_position_event_interval_s", "per_user_turns_per_minute"],
+      "properties": { "max_concurrent_turns": { "type": "integer", "minimum": 1, "maximum": 16 }, "queue_visible": { "const": true }, "queue_position_event_interval_s": { "type": "integer", "minimum": 1, "maximum": 5 }, "per_user_turns_per_minute": { "type": "integer", "minimum": 1, "maximum": 60 } }
+    },
+    "evaluation": {
+      "type": "object", "additionalProperties": false, "required": ["answer_set", "sql_set", "run_on"],
+      "properties": {
+        "answer_set": {
+          "type": "object", "additionalProperties": false, "required": ["min_questions", "languages", "intents_all", "min_accuracy", "min_citation_correctness", "max_fabricated"],
+          "properties": { "min_questions": { "type": "integer", "minimum": 60 }, "languages": { "type": "array", "const": ["th", "ja", "en"] }, "intents_all": { "const": true }, "min_accuracy": { "type": "number", "minimum": 0.9, "maximum": 1 }, "min_citation_correctness": { "type": "number", "minimum": 0.95, "maximum": 1 }, "max_fabricated": { "const": 0 } }
+        },
+        "sql_set": { "type": "object", "additionalProperties": false, "required": ["min_questions", "min_accuracy"], "properties": { "min_questions": { "type": "integer", "minimum": 30 }, "min_accuracy": { "type": "number", "minimum": 0.85, "maximum": 1 } } },
+        "run_on": { "type": "array", "items": { "type": "string", "enum": ["prompt_change", "model_change", "tool_schema_change", "embedding_change", "evidence_schema_change", "schedule"] }, "allOf": [{ "contains": { "const": "prompt_change" } }, { "contains": { "const": "model_change" } }, { "contains": { "const": "tool_schema_change" } }] },
+        "schedule_cron": { "type": "string" }
+      }
+    },
+    "retention": {
+      "type": "object", "additionalProperties": false, "required": ["conversations_days", "shares_days_max", "uploads_hours", "eval_runs_years", "user_export_and_delete"],
+      "properties": { "conversations_days": { "type": "integer", "minimum": 365, "maximum": 730 }, "shares_days_max": { "type": "integer", "minimum": 1, "maximum": 30 }, "uploads_hours": { "type": "integer", "minimum": 1, "maximum": 72 }, "eval_runs_years": { "type": "integer", "minimum": 1 }, "user_export_and_delete": { "const": true } }
+    },
+    "observability": { "type": "object", "additionalProperties": false, "required": ["metrics", "trace_every_turn"], "properties": { "metrics": { "type": "boolean" }, "trace_every_turn": { "const": true } } },
+    "locale": { "type": "object", "additionalProperties": false, "required": ["default", "supported"], "properties": { "default": { "type": "string", "enum": ["th", "ja", "en"] }, "supported": { "type": "array", "const": ["th", "ja", "en"] } } }
+  },
+  "$defs": {
+    "prompt_ref": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "version", "path", "temperature"],
+      "properties": { "kind": { "type": "string", "enum": ["planner", "composer", "clarify", "suggest"] }, "version": { "type": "string", "pattern": "^v[0-9]+$" }, "path": { "type": "string", "pattern": "^prompts/[a-z_]+\\.v[0-9]+\\.md$" }, "temperature": { "type": "number", "minimum": 0, "maximum": 0.3 } }
+    }
+  }
+}

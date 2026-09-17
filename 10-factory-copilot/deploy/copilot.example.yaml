@@ -1,0 +1,162 @@
+# Factory Copilot configuration — deploy/copilot.example.yaml
+# Loaded with:  cpctl config load copilot.yaml   (admin; PUT /config; validated against schemas/copilot-config.schema.json)
+# Every turn made after a load carries the version (agent.run.prompt_version + copilot.turn.plan_json.config_version).
+# These are the values the seed was written with (DDS-10 §9): tool-call cap 5, text-to-SQL on after an 87.5 % evaluation,
+# whitelist of three views, masking below manager, Discord enabled under policy DISC-01, retention 365 days.
+
+version: "2026-09"
+
+languages:                              # FR-01, NFR-08
+  supported: [th, ja, en]
+  default_answer: question              # answer in the question's language unless the user set a preference
+  detection: script                     # Thai block / kana+kanji / Latin, dominant script wins
+
+time:                                   # FR-02
+  plant_timezone: Asia/Bangkok
+  shift_source: core.shift_calendar     # versioned; "yesterday shift B" uses the calendar valid on that date — constant
+  print_resolved_range: true            # constant — every quantitative answer prints the range it used
+
+entities:                               # FR-03
+  alias_source: aliases.example.csv
+  trigram_min_similarity: 0.5
+  clarify_on_ambiguity: true            # FR-05 — constant
+
+intents:                                # FR-04
+  set: [data_lookup, trend_comparison, cause_analysis, document_lookup, image_lookup, how_to]
+  cause_analysis:
+    delegate_to: qe_agent               # FR-21 — constant
+    tools: [get_signals, get_case, get_hypotheses]
+    wording: qe                         # repeat QE's "hypothesis to verify" wording; never add a cause
+
+planner:                                # AI-08, IF-09
+  max_tool_calls_per_turn: 5
+  per_tool_timeout_ms: 10000
+  per_turn_wall_clock_s: 60
+  parallel_independent_calls: true
+  prompt: { kind: planner, version: v1, path: prompts/planner.v1.md, temperature: 0.1 }
+  clarify_prompt: { kind: clarify, version: v1, path: prompts/clarify.v1.md, temperature: 0.1 }
+  validate_plan_against_registry: true  # IF-16 rule 1 — constant
+
+tools:                                  # FR-07, FR-22, C-01
+  registry: tools.example.json
+  read_only: true                       # constant — write tools cannot be enabled
+  scope_param_default: lines
+  scope_injection: predicate            # constant — scope is a WHERE inside the tool, never post-filtering
+  narrowed_answer_notice: true          # AC-04
+
+text_to_sql:                            # FR-08, C-05, AI-06, IF-54
+  enabled: true                         # allowed only because sql_eval.min_accuracy was met (trg_sql_flag re-checks)
+  role: copilot_sql_ro                  # constant
+  parser: pglast
+  whitelist:
+    - { relation: core.v_kpi_daily,          scope_column: line_code }
+    - { relation: core.v_defect_pareto,      scope_column: line_id }
+    - { relation: vision.v_inspection_daily, scope_column: line_id }
+  max_limit: 1000
+  statement_timeout_ms: 5000
+  allowed_functions: [avg, sum, count, min, max, round, date_trunc, coalesce, nullif]
+  show_sql_toggle: true                 # FR-18 — constant
+
+retrieval:                              # FR-09…FR-12, AI-02, AI-03, IF-55
+  embedding_model: bge-m3
+  embedding_dims: 1024
+  chunk_tokens: 500
+  chunk_overlap_pct: 15
+  lexical: trigram                      # pg_trgm + tsvector
+  fusion: rrf
+  rrf_k: 60
+  candidates: 30
+  rerank: { enabled: true, model: bge-reranker-v2-m3, top_k: 5 }
+  curated_first: true                   # FR-25
+  citable_cases_only: true              # knowledge.v_citable_case — constant
+  acl_as_predicate: true                # constant
+  suspicious_chunks_excluded: true      # AI-07 — constant
+  watch_interval_s: 300                 # FR-12
+
+composer:                               # FR-13…FR-18, AI-01, AI-04, IF-56
+  model:
+    name: qwen2.5:7b-instruct-q4_K_M
+    parameters_b: 7                     # AI-01 — ≤ 9 B on the 8 GB baseline
+    quantization: Q4_K_M
+    tool_calling: true
+    num_ctx: 8192
+  prompt: { kind: composer, version: v1, path: prompts/composer.v1.md, temperature: 0.2 }
+  evidence_schema: schemas/evidence-bundle.schema.json   # constant
+  grounding_post_check:
+    enabled: true                       # constant
+    withhold_on_unmatched: true         # constant — never "answer with a warning"
+    abs_tolerance: 0.005
+    rel_tolerance_pct: 0.5
+  answer_order: [result, detail, sources]   # FR-13 — constant
+  confidence_note_on_partial: true      # FR-16 — constant
+  refuse_instead_of_speculate: true     # FR-17 — constant
+  suggestions: { enabled: true, source: slots }   # FR-20 — derived from slots, not the model
+  term_check: { enabled: true, languages: [ja], block_on_violation: false, flag_for_review: true }   # AI-09
+
+charts:                                 # FR-14
+  kinds: [trend, pareto, control, bar]
+  renderer: vega-lite
+  png_for_exports: true
+  labels_localised: true                # NFR-09 — constant
+
+masking:                                # FR-26
+  rules:
+    - { field_kind: operator_name, min_role_unmasked: manager, replacement: "***" }
+    - { field_kind: employee_id,   min_role_unmasked: manager, replacement: "***" }
+  discord_always_masked: true           # constant
+
+sharing:                                # FR-19
+  formats: [link, png, pdf]
+  max_expiry_days: 30
+  default_expiry_days: 7
+  grounded_only: true                   # constant
+  label: "AI-generated answer — sources attached"   # constant
+  lan_only: true                        # constant
+
+channels:                               # SRS §4.2, C-04, IF-08, IF-57
+  web: { enabled: true, tablet_min_width_px: 360 }
+  embed: { enabled: true, allowed_origins: ["https://factorybrain.plant.local"] }
+  discord:
+    enabled: true                       # requires policy + verified bindings; answers leave the LAN (SEC-C41)
+    policy_ref: DISC-01
+    require_verified_binding: true      # constant
+    channel_allowlist: ["#quality"]
+    images: false                       # constant when enabled
+    document_text: false                # constant when enabled
+  external_model:
+    enabled: false                      # C-04 — when true, provider and reason are mandatory
+
+concurrency:                            # NFR-03
+  max_concurrent_turns: 4
+  queue_visible: true                   # constant
+  queue_position_event_interval_s: 1
+  per_user_turns_per_minute: 12
+
+evaluation:                             # AI-05, AI-06, AC-01
+  answer_set:
+    min_questions: 60
+    languages: [th, ja, en]
+    intents_all: true
+    min_accuracy: 0.90
+    min_citation_correctness: 0.95
+    max_fabricated: 0
+  sql_set:
+    min_questions: 30
+    min_accuracy: 0.85
+  run_on: [prompt_change, model_change, tool_schema_change, embedding_change, evidence_schema_change, schedule]
+  schedule_cron: "0 2 * * 0"
+
+retention:                              # NFR-07
+  conversations_days: 365
+  shares_days_max: 30
+  uploads_hours: 24
+  eval_runs_years: 5
+  user_export_and_delete: true          # constant
+
+observability:                          # IF-14
+  metrics: true
+  trace_every_turn: true                # FR-23 — constant
+
+locale:
+  default: th
+  supported: [th, ja, en]               # NFR-08

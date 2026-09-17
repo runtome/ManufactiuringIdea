@@ -1,0 +1,369 @@
+# Factory Copilot — docker-compose.yml (standalone; OPS-10 §4)
+# Profiles:  gpu (Ollama on CUDA) | cpu (Ollama on CPU) | discord (the bot — only with feature_flag.discord and policy) | dev (mailpit, sibling stubs)
+#   docker compose --profile gpu up -d
+#   docker compose --profile cpu --profile dev up -d
+# Networks:  frontend (reverse proxy → web/api) · internal (no egress: postgres, redis, minio, ollama, planner, executor, sql-sandbox,
+#            retriever, indexer, composer, renderer, scheduler) · sources (executor/indexer/scheduler → sibling tool endpoints, read-only feeds)
+#            egress (ONLY discord-bot, only with the discord profile — answers leave the LAN, SEC-C41)
+# Secrets are FILES under ${SECRETS_DIR} (OPS-10 §4.2) — never in this file or in .env (TEST-10 TC-004).
+# Platform mode (SAD-10 §9): the workers join the platform compose; postgres/redis/minio/ollama/web are the platform's.
+
+x-hardened: &hardened
+  user: "10001:10001"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp]
+  restart: unless-stopped
+  logging: { driver: json-file, options: { max-size: "20m", max-file: "5" } }
+
+x-app-env: &app-env
+  TZ: ${TZ}
+  DATABASE_URL_FILE: /run/secrets/database_url
+  REDIS_URL: redis://redis:6379/0
+  S3_ENDPOINT: http://minio:9000
+  S3_REGION: ${S3_REGION}
+  S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+  S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+  S3_BUCKET_DOCS: ${S3_BUCKET_DOCS}
+  S3_BUCKET_EXPORTS: ${S3_BUCKET_EXPORTS}
+  S3_BUCKET_UPLOADS: ${S3_BUCKET_UPLOADS}
+  CONFIG_DIR: /etc/copilot
+  LOG_LEVEL: ${LOG_LEVEL}
+
+x-model-env: &model-env
+  OLLAMA_URL: http://ollama:11434
+  PLANNER_MODEL: ${PLANNER_MODEL}
+  COMPOSER_MODEL: ${COMPOSER_MODEL}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL}
+  RERANKER_MODEL: ${RERANKER_MODEL}
+
+services:
+  # ------------------------------------------------------------------ edge
+  web:
+    <<: *hardened
+    image: ${CP_REGISTRY}/web:${CP_VERSION}
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL}
+      API_URL: http://api:8080
+      DEFAULT_LOCALE: ${DEFAULT_LOCALE}
+      EMBED_ALLOWED_ORIGINS: ${EMBED_ALLOWED_ORIGINS}
+    ports: ["${BIND_ADDR}:${WEB_PORT}:3000"]
+    depends_on: [api]
+    networks: [frontend]
+
+  api:
+    <<: *hardened
+    image: ${CP_REGISTRY}/api:${CP_VERSION}
+    environment:
+      <<: *app-env
+      PUBLIC_URL: ${PUBLIC_URL}
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      SHARE_SIGNING_KEY_FILE: /run/secrets/share_signing_key
+      EMBED_ALLOWED_ORIGINS: ${EMBED_ALLOWED_ORIGINS}
+      SIGNED_URL_TTL_S: ${SIGNED_URL_TTL_S}
+      MAX_CONCURRENT_TURNS: ${MAX_CONCURRENT_TURNS}
+      PER_USER_TURNS_PER_MINUTE: ${PER_USER_TURNS_PER_MINUTE}
+      ANSWERS_ENABLED: ${ANSWERS_ENABLED}
+      METRICS_ENABLED: "true"
+    secrets: [database_url, s3_access_key, s3_secret_key, jwt_secret, share_signing_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/copilot:ro
+    ports: ["${BIND_ADDR}:${API_PORT}:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+      minio-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/v1/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    networks: [frontend, internal]
+
+  # ------------------------------------------------------------------ understanding and execution (P-1: the model plans and phrases; code executes)
+  planner:
+    <<: *hardened
+    image: ${CP_REGISTRY}/planner:${CP_VERSION}
+    environment:
+      <<: [*app-env, *model-env]
+      MAX_TOOL_CALLS: ${MAX_TOOL_CALLS}
+      PROMPTS_DIR: /etc/copilot/prompts
+      TOOLS_REGISTRY: /etc/copilot/tools.json
+    secrets: [database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/copilot:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+    networks: [internal]
+
+  executor:
+    <<: *hardened
+    image: ${CP_REGISTRY}/executor:${CP_VERSION}
+    environment:
+      <<: *app-env
+      DATABASE_URL_FILE: /run/secrets/executor_database_url      # role agent_ro for local tools (no core.app_user); app_rw only for agent.tool_call rows via api
+      TOOL_TIMEOUT_MS: ${TOOL_TIMEOUT_MS}
+      TURN_WALL_CLOCK_S: ${TURN_WALL_CLOCK_S}
+      TOOLS_REGISTRY: /etc/copilot/tools.json
+      SIBLING_SHIFTBRIEF_URL: ${SIBLING_SHIFTBRIEF_URL}
+      SIBLING_MACHINESENSE_URL: ${SIBLING_MACHINESENSE_URL}
+      SIBLING_QE_URL: ${SIBLING_QE_URL}
+      SIBLING_GENBA_URL: ${SIBLING_GENBA_URL}
+      SIBLING_TOKEN_FILE: /run/secrets/sibling_service_token
+    secrets: [executor_database_url, s3_access_key, s3_secret_key, sibling_service_token]
+    volumes:
+      - ${CONFIG_DIR}:/etc/copilot:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+    networks: [internal, sources]
+
+  sql-sandbox:
+    <<: *hardened
+    image: ${CP_REGISTRY}/sql-sandbox:${CP_VERSION}
+    environment:
+      TZ: ${TZ}
+      DATABASE_URL_FILE: /run/secrets/sandbox_database_url         # role copilot_sql_ro — whitelisted views only, 5 s timeout
+      REDIS_URL: redis://redis:6379/0
+      SQL_MAX_LIMIT: ${SQL_MAX_LIMIT}
+      SQL_TIMEOUT_MS: ${SQL_TIMEOUT_MS}
+      CONFIG_DIR: /etc/copilot
+      LOG_LEVEL: ${LOG_LEVEL}
+    secrets: [sandbox_database_url]
+    volumes:
+      - ${CONFIG_DIR}:/etc/copilot:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal]
+
+  retriever:
+    <<: *hardened
+    image: ${CP_REGISTRY}/retriever:${CP_VERSION}
+    environment:
+      <<: [*app-env, *model-env]
+      DATABASE_URL_FILE: /run/secrets/executor_database_url
+      RETRIEVAL_CANDIDATES: ${RETRIEVAL_CANDIDATES}
+      RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K}
+    secrets: [executor_database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/copilot:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal]
+
+  indexer:
+    <<: *hardened
+    image: ${CP_REGISTRY}/indexer:${CP_VERSION}
+    environment:
+      <<: [*app-env, *model-env]
+      DATABASE_URL_FILE: /run/secrets/indexer_database_url          # role indexer_rw
+      DOC_SOURCES_ROOT: /srv/docs
+      WATCH_INTERVAL_S: ${WATCH_INTERVAL_S}
+      CHUNK_TOKENS: ${CHUNK_TOKENS}
+      CHUNK_OVERLAP_PCT: ${CHUNK_OVERLAP_PCT}
+    secrets: [indexer_database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/copilot:ro
+      - ${DOC_SOURCES_ROOT}:/srv/docs:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+    networks: [internal, sources]
+
+  composer:
+    <<: *hardened
+    image: ${CP_REGISTRY}/composer:${CP_VERSION}
+    environment:
+      <<: [*app-env, *model-env]
+      PROMPTS_DIR: /etc/copilot/prompts
+      EVIDENCE_SCHEMA: /etc/copilot/schemas/evidence-bundle.schema.json
+      FIRST_TOKEN_BUDGET_S: ${FIRST_TOKEN_BUDGET_S}
+    secrets: [database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/copilot:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+    networks: [internal]
+
+  renderer:
+    <<: *hardened
+    image: ${CP_REGISTRY}/renderer:${CP_VERSION}
+    environment:
+      <<: *app-env
+      SHARE_SIGNING_KEY_FILE: /run/secrets/share_signing_key
+    secrets: [database_url, s3_access_key, s3_secret_key, share_signing_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/copilot:ro
+    tmpfs: [/tmp, /home/renderer/.cache]
+    depends_on:
+      minio-init: { condition: service_completed_successfully }
+    networks: [internal]
+
+  scheduler:
+    <<: *hardened
+    image: ${CP_REGISTRY}/scheduler:${CP_VERSION}
+    environment:
+      <<: *app-env
+      RETENTION_DAYS: ${RETENTION_DAYS}
+      RETENTION_CRON: ${RETENTION_CRON}
+      EVAL_CRON: ${EVAL_CRON}
+      QUEUE_SNAPSHOT_S: ${QUEUE_SNAPSHOT_S}
+      SIBLING_GENBA_URL: ${SIBLING_GENBA_URL}
+      SIBLING_TOKEN_FILE: /run/secrets/sibling_service_token
+    secrets: [database_url, s3_access_key, s3_secret_key, sibling_service_token]
+    volumes:
+      - ${CONFIG_DIR}:/etc/copilot:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+    networks: [internal, sources]
+
+  # ------------------------------------------------------------------ Discord (IF-08) — profile only; the one container with egress
+  discord-bot:
+    <<: *hardened
+    profiles: [discord]
+    image: ${CP_REGISTRY}/discord-bot:${CP_VERSION}
+    environment:
+      TZ: ${TZ}
+      API_URL: http://api:8080
+      DISCORD_BOT_TOKEN_FILE: /run/secrets/discord_bot_token
+      DISCORD_CHANNEL_ALLOWLIST: ${DISCORD_CHANNEL_ALLOWLIST}
+      DISCORD_POLICY_REF: ${DISCORD_POLICY_REF}
+      LOG_LEVEL: ${LOG_LEVEL}
+    secrets: [discord_bot_token]
+    depends_on: [api]
+    networks: [internal, egress]
+
+  # ------------------------------------------------------------------ data
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      TZ: ${TZ}
+    command: ["postgres", "-c", "shared_buffers=${PG_SHARED_BUFFERS}", "-c", "wal_level=replica", "-c", "log_min_duration_statement=2000"]
+    secrets: [postgres_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+
+  redis:
+    image: redis:${REDIS_VERSION}
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "${REDIS_MAXMEMORY}", "--maxmemory-policy", "allkeys-lru"]
+    networks: [internal]
+
+  minio:
+    image: minio/minio:${MINIO_VERSION}
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/s3_access_key
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/s3_secret_key
+    secrets: [s3_access_key, s3_secret_key]
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+
+  minio-init:
+    image: minio/mc:${MINIO_MC_VERSION}
+    entrypoint: ["/bin/sh", "-c"]
+    # docs are originals (versioned); exports expire with the share; uploads (photos for similarity) expire in a day
+    command:
+      - >
+        mc alias set local http://minio:9000 "$(cat /run/secrets/s3_access_key)" "$(cat /run/secrets/s3_secret_key)" &&
+        mc mb --ignore-existing --with-versioning local/${S3_BUCKET_DOCS} &&
+        mc mb --ignore-existing local/${S3_BUCKET_EXPORTS} &&
+        mc ilm rule add --expire-days ${SHARES_EXPIRE_DAYS} local/${S3_BUCKET_EXPORTS} &&
+        mc mb --ignore-existing local/${S3_BUCKET_UPLOADS} &&
+        mc ilm rule add --expire-days 1 local/${S3_BUCKET_UPLOADS}
+    secrets: [s3_access_key, s3_secret_key]
+    depends_on:
+      minio: { condition: service_healthy }
+    networks: [internal]
+
+  # ------------------------------------------------------------------ model runtime (IF-09) — no route out; no tools
+  ollama:
+    profiles: [gpu]
+    image: ollama/ollama:${OLLAMA_VERSION}
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: 30m
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL}
+    volumes:
+      - ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT}
+              capabilities: [gpu]
+    networks: [internal]
+
+  ollama-cpu:
+    profiles: [cpu]
+    image: ollama/ollama:${OLLAMA_VERSION}
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: 30m
+      OLLAMA_NUM_THREAD: ${CPU_THREADS}
+    volumes:
+      - ollama:/root/.ollama
+    networks:
+      internal:
+        aliases: [ollama]
+
+  # ------------------------------------------------------------------ dev only
+  mailpit:
+    profiles: [dev]
+    image: axllent/mailpit:${MAILPIT_VERSION}
+    ports: ["${BIND_ADDR}:8025:8025"]
+    networks: [internal]
+
+  sibling-stub:
+    profiles: [dev]
+    image: ${CP_REGISTRY}/sibling-stub:${CP_VERSION}     # serves the seed's ShiftBrief / QE-Agent / MachineSense / Genba tool endpoints (TEST-10 E1)
+    networks: [sources]
+
+networks:
+  frontend: {}
+  internal:
+    internal: true
+  sources:
+    internal: true
+  egress: {}
+
+volumes:
+  pgdata: {}
+  miniodata: {}
+  ollama: {}
+
+secrets:
+  database_url:          { file: "${SECRETS_DIR}/database_url" }            # app_rw
+  executor_database_url: { file: "${SECRETS_DIR}/executor_database_url" }   # agent_ro
+  sandbox_database_url:  { file: "${SECRETS_DIR}/sandbox_database_url" }    # copilot_sql_ro
+  indexer_database_url:  { file: "${SECRETS_DIR}/indexer_database_url" }    # indexer_rw
+  postgres_password:     { file: "${SECRETS_DIR}/postgres_password" }
+  jwt_secret:            { file: "${SECRETS_DIR}/jwt_secret" }
+  share_signing_key:     { file: "${SECRETS_DIR}/share_signing_key" }
+  s3_access_key:         { file: "${SECRETS_DIR}/s3_access_key" }
+  s3_secret_key:         { file: "${SECRETS_DIR}/s3_secret_key" }
+  sibling_service_token: { file: "${SECRETS_DIR}/sibling_service_token" }
+  discord_bot_token:     { file: "${SECRETS_DIR}/discord_bot_token" }

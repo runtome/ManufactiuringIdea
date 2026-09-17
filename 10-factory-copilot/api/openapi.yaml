@@ -1,0 +1,1685 @@
+openapi: 3.1.0
+info:
+  title: Factory Copilot API
+  version: 1.0.0
+  summary: The front door of FactoryBrain — grounded, permission-aware, read-only answers in Thai, Japanese and English.
+  description: |
+    **Scope.** The Factory Copilot API — standalone, and the `agent` front door of FactoryBrain in platform mode.
+    SRS-10 §4.1's six paths are kept verbatim under `/api/v1` (`/chat`, `/chat/{conversation_id}`, `/feedback`,
+    `/sources/{id}`, `/index/documents`, `/tools`). The platform's `/agent/ask`, `/agent/runs/{runId}`,
+    `/agent/feedback`, `/agent/tools`, `/knowledge/search` and `/knowledge/documents` and their components are
+    copied byte-for-byte from API-00 and diffed by TEST-10 TC-008; in platform mode they are served by the gateway.
+
+    **Five contracts (API-Specification.md §3–§7):**
+    - **Grounding** — the composer receives only the evidence bundle; every number in an answer traces to a fact
+      with an evidence id; an answer with an unmatched number is withheld (`422 GROUNDING_FAILED`), never returned
+      with a warning.
+    - **Permission** — the caller's line scope is applied inside every tool as a predicate; a narrowed answer says
+      so in `notes`; a restricted caller never receives out-of-scope rows.
+    - **Streaming** — `/chat` streams Server-Sent Events (`queue`, `plan`, `clarify`, `tool_call`, `tool_result`,
+      `token`, `chart`, `image`, `sources`, `confidence`, `done`, `error`) so the plan and sources are visible
+      before the answer (ICD-10 IF-53).
+    - **SQL** — generated SQL exists only behind the `text_to_sql` flag, runs as `copilot_sql_ro` on whitelisted
+      views with a `LIMIT` and a 5 s timeout, and is shown verbatim under "show the SQL".
+    - **Refusal / partial** — missing data yields `refused` with what is missing and how to obtain it; a budget
+      or scope narrowing yields `partial` with a reason; the model is never asked to guess.
+
+    Errors are RFC 7807 `application/problem+json` with a stable `code`.
+  contact: { name: Suphot N. }
+  license: { name: Proprietary }
+  x-document-id: API-10-Copilot
+
+servers:
+  - url: https://copilot.plant.local/api/v1
+    description: Standalone
+  - url: https://factorybrain.plant.local/api/v1
+    description: Platform mode (the platform's six paths are served by the gateway; the rest under /copilot/)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - { name: chat, description: "SRS §4.1 — conversations, streaming answers, feedback, sources, tools" }
+  - { name: turns, description: "Turn traces — show the numbers, show the SQL, clarify, share, pin" }
+  - { name: images, description: "Defect image lookup by filter and by similarity (FR-10)" }
+  - { name: documents, description: "Sources, indexing and re-indexing (FR-11, FR-12)" }
+  - { name: curation, description: "Ratings, flags, curated Q&A (FR-24, FR-25)" }
+  - { name: evaluation, description: "Answer and SQL evaluation runs — the release gates (AI-05, AI-06)" }
+  - { name: admin, description: "Aliases, glossary, masking, channels, tool policy, flags, config" }
+  - { name: agent, description: "Platform paths (API-00, verbatim)" }
+  - { name: knowledge, description: "Platform paths (API-00, verbatim)" }
+  - { name: system, description: "Health, readiness (mode), queue, metrics" }
+
+paths:
+  # ------------------------------------------------------------------
+  # SRS-10 §4.1 — verbatim paths
+  # ------------------------------------------------------------------
+  /chat:
+    post:
+      tags: [chat]
+      summary: Send a message — streamed answer with plan, tool calls, charts, images, sources and confidence (FR-13…FR-18)
+      description: |
+        With `Accept: text/event-stream` the response is the IF-53 event stream; the first event is `queue` (position)
+        or `plan`. With `Accept: application/json` the complete `ChatResponse` is returned after the post-check.
+        A question whose answer would contain a number absent from the evidence bundle is withheld with
+        `422 GROUNDING_FAILED`. In dashboards-only mode (model unavailable) the response is `503 MODEL_UNAVAILABLE`
+        with `links` to the equivalent dashboards (NFR-06, AC-09).
+      operationId: chat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChatRequest' }
+      responses:
+        '200':
+          description: Answer (JSON) or event stream
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/ChatResponse' } }
+            text/event-stream: { schema: { $ref: '#/components/schemas/StreamEvent' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { description: "Answer withheld by the grounding post-check (GROUNDING_FAILED) or invalid request", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { description: "Model unavailable — dashboards-only mode with links (MODEL_UNAVAILABLE)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/DegradedProblem' } } } }
+  /chat/{conversation_id}:
+    get:
+      tags: [chat]
+      summary: Conversation history — messages and turn summaries (FR-06, FR-23)
+      operationId: getConversation
+      parameters: [ { $ref: '#/components/parameters/ConversationId' } ]
+      responses:
+        '200': { description: Conversation, content: { application/json: { schema: { $ref: '#/components/schemas/ConversationDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /feedback:
+    post:
+      tags: [chat]
+      summary: Rate an answer (FR-24)
+      operationId: submitFeedback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FeedbackRequest' }
+      responses:
+        '204': { description: Recorded }
+  /sources/{id}:
+    get:
+      tags: [chat]
+      summary: Open a cited source — the tool call with its arguments, a document chunk with page/section, or an image (FR-15)
+      operationId: getSource
+      parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200': { description: Source detail, content: { application/json: { schema: { $ref: '#/components/schemas/SourceDetail' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /index/documents:
+    post:
+      tags: [documents]
+      summary: Ingest or refresh a document (FR-11, FR-12)
+      description: Standalone twin of the platform's /knowledge/documents. The file is chunked with structure awareness, embedded, ACL-tagged and scanned for instruction-like text (flagged, never followed).
+      operationId: indexDocument
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, kind]
+              properties:
+                file: { type: string, format: binary }
+                kind: { type: string, enum: [sop, eight_d, fmea, manual, work_instruction] }
+                lang: { $ref: '#/components/schemas/Language' }
+                acl_min_role: { type: string, enum: [viewer, inspector, engineer, manager, admin], default: viewer }
+      responses:
+        '202': { description: Queued, content: { application/json: { schema: { $ref: '#/components/schemas/IndexJob' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /tools:
+    get:
+      tags: [chat]
+      summary: Tools available to the caller's role — the visible capability boundary (FR-07, C-01)
+      operationId: listMyTools
+      responses:
+        '200': { description: Tools, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ToolPolicy' } } } } }
+
+  # ------------------------------------------------------------------
+  # Turns — traces, clarification, sharing (FR-05, FR-18, FR-19)
+  # ------------------------------------------------------------------
+  /turns:
+    get:
+      tags: [turns]
+      summary: Turns for review — by date range, line and outcome (FR-23; engineer+ sees all users, others their own)
+      operationId: listTurns
+      parameters: [ { $ref: '#/components/parameters/DateFrom' }, { $ref: '#/components/parameters/DateTo' }, { $ref: '#/components/parameters/LineFilter' }, { name: outcome, in: query, schema: { $ref: '#/components/schemas/Outcome' } }, { name: intent, in: query, schema: { $ref: '#/components/schemas/Intent' } }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses:
+        '200': { description: Turns, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/TurnSummary' } }, next_cursor: { type: [string, 'null'] } } } } } }
+  /turns/{turnId}:
+    get:
+      tags: [turns]
+      summary: Full turn trace — language, intent, entities, time range, plan, evidence bundle ("show the numbers"), sources, grounding, SQL (FR-18, FR-23)
+      operationId: getTurn
+      parameters: [ { $ref: '#/components/parameters/TurnId' } ]
+      responses:
+        '200': { description: Trace, content: { application/json: { schema: { $ref: '#/components/schemas/TurnTrace' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /turns/{turnId}/clarify:
+    post:
+      tags: [turns]
+      summary: Answer a clarifying question (FR-05) — continues the same turn and streams the answer
+      operationId: clarifyTurn
+      parameters: [ { $ref: '#/components/parameters/TurnId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ClarifyReply' }
+      responses:
+        '200':
+          description: Answer or event stream
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/ChatResponse' } }
+            text/event-stream: { schema: { $ref: '#/components/schemas/StreamEvent' } }
+        '409': { description: "No clarification pending (NO_CLARIFICATION)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /turns/{turnId}/sql:
+    get:
+      tags: [turns]
+      summary: Show the SQL — every generated statement of the turn with its verdict (FR-18, AC-07)
+      operationId: listTurnSql
+      parameters: [ { $ref: '#/components/parameters/TurnId' } ]
+      responses:
+        '200': { description: Statements, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/SqlQuery' } } } } }
+  /sql-queries/{id}/rerun:
+    post:
+      tags: [turns]
+      summary: Re-run a stored statement in the sandbox to reproduce the stated numbers (AC-07) — engineer+
+      operationId: rerunSql
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Rows (≤ LIMIT), content: { application/json: { schema: { $ref: '#/components/schemas/SqlResult' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: "Statement was rejected or the flag is off (SQL_REJECTED, SQL_FLAG_OFF)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /turns/{turnId}/share:
+    post:
+      tags: [turns]
+      summary: Share an answer as a link, PNG or PDF (FR-19) — grounded answers only, expiring
+      operationId: shareTurn
+      parameters: [ { $ref: '#/components/parameters/TurnId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShareRequest' }
+      responses:
+        '201': { description: Share, content: { application/json: { schema: { $ref: '#/components/schemas/Share' } } } }
+        '409': { description: "Only grounded (ok) answers can be shared (NOT_SHAREABLE)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /shares/{token}:
+    get:
+      tags: [turns]
+      summary: Open a shared answer (LAN, expiring token)
+      operationId: getShare
+      security: []
+      parameters: [ { name: token, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200': { description: Shared answer, content: { application/json: { schema: { $ref: '#/components/schemas/SharedAnswer' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410': { description: "Expired or revoked", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    delete:
+      tags: [turns]
+      summary: Revoke a share
+      operationId: revokeShare
+      parameters: [ { name: token, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '204': { description: Revoked }
+  /turns/{turnId}/pin:
+    post:
+      tags: [turns]
+      summary: Pin an answer to a dashboard (FR-19)
+      operationId: pinTurn
+      parameters: [ { $ref: '#/components/parameters/TurnId' } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { dashboard: { type: string, default: my } } }
+      responses:
+        '201': { description: Pinned, content: { application/json: { schema: { $ref: '#/components/schemas/Pin' } } } }
+  /pins:
+    get:
+      tags: [turns]
+      summary: My pins
+      operationId: listPins
+      responses:
+        '200': { description: Pins, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Pin' } } } } }
+  /pins/{id}:
+    delete:
+      tags: [turns]
+      summary: Unpin
+      operationId: deletePin
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '204': { description: Removed }
+  /turns/{turnId}/flag:
+    post:
+      tags: [curation]
+      summary: Flag an answer for review (FR-25)
+      operationId: flagTurn
+      parameters: [ { $ref: '#/components/parameters/TurnId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [reason], properties: { reason: { type: string, maxLength: 500 } } }
+      responses:
+        '201': { description: Flag, content: { application/json: { schema: { $ref: '#/components/schemas/AnswerFlag' } } } }
+  /turns/{turnId}/term-check:
+    get:
+      tags: [turns]
+      summary: Japanese terminology check of the answer against the glossary (AI-09)
+      operationId: getTermCheck
+      parameters: [ { $ref: '#/components/parameters/TurnId' } ]
+      responses:
+        '200': { description: Hits, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/TermCheck' } } } } }
+
+  # ------------------------------------------------------------------
+  # Conversations (list, export, delete — NFR-07), saved questions, preferences
+  # ------------------------------------------------------------------
+  /conversations:
+    get:
+      tags: [chat]
+      summary: My conversations
+      operationId: listConversations
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses:
+        '200': { description: Conversations, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/ConversationSummary' } }, next_cursor: { type: [string, 'null'] } } } } } }
+  /conversations/{conversation_id}/export:
+    get:
+      tags: [chat]
+      summary: Export a conversation with its traces (NFR-07)
+      operationId: exportConversation
+      parameters: [ { $ref: '#/components/parameters/ConversationId' } ]
+      responses:
+        '200': { description: JSON export, content: { application/json: { schema: { $ref: '#/components/schemas/ConversationExport' } } } }
+  /conversations/{conversation_id}:
+    delete:
+      tags: [chat]
+      summary: Delete one of my conversations (NFR-07) — audited
+      operationId: deleteConversation
+      parameters: [ { $ref: '#/components/parameters/ConversationId' } ]
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /me/conversations:
+    delete:
+      tags: [chat]
+      summary: Delete all my conversations (NFR-07) — runs copilot.purge_user_conversations, audited
+      operationId: purgeMyConversations
+      responses:
+        '202': { description: Purged, content: { application/json: { schema: { type: object, properties: { conversations_deleted: { type: integer } } } } } }
+  /me/preferences:
+    get:
+      tags: [chat]
+      summary: My preferences (answer language, show numbers by default)
+      operationId: getPreferences
+      responses:
+        '200': { description: Preferences, content: { application/json: { schema: { $ref: '#/components/schemas/Preferences' } } } }
+    put:
+      tags: [chat]
+      summary: Update my preferences (FR-01 language override)
+      operationId: putPreferences
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Preferences' }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Preferences' } } } }
+  /saved-questions:
+    get:
+      tags: [chat]
+      summary: My saved questions — each carries a direct dashboard URL usable when the model is down (NFR-06)
+      operationId: listSavedQuestions
+      responses:
+        '200': { description: Saved questions, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/SavedQuestion' } } } } }
+    post:
+      tags: [chat]
+      summary: Save a question
+      operationId: createSavedQuestion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SavedQuestion' }
+      responses:
+        '201': { description: Saved, content: { application/json: { schema: { $ref: '#/components/schemas/SavedQuestion' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /saved-questions/{id}:
+    delete:
+      tags: [chat]
+      summary: Remove a saved question
+      operationId: deleteSavedQuestion
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '204': { description: Removed }
+
+  # ------------------------------------------------------------------
+  # Images (FR-10)
+  # ------------------------------------------------------------------
+  /images/search:
+    post:
+      tags: [images]
+      summary: Defect images by filter (line / SKU / defect / date) and optionally by visual similarity to an uploaded photo
+      description: Scope-filtered at the tool layer; signed URLs expire in 15 minutes; similarity requires the image_similarity flag (local embeddings only).
+      operationId: searchImages
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [date_from, date_to]
+              properties:
+                date_from: { type: string, format: date }
+                date_to: { type: string, format: date }
+                lines: { type: array, items: { type: string } }
+                sku: { type: string }
+                defect: { type: string }
+                limit: { type: integer, minimum: 1, maximum: 20, default: 12 }
+                photo: { type: string, format: binary }
+      responses:
+        '200': { description: Images, content: { application/json: { schema: { $ref: '#/components/schemas/ImageSearchResult' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ------------------------------------------------------------------
+  # Documents — sources and indexing (FR-11, FR-12)
+  # ------------------------------------------------------------------
+  /documents/sources:
+    get:
+      tags: [documents]
+      summary: Watched document sources with index status (FR-12)
+      operationId: listDocSources
+      responses:
+        '200': { description: Sources, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/DocSource' } } } } }
+    post:
+      tags: [documents]
+      summary: Register a document source (admin)
+      operationId: createDocSource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DocSource' }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/DocSource' } } } }
+  /documents/sources/{id}/rescan:
+    post:
+      tags: [documents]
+      summary: Rescan a source now — unchanged files (same sha256) are skipped
+      operationId: rescanDocSource
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '202': { description: Jobs queued, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/IndexJob' } } } } }
+  /index/jobs:
+    get:
+      tags: [documents]
+      summary: Index jobs (state, reason, chunks, errors, suspicious flags)
+      operationId: listIndexJobs
+      parameters: [ { name: state, in: query, schema: { type: string, enum: [queued, running, done, failed, skipped] } }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses:
+        '200': { description: Jobs, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/IndexJob' } }, next_cursor: { type: [string, 'null'] } } } } } }
+
+  # ------------------------------------------------------------------
+  # Curation — flags and curated Q&A (FR-25)
+  # ------------------------------------------------------------------
+  /flags:
+    get:
+      tags: [curation]
+      summary: Flagged answers awaiting review (engineer+)
+      operationId: listFlags
+      parameters: [ { name: status, in: query, schema: { type: string, enum: [open, corrected, dismissed], default: open } } ]
+      responses:
+        '200': { description: Flags, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AnswerFlag' } } } } }
+  /flags/{id}/review:
+    post:
+      tags: [curation]
+      summary: Review a flag — dismiss, or correct by creating a curated answer (engineer+)
+      operationId: reviewFlag
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FlagReview' }
+      responses:
+        '200': { description: Reviewed, content: { application/json: { schema: { $ref: '#/components/schemas/AnswerFlag' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /curated:
+    get:
+      tags: [curation]
+      summary: Curated Q&A store
+      operationId: listCurated
+      parameters: [ { name: lang, in: query, schema: { $ref: '#/components/schemas/Language' } }, { name: active, in: query, schema: { type: boolean } } ]
+      responses:
+        '200': { description: Entries, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/CuratedQa' } } } } }
+    post:
+      tags: [curation]
+      summary: Add a curated answer (engineer+; inactive until approved and embedded)
+      operationId: createCurated
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CuratedQa' }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/CuratedQa' } } } }
+  /curated/{id}/approve:
+    post:
+      tags: [curation]
+      summary: Approve a curated answer (engineer+) — becomes citable once embedded
+      operationId: approveCurated
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Approved, content: { application/json: { schema: { $ref: '#/components/schemas/CuratedQa' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /curated/{id}:
+    delete:
+      tags: [curation]
+      summary: Retire a curated answer (admin)
+      operationId: deleteCurated
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '204': { description: Retired }
+
+  # ------------------------------------------------------------------
+  # Evaluation (AI-05, AI-06)
+  # ------------------------------------------------------------------
+  /eval/questions:
+    get:
+      tags: [evaluation]
+      summary: The evaluation set (≥ 60 questions across TH/JA/EN and all six intents)
+      operationId: listEvalQuestions
+      responses:
+        '200': { description: Questions, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/EvalQuestion' } } } } }
+  /eval/runs:
+    get:
+      tags: [evaluation]
+      summary: Evaluation runs with computed gates
+      operationId: listEvalRuns
+      responses:
+        '200': { description: Runs, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/EvalRun' } } } } }
+    post:
+      tags: [evaluation]
+      summary: Start an evaluation run (admin) — required after any prompt, model, tool-schema or embedding change
+      operationId: startEvalRun
+      responses:
+        '202': { description: Started, content: { application/json: { schema: { $ref: '#/components/schemas/EvalRun' } } } }
+  /eval/runs/{id}:
+    get:
+      tags: [evaluation]
+      summary: One evaluation run with per-question results
+      operationId: getEvalRun
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Run, content: { application/json: { schema: { $ref: '#/components/schemas/EvalRunDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /eval/sql-runs:
+    get:
+      tags: [evaluation]
+      summary: Text-to-SQL evaluation runs (≥ 30 questions; ≥ 85 % execution accuracy enables the flag)
+      operationId: listSqlEvalRuns
+      responses:
+        '200': { description: Runs, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/SqlEvalRun' } } } } }
+    post:
+      tags: [evaluation]
+      summary: Start a SQL evaluation run (admin)
+      operationId: startSqlEvalRun
+      responses:
+        '202': { description: Started, content: { application/json: { schema: { $ref: '#/components/schemas/SqlEvalRun' } } } }
+
+  # ------------------------------------------------------------------
+  # Admin — aliases, glossary, masking, channels, tool policy, flags, config
+  # ------------------------------------------------------------------
+  /aliases:
+    get:
+      tags: [admin]
+      summary: Entity aliases (FR-03)
+      operationId: listAliases
+      parameters: [ { name: kind, in: query, schema: { type: string, enum: [line, machine, sku, defect, mould] } } ]
+      responses:
+        '200': { description: Aliases, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/EntityAlias' } } } } }
+    post:
+      tags: [admin]
+      summary: Add an alias (admin)
+      operationId: createAlias
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EntityAlias' }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/EntityAlias' } } } }
+        '409': { description: "Alias already mapped (ALIAS_EXISTS)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /aliases/{id}:
+    delete:
+      tags: [admin]
+      summary: Remove an alias (admin)
+      operationId: deleteAlias
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '204': { description: Removed }
+  /glossary/terms:
+    get:
+      tags: [admin]
+      summary: Company terminology glossary used by the JA term check (AI-09)
+      operationId: listGlossaryTerms
+      responses:
+        '200': { description: Terms, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/GlossaryTerm' } } } } }
+  /masking-rules:
+    get:
+      tags: [admin]
+      summary: Personal-data masking rules (FR-26)
+      operationId: listMaskingRules
+      responses:
+        '200': { description: Rules, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/MaskingRule' } } } } }
+    put:
+      tags: [admin]
+      summary: Replace the masking rules (admin)
+      operationId: putMaskingRules
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: array, items: { $ref: '#/components/schemas/MaskingRule' } }
+      responses:
+        '200': { description: Rules, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/MaskingRule' } } } } }
+  /channel-bindings:
+    get:
+      tags: [admin]
+      summary: Discord identity bindings (IF-08) — an unbound identity has no permissions
+      operationId: listChannelBindings
+      responses:
+        '200': { description: Bindings, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ChannelBinding' } } } } }
+    post:
+      tags: [admin]
+      summary: Create a binding (admin); channels are allowed only after verification
+      operationId: createChannelBinding
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChannelBinding' }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/ChannelBinding' } } } }
+  /channel-bindings/{id}/verify:
+    post:
+      tags: [admin]
+      summary: Verify a binding with the one-time code sent to the user
+      operationId: verifyChannelBinding
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [code], properties: { code: { type: string } } }
+      responses:
+        '200': { description: Verified, content: { application/json: { schema: { $ref: '#/components/schemas/ChannelBinding' } } } }
+  /tool-policy:
+    get:
+      tags: [admin]
+      summary: Tool policy — which registry tools Copilot exposes, to whom, with which scope parameter (C-01, FR-22)
+      operationId: listToolPolicy
+      responses:
+        '200': { description: Policy, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ToolPolicy' } } } } }
+  /tool-policy/{toolName}:
+    put:
+      tags: [admin]
+      summary: Update a tool's policy (admin) — write tools cannot be enabled
+      operationId: putToolPolicy
+      parameters: [ { name: toolName, in: path, required: true, schema: { type: string } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ToolPolicy' }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/ToolPolicy' } } } }
+        '409': { description: "A write tool cannot be exposed by Copilot (READ_ONLY)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /feature-flags:
+    get:
+      tags: [admin]
+      summary: Feature flags — text_to_sql, discord, external_model, image_similarity (C-04, C-05)
+      operationId: listFeatureFlags
+      responses:
+        '200': { description: Flags, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/FeatureFlag' } } } } }
+  /feature-flags/{key}:
+    put:
+      tags: [admin]
+      summary: Enable or disable a flag (admin) — a reason is mandatory; text_to_sql additionally needs a passed SQL evaluation
+      operationId: putFeatureFlag
+      parameters: [ { name: key, in: path, required: true, schema: { type: string, enum: [text_to_sql, discord, external_model, image_similarity] } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [enabled, reason], properties: { enabled: { type: boolean }, reason: { type: string, minLength: 8 } } }
+      responses:
+        '200': { description: Flag, content: { application/json: { schema: { $ref: '#/components/schemas/FeatureFlag' } } } }
+        '409': { description: "Gate not passed (SQL_EVAL_GATE) or policy missing (POLICY_REQUIRED)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /config:
+    get:
+      tags: [admin]
+      summary: Effective configuration (deploy/copilot.yaml, schema-validated)
+      operationId: getConfig
+      responses:
+        '200': { description: Configuration, content: { application/json: { schema: { $ref: '#/components/schemas/Config' } } } }
+    put:
+      tags: [admin]
+      summary: Load a configuration (admin) — validated against schemas/copilot-config.schema.json; a prompt or model change requires an evaluation run before answers use it
+      operationId: putConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Config' }
+      responses:
+        '200': { description: Loaded, content: { application/json: { schema: { $ref: '#/components/schemas/Config' } } } }
+        '422': { description: "Configuration invalid (CONFIG_INVALID)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # ------------------------------------------------------------------
+  # System
+  # ------------------------------------------------------------------
+  /queue:
+    get:
+      tags: [system]
+      summary: Queue picture — depth, max wait, GPU wait, mode (NFR-03)
+      operationId: getQueue
+      responses:
+        '200': { description: Queue, content: { application/json: { schema: { $ref: '#/components/schemas/QueueStatus' } } } }
+  /healthz:
+    get:
+      tags: [system]
+      summary: Liveness
+      operationId: healthz
+      security: []
+      responses:
+        '200': { description: Alive, content: { application/json: { schema: { type: object, properties: { status: { type: string } } } } } }
+  /readyz:
+    get:
+      tags: [system]
+      summary: Readiness — mode is full or dashboards_only (NFR-06, AC-09)
+      operationId: readyz
+      security: []
+      responses:
+        '200': { description: Ready, content: { application/json: { schema: { $ref: '#/components/schemas/Readiness' } } } }
+        '503': { description: Not ready (NOT_READY), content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /metrics:
+    get:
+      tags: [system]
+      summary: Prometheus metrics (ICD-10 IF-14)
+      operationId: metrics
+      security: []
+      responses:
+        '200': { description: Metrics, content: { text/plain: { schema: { type: string } } } }
+
+  # ------------------------------------------------------------------
+  # Platform paths — API-00, verbatim (TEST-10 TC-008)
+  # ------------------------------------------------------------------
+  /agent/ask:
+    post:
+      tags: [agent]
+      summary: Ask a grounded question
+      description: |
+        Runs the tool-calling loop and returns a natural-language answer with
+        its sources.
+
+        **Grounding contract.** Every number in `answer` appears in a tool
+        result listed in `sources`. If the post-check finds an unmatched
+        number, the answer is withheld and `outcome` is `grounding_failed`
+        (HTTP 422) — the caller never receives an ungrounded answer with a
+        warning attached.
+
+        Budgets (max tool calls, wall time) are enforced by the executor. When
+        a budget is hit, `outcome` is `partial` and `partial_reason` explains
+        what was not covered.
+      operationId: askAgent
+      parameters:
+        - name: stream
+          in: query
+          description: Stream the response as Server-Sent Events
+          schema: { type: boolean, default: false }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AskRequest'
+      responses:
+        '200':
+          description: Grounded answer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AskResponse'
+              examples:
+                grounded:
+                  summary: Answer with sources
+                  value:
+                    run_id: 0192f0a1-0000-7000-8000-000000000f01
+                    outcome: ok
+                    lang: en
+                    answer: >-
+                      Line 3 defect rate was 5.80 % on 2026-09-09 against a 7-day
+                      baseline of 2.41 % (p = 0.0004, n = 2140). Missing Component
+                      accounts for 63 % of defects. The change point is
+                      2026-09-08 14:20, coincident with material lot LOT-2609-114
+                      entering production at 14:12. This is a correlation; the root
+                      cause is not verified.
+                    sources:
+                      - kind: tool
+                        tool: query_defects
+                        args: { date_from: '2026-09-09', date_to: '2026-09-09' }
+                        row_count: 5
+                      - kind: tool
+                        tool: query_production
+                        args: { date_from: '2026-09-02', date_to: '2026-09-09', line: L3 }
+                        row_count: 16
+                    grounding:
+                      numbers_found: ['5.80', '2.41', '0.0004', '2140', '63']
+                      all_matched: true
+                insufficientData:
+                  summary: Refusal rather than speculation
+                  value:
+                    run_id: 0192f0a1-0000-7000-8000-000000000f02
+                    outcome: refused
+                    lang: en
+                    answer: >-
+                      I do not have shift C data for 2026-09-09 — it has not been
+                      uploaded yet. I cannot compare shifts for that date. The
+                      shift A and B figures are available if that helps.
+                    sources: []
+          headers:
+            X-Correlation-Id:
+              schema: { type: string }
+        '422':
+          description: |
+            Grounding post-check failed. The answer was withheld.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://factorybrain.local/problems/grounding-failed
+                title: Answer withheld by grounding check
+                status: 422
+                code: GROUNDING_FAILED
+                detail: >-
+                  The generated answer contained the value "4.7" which does not
+                  appear in any tool result for this turn. The answer was not
+                  returned. This has been logged as run 0192f0a1-...
+        '503':
+          $ref: '#/components/responses/ModelUnavailable'
+
+  /agent/runs/{runId}:
+    get:
+      tags: [agent]
+      summary: Full trace of an agent run
+      description: Tool calls, arguments, timings, facts object and grounding result.
+      operationId: getAgentRun
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Run trace
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRunTrace'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /agent/feedback:
+    post:
+      tags: [agent]
+      summary: Rate an agent answer
+      operationId: submitAgentFeedback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [run_id, rating]
+              properties:
+                run_id: { type: string, format: uuid }
+                rating:
+                  type: integer
+                  enum: [-1, 1]
+                reason: { type: string }
+      responses:
+        '204':
+          description: Recorded
+
+  /agent/tools:
+    get:
+      tags: [agent]
+      summary: Tools available to the calling user
+      description: |
+        Filtered by the caller's role. This endpoint is the transparent view of
+        the agent's capability boundary — there is no hidden tool.
+      operationId: listTools
+      responses:
+        '200':
+          description: Tools
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Tool'
+
+  /knowledge/search:
+    post:
+      tags: [knowledge]
+      summary: Hybrid search over documents and past cases
+      description: |
+        Combines lexical (trigram) and vector retrieval with reranking, and
+        supports cross-language retrieval — a Thai query can surface a Japanese
+        8D report.
+
+        Results are filtered by the caller's document ACL at query time, not
+        after retrieval.
+      operationId: searchKnowledge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string }
+                top_k: { type: integer, default: 5, maximum: 50 }
+                filters:
+                  type: object
+                  properties:
+                    machine: { type: string }
+                    line: { type: string }
+                    sku: { type: string }
+                    verified_only:
+                      type: boolean
+                      default: true
+                      description: >-
+                        When true (default) only human-verified case records are
+                        returned. Unverified LLM extractions are never presented
+                        as established fact.
+      responses:
+        '200':
+          description: Ranked results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/KnowledgeHit'
+
+  /knowledge/documents:
+    post:
+      tags: [knowledge]
+      summary: Ingest a document into the knowledge base
+      operationId: ingestDocument
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                kind: { type: string }
+      responses:
+        '202':
+          description: Accepted for processing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document_id: { type: string, format: uuid }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    ConversationId:
+      name: conversation_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    TurnId:
+      name: turnId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    DateFrom:
+      name: from
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive start date (plant timezone)
+    DateTo:
+      name: to
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive end date (plant timezone)
+    LineFilter:
+      name: line
+      in: query
+      schema: { type: string }
+      description: Line code. Restricted users only see lines in their scope.
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Opaque cursor from the previous page's `next_cursor`
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: |
+        Authenticated but not permitted. For line-scoped resources the rows are
+        never retrieved in the first place — this is not response filtering.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Resource does not exist
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ValidationFailed:
+      description: Request was well-formed but semantically invalid
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ModelUnavailable:
+      description: |
+        The language model is unavailable. Deterministic features (charts,
+        statistics, queues) remain available.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 7807 problem details with a stable machine-readable `code`.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          description: Stable error code — see API-Specification.md §7
+        correlation_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+    Language:
+      type: string
+      enum: [th, ja, en]
+      default: th
+    AskRequest:
+      type: object
+      required: [question]
+      properties:
+        question: { type: string }
+        conversation_id: { type: string, format: uuid }
+        lang:
+          $ref: '#/components/schemas/Language'
+        scope:
+          type: object
+          properties:
+            line: { type: string }
+            date_from: { type: string, format: date }
+            date_to: { type: string, format: date }
+    AskResponse:
+      type: object
+      properties:
+        run_id: { type: string, format: uuid }
+        conversation_id: { type: [string, 'null'], format: uuid }
+        outcome:
+          type: string
+          enum: [ok, partial, refused]
+          description: |
+            `refused` means the data was insufficient and the agent said so
+            rather than speculating. `partial` means a budget was hit.
+        partial_reason: { type: [string, 'null'] }
+        lang:
+          $ref: '#/components/schemas/Language'
+        answer: { type: string }
+        charts:
+          type: array
+          items:
+            type: object
+            properties:
+              kind: { type: string, enum: [trend, pareto, control, histogram] }
+              data: { type: object, additionalProperties: true }
+        sources:
+          type: array
+          description: Every number in `answer` traces to one of these
+          items:
+            $ref: '#/components/schemas/Source'
+        grounding:
+          type: object
+          properties:
+            numbers_found:
+              type: array
+              items: { type: string }
+            all_matched: { type: boolean }
+        latency_ms: { type: integer }
+        model: { type: string }
+    Source:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [tool, document, case, chart]
+        tool: { type: string }
+        args: { type: object, additionalProperties: true }
+        row_count: { type: integer }
+        document_id: { type: string, format: uuid }
+        title: { type: string }
+        page: { type: integer }
+        url: { type: string }
+    AgentRunTrace:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        correlation_id: { type: [string, 'null'] }
+        question: { type: [string, 'null'] }
+        answer: { type: [string, 'null'] }
+        model: { type: string }
+        prompt_version: { type: [string, 'null'] }
+        outcome:
+          type: string
+          enum: [ok, partial, refused, grounding_failed, error, budget_exceeded]
+        facts: { type: [object, 'null'], additionalProperties: true }
+        grounding: { type: [object, 'null'], additionalProperties: true }
+        tokens_in: { type: [integer, 'null'] }
+        tokens_out: { type: [integer, 'null'] }
+        latency_ms: { type: [integer, 'null'] }
+        tool_calls:
+          type: array
+          items:
+            type: object
+            properties:
+              ordinal: { type: integer }
+              tool_name: { type: string }
+              args: { type: object, additionalProperties: true }
+              row_count: { type: [integer, 'null'] }
+              duration_ms: { type: [integer, 'null'] }
+              ok: { type: boolean }
+              error: { type: [string, 'null'] }
+    Tool:
+      type: object
+      properties:
+        name: { type: string }
+        kind: { type: string, enum: [read, write] }
+        risk: { type: string, enum: [low, medium, high] }
+        min_role: { type: string }
+        schema: { type: object, additionalProperties: true }
+        enabled: { type: boolean }
+    KnowledgeHit:
+      type: object
+      properties:
+        kind: { type: string, enum: [case, document_chunk] }
+        case_id: { type: [string, 'null'], format: uuid }
+        document_id: { type: [string, 'null'], format: uuid }
+        title: { type: string }
+        snippet: { type: string }
+        lang:
+          $ref: '#/components/schemas/Language'
+        score: { type: number }
+        verified:
+          type: boolean
+          description: False means LLM-extracted and not human-confirmed
+        outcome: { type: [string, 'null'] }
+        matched_on:
+          type: array
+          items: { type: string }
+          description: Why this result matched — shown to the user
+        source_url: { type: [string, 'null'] }
+
+    # ---- Copilot schemas
+    Intent:
+      type: string
+      enum: [data_lookup, trend_comparison, cause_analysis, document_lookup, image_lookup, how_to]
+      description: FR-04. cause_analysis is delegated to QE-Agent (FR-21).
+    Outcome:
+      type: string
+      enum: [ok, partial, refused, grounding_failed, error, budget_exceeded]
+    ChatRequest:
+      type: object
+      required: [text]
+      properties:
+        text: { type: string, maxLength: 2000 }
+        conversation_id: { type: [string, 'null'], format: uuid, description: "omit to start a new conversation; present for follow-ups (FR-06)" }
+        answer_lang: { $ref: '#/components/schemas/Language' }
+        channel: { type: string, enum: [web, discord, api, embed], default: web }
+        attachments:
+          type: array
+          maxItems: 1
+          items: { type: object, properties: { upload_id: { type: string, format: uuid }, kind: { type: string, enum: [photo] } } }
+    ChatResponse:
+      type: object
+      required: [turn_id, run_id, conversation_id, outcome, lang, answer, sources]
+      properties:
+        turn_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        conversation_id: { type: string, format: uuid }
+        outcome: { $ref: '#/components/schemas/Outcome' }
+        lang: { $ref: '#/components/schemas/Language' }
+        lang_detected: { $ref: '#/components/schemas/Language' }
+        intent: { $ref: '#/components/schemas/Intent' }
+        answer: { type: string, description: "result first, then detail, then sources (FR-13)" }
+        time_range: { $ref: '#/components/schemas/TimeRange' }
+        entities: { type: array, items: { $ref: '#/components/schemas/Entity' } }
+        clarification: { type: [string, 'null'], description: "FR-05 — when present the answer is a question back and the turn waits for /turns/{turnId}/clarify" }
+        charts: { type: array, items: { $ref: '#/components/schemas/Chart' } }
+        images: { type: array, items: { $ref: '#/components/schemas/ImageHit' } }
+        sources: { type: array, items: { $ref: '#/components/schemas/Source' }, description: "FR-15: tool name + parameters, or document title + section/page" }
+        confidence_note: { type: [string, 'null'], description: "FR-16" }
+        partial_reason: { type: [string, 'null'] }
+        delegated: { type: [object, 'null'], properties: { signal_ref: { type: string }, case_ref: { type: string }, url: { type: string } }, description: "FR-21" }
+        masked: { type: boolean, description: "FR-26" }
+        grounding: { $ref: '#/components/schemas/Grounding' }
+        suggestions: { type: array, items: { type: string }, description: "FR-20" }
+        latency_ms: { type: integer }
+        first_token_ms: { type: integer }
+        queue_wait_ms: { type: integer }
+        model: { type: string }
+    StreamEvent:
+      type: object
+      description: "One Server-Sent Event of the IF-53 stream (`event:` name = kind, `data:` = this object)"
+      required: [kind]
+      properties:
+        kind: { type: string, enum: [queue, plan, clarify, tool_call, tool_result, token, chart, image, sources, confidence, done, error] }
+        seq: { type: integer }
+        data: { type: object, additionalProperties: true }
+    Entity:
+      type: object
+      properties:
+        kind: { type: string, enum: [line, machine, sku, defect, mould] }
+        canonical_id: { type: string, format: uuid }
+        alias: { type: string }
+        method: { type: string, enum: [exact, trigram, context, clarified] }
+        in_scope: { type: boolean }
+    TimeRange:
+      type: object
+      properties:
+        expr: { type: [string, 'null'] }
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        resolution: { type: string, description: "relative:yesterday | shift:B | explicit | context" }
+    PlanStep:
+      type: object
+      properties:
+        ordinal: { type: integer }
+        tool: { type: string }
+        kind: { type: string, enum: [tool, retrieve, sql, delegate], default: tool }
+        args: { type: object, additionalProperties: true }
+        after: { type: [integer, 'null'], description: "dependency; independent steps run in parallel" }
+        scope_narrowed_to: { type: array, items: { type: string } }
+    Grounding:
+      type: object
+      properties:
+        numbers_found: { type: array, items: { type: string } }
+        unmatched: { type: array, items: { type: string } }
+        all_matched: { type: boolean }
+    Chart:
+      type: object
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [trend, pareto, control, bar] }
+        facts: { type: array, items: { type: string } }
+        spec: { type: object, additionalProperties: true, description: Vega-Lite }
+        png_url: { type: [string, 'null'] }
+    TurnTrace:
+      type: object
+      properties:
+        turn_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
+        question: { type: string }
+        answer: { type: [string, 'null'] }
+        lang_detected: { $ref: '#/components/schemas/Language' }
+        answer_lang: { $ref: '#/components/schemas/Language' }
+        intent: { $ref: '#/components/schemas/Intent' }
+        entities: { type: array, items: { $ref: '#/components/schemas/Entity' } }
+        time_range: { $ref: '#/components/schemas/TimeRange' }
+        context: { type: object, additionalProperties: true, description: "FR-06 slots reused from the previous turn" }
+        clarification_asked: { type: [string, 'null'] }
+        clarification_reply: { type: [string, 'null'] }
+        plan: { type: array, items: { $ref: '#/components/schemas/PlanStep' } }
+        tool_calls: { type: array, items: { type: object, properties: { ordinal: { type: integer }, tool: { type: string }, args: { type: object, additionalProperties: true }, row_count: { type: [integer, 'null'] }, duration_ms: { type: [integer, 'null'] }, ok: { type: boolean }, digest: { type: [string, 'null'] } } } }
+        evidence_bundle: { type: object, additionalProperties: true, description: "IF-56 — the composer's only input; 'show the numbers' renders facts[]" }
+        bundle_digest: { type: string }
+        sources: { type: array, items: { $ref: '#/components/schemas/Source' } }
+        sql: { type: array, items: { $ref: '#/components/schemas/SqlQuery' } }
+        grounding: { $ref: '#/components/schemas/Grounding' }
+        outcome: { $ref: '#/components/schemas/Outcome' }
+        confidence_note: { type: [string, 'null'] }
+        partial_reason: { type: [string, 'null'] }
+        masked: { type: boolean }
+        delegated: { type: [object, 'null'], additionalProperties: true }
+        mode: { type: string, enum: [full, dashboards_only] }
+        model: { type: string }
+        prompt_version: { type: string }
+        latency_ms: { type: integer }
+        first_token_ms: { type: [integer, 'null'] }
+        queue_wait_ms: { type: integer }
+    TurnSummary:
+      type: object
+      properties:
+        turn_id: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
+        username: { type: [string, 'null'] }
+        lang_detected: { $ref: '#/components/schemas/Language' }
+        intent: { $ref: '#/components/schemas/Intent' }
+        outcome: { $ref: '#/components/schemas/Outcome' }
+        lines: { type: array, items: { type: string } }
+        latency_ms: { type: integer }
+        delegated: { type: boolean }
+        flagged: { type: boolean }
+    ClarifyReply:
+      type: object
+      required: [reply]
+      properties:
+        reply: { type: string, maxLength: 500 }
+    SqlQuery:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        sql_text: { type: string }
+        parser_ok: { type: boolean }
+        whitelist_ok: { type: boolean }
+        reject_reason: { type: [string, 'null'] }
+        limit_applied: { type: integer }
+        timeout_ms: { type: integer }
+        executed_as: { type: string, enum: [copilot_sql_ro] }
+        executed: { type: boolean }
+        row_count: { type: [integer, 'null'] }
+        duration_ms: { type: [integer, 'null'] }
+        result_digest: { type: [string, 'null'] }
+    SqlResult:
+      type: object
+      properties:
+        columns: { type: array, items: { type: string } }
+        rows: { type: array, items: { type: array, items: {} } }
+        row_count: { type: integer }
+        digest: { type: string }
+        matches_stored_digest: { type: boolean }
+    SourceDetail:
+      type: object
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [tool, document, curated, hypothesis, sql, image] }
+        tool: { type: [string, 'null'] }
+        args: { type: [object, 'null'], additionalProperties: true }
+        row_count: { type: [integer, 'null'] }
+        rows_preview: { type: array, items: { type: object, additionalProperties: true }, description: "≤ 50 rows, scope-filtered" }
+        document_id: { type: [string, 'null'], format: uuid }
+        chunk_id: { type: [string, 'null'], format: uuid }
+        title: { type: [string, 'null'] }
+        section: { type: [string, 'null'] }
+        page: { type: [integer, 'null'] }
+        text: { type: [string, 'null'] }
+        signed_url: { type: [string, 'null'], description: "document page or image; expires in 15 min" }
+        case_ref: { type: [string, 'null'] }
+    ShareRequest:
+      type: object
+      required: [format]
+      properties:
+        format: { type: string, enum: [link, png, pdf] }
+        expires_in_days: { type: integer, minimum: 1, maximum: 30, default: 7 }
+    Share:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        turn_id: { type: string, format: uuid }
+        format: { type: string, enum: [link, png, pdf] }
+        url: { type: string }
+        expires_at: { type: string, format: date-time }
+    SharedAnswer:
+      type: object
+      properties:
+        question: { type: string }
+        answer: { type: string }
+        lang: { $ref: '#/components/schemas/Language' }
+        charts: { type: array, items: { $ref: '#/components/schemas/Chart' } }
+        sources: { type: array, items: { $ref: '#/components/schemas/Source' } }
+        created_at: { type: string, format: date-time }
+        shared_by: { type: string }
+        label: { type: string, const: "AI-generated answer — sources attached" }
+    Pin:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        turn_id: { type: string, format: uuid }
+        dashboard: { type: string }
+        position: { type: integer }
+    SavedQuestion:
+      type: object
+      required: [text, lang]
+      properties:
+        id: { type: string, format: uuid }
+        text: { type: string }
+        lang: { $ref: '#/components/schemas/Language' }
+        slots: { type: object, additionalProperties: true }
+        direct_url: { type: [string, 'null'], description: "dashboard link used in dashboards-only mode" }
+    Preferences:
+      type: object
+      properties:
+        answer_lang: { oneOf: [ { $ref: '#/components/schemas/Language' }, { type: 'null' } ], description: "null = answer in the question's language" }
+        show_numbers: { type: boolean, default: false }
+    FeedbackRequest:
+      type: object
+      required: [message_id, rating]
+      properties:
+        message_id: { type: string, format: uuid }
+        rating: { type: integer, enum: [-1, 1] }
+        reason: { type: [string, 'null'], maxLength: 500 }
+    ConversationSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        channel: { type: string }
+        lang: { $ref: '#/components/schemas/Language' }
+        title: { type: [string, 'null'] }
+        started_at: { type: string, format: date-time }
+        turns: { type: integer }
+    ConversationDetail:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        lang: { $ref: '#/components/schemas/Language' }
+        title: { type: [string, 'null'] }
+        messages: { type: array, items: { $ref: '#/components/schemas/Message' } }
+        turns: { type: array, items: { type: object, properties: { turn_id: { type: string, format: uuid }, intent: { $ref: '#/components/schemas/Intent' }, outcome: { $ref: '#/components/schemas/Outcome' }, latency_ms: { type: integer } } } }
+    Message:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        role: { type: string, enum: [user, assistant, system, tool] }
+        content: { type: string }
+        ts: { type: string, format: date-time }
+    ConversationExport:
+      type: object
+      properties:
+        conversation: { $ref: '#/components/schemas/ConversationDetail' }
+        traces: { type: array, items: { $ref: '#/components/schemas/TurnTrace' } }
+        exported_at: { type: string, format: date-time }
+    ImageHit:
+      type: object
+      properties:
+        id: { type: string }
+        inspection_id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        line: { type: string }
+        sku: { type: [string, 'null'] }
+        defect: { type: [string, 'null'] }
+        confidence: { type: [number, 'null'] }
+        signed_url: { type: string }
+        similarity: { type: [number, 'null'] }
+    ImageSearchResult:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ImageHit' } }
+        count: { type: integer }
+        link_ttl_minutes: { type: integer, const: 15 }
+        notes: { type: array, items: { type: string } }
+    DocSource:
+      type: object
+      required: [kind, uri]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [sop, eight_d, fmea, manual, work_instruction, mixed] }
+        uri: { type: string }
+        acl: { type: object, properties: { min_role: { type: string, enum: [viewer, inspector, engineer, manager, admin] } } }
+        watch: { type: boolean, default: true }
+        scan_interval_s: { type: integer, minimum: 60, maximum: 86400, default: 300 }
+        last_scan_at: { type: [string, 'null'], format: date-time }
+        status: { type: [object, 'null'], properties: { jobs: { type: integer }, done: { type: integer }, failed: { type: integer }, skipped: { type: integer }, suspicious_chunks: { type: integer } } }
+    IndexJob:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        source_id: { type: [string, 'null'], format: uuid }
+        document_id: { type: [string, 'null'], format: uuid }
+        uri: { type: string }
+        sha256: { type: string }
+        state: { type: string, enum: [queued, running, done, failed, skipped] }
+        reason: { type: string, enum: [new, changed, manual, reembed] }
+        chunks: { type: [integer, 'null'] }
+        error: { type: [string, 'null'] }
+    AnswerFlag:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        turn_id: { type: string, format: uuid }
+        reason: { type: string }
+        status: { type: string, enum: [open, corrected, dismissed] }
+        flagged_by: { type: [string, 'null'] }
+        reviewed_by: { type: [string, 'null'] }
+        curated_qa_id: { type: [string, 'null'], format: uuid }
+        created_at: { type: string, format: date-time }
+    FlagReview:
+      type: object
+      required: [decision]
+      properties:
+        decision: { type: string, enum: [dismiss, correct] }
+        corrected_answer: { type: [string, 'null'], description: "required for correct — becomes a curated answer" }
+        sources: { type: array, items: { $ref: '#/components/schemas/Source' } }
+    CuratedQa:
+      type: object
+      required: [question, answer, lang]
+      properties:
+        id: { type: string, format: uuid }
+        question: { type: string }
+        answer: { type: string }
+        lang: { $ref: '#/components/schemas/Language' }
+        sources: { type: array, items: { $ref: '#/components/schemas/Source' } }
+        author: { type: [string, 'null'] }
+        approved_by: { type: [string, 'null'] }
+        approved_at: { type: [string, 'null'], format: date-time }
+        active: { type: boolean }
+    EvalQuestion:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ordinal: { type: integer }
+        lang: { $ref: '#/components/schemas/Language' }
+        intent: { $ref: '#/components/schemas/Intent' }
+        question: { type: string }
+        expected: { type: object, additionalProperties: true }
+    EvalRun:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ran_at: { type: string, format: date-time }
+        model: { type: string }
+        prompt_version: { type: string }
+        embedding_version: { type: string }
+        tool_schema_version: { type: string }
+        questions: { type: integer }
+        correct: { type: integer }
+        citations_correct: { type: integer }
+        fabricated: { type: integer }
+        langs_covered: { type: integer }
+        intents_covered: { type: integer }
+        accuracy: { type: [number, 'null'] }
+        citation_rate: { type: [number, 'null'] }
+        passed: { type: [boolean, 'null'], description: "computed: ≥ 60 questions, 3 languages, 6 intents, accuracy ≥ 0.90, citation ≥ 0.95, fabricated = 0" }
+        release_blocked: { type: [boolean, 'null'] }
+    EvalRunDetail:
+      allOf:
+        - { $ref: '#/components/schemas/EvalRun' }
+        - type: object
+          properties:
+            results: { type: array, items: { type: object, properties: { question_id: { type: string, format: uuid }, run_id: { type: [string, 'null'], format: uuid }, correct: { type: boolean }, citation_correct: { type: boolean }, fabricated_numbers: { type: integer }, latency_ms: { type: [integer, 'null'] } } } }
+    SqlEvalRun:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ran_at: { type: string, format: date-time }
+        model: { type: string }
+        prompt_version: { type: string }
+        questions: { type: integer }
+        correct: { type: integer }
+        accuracy: { type: [number, 'null'] }
+        passed: { type: [boolean, 'null'], description: "computed: ≥ 30 questions and accuracy ≥ 0.85" }
+    EntityAlias:
+      type: object
+      required: [kind, canonical_id, alias]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [line, machine, sku, defect, mould] }
+        canonical_id: { type: string, format: uuid }
+        alias: { type: string }
+        lang: { oneOf: [ { $ref: '#/components/schemas/Language' }, { type: 'null' } ] }
+    GlossaryTerm:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ja: { type: string }
+        ja_reading: { type: [string, 'null'] }
+        th: { type: [string, 'null'] }
+        en: { type: [string, 'null'] }
+        domain: { type: [string, 'null'] }
+        forbidden: { type: array, items: { type: string } }
+    TermCheck:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        term_id: { type: [string, 'null'], format: uuid }
+        found: { type: string }
+        expected: { type: string }
+        position: { type: [integer, 'null'] }
+        resolved: { type: boolean }
+    MaskingRule:
+      type: object
+      required: [field_kind, min_role_unmasked]
+      properties:
+        id: { type: string, format: uuid }
+        field_kind: { type: string, enum: [operator_name, employee_id, email, phone] }
+        min_role_unmasked: { type: string, enum: [inspector, engineer, manager, admin] }
+        replacement: { type: string, default: "***" }
+        active: { type: boolean, default: true }
+    ChannelBinding:
+      type: object
+      required: [channel, external_user_id, user_id]
+      properties:
+        id: { type: string, format: uuid }
+        channel: { type: string, enum: [discord, line, embed] }
+        external_user_id: { type: string }
+        user_id: { type: string, format: uuid }
+        verified_at: { type: [string, 'null'], format: date-time }
+        allowed_channels: { type: array, items: { type: string } }
+    ToolPolicy:
+      type: object
+      properties:
+        name: { type: string }
+        provider: { type: string, enum: [platform, shiftbrief, machinesense, qe_agent, genba_memory, vision, copilot] }
+        kind: { type: string, enum: [read], description: "write tools are never exposed (C-01)" }
+        enabled: { type: boolean }
+        min_role: { type: string, enum: [viewer, inspector, engineer, manager, admin] }
+        scope_param: { type: string, default: lines }
+        max_rows: { type: integer }
+        timeout_ms: { type: integer, maximum: 10000 }
+        intents: { type: array, items: { $ref: '#/components/schemas/Intent' } }
+        schema: { type: object, additionalProperties: true }
+    FeatureFlag:
+      type: object
+      properties:
+        key: { type: string, enum: [text_to_sql, discord, external_model, image_similarity] }
+        enabled: { type: boolean }
+        enabled_by: { type: [string, 'null'] }
+        enabled_at: { type: [string, 'null'], format: date-time }
+        reason: { type: [string, 'null'] }
+        gate: { type: [object, 'null'], additionalProperties: true, description: "for text_to_sql: the latest SQL evaluation run" }
+    Config:
+      type: object
+      description: The deploy/copilot.yaml document (schemas/copilot-config.schema.json)
+      additionalProperties: true
+      properties:
+        version: { type: string }
+    QueueStatus:
+      type: object
+      properties:
+        ts: { type: string, format: date-time }
+        depth: { type: integer }
+        max_wait_ms: { type: integer }
+        gpu_wait_ms: { type: [integer, 'null'] }
+        mode: { type: string, enum: [full, dashboards_only] }
+        my_position: { type: [integer, 'null'] }
+    Readiness:
+      type: object
+      properties:
+        ready: { type: boolean }
+        mode: { type: string, enum: [full, dashboards_only] }
+        model: { type: [string, 'null'] }
+        checks: { type: object, additionalProperties: { type: string } }
+    DegradedProblem:
+      allOf:
+        - { $ref: '#/components/schemas/Problem' }
+        - type: object
+          properties:
+            mode: { type: string, const: dashboards_only }
+            links: { type: array, items: { type: object, properties: { label: { type: string }, url: { type: string } } }, description: "dashboards, saved questions, document search (NFR-06)" }
