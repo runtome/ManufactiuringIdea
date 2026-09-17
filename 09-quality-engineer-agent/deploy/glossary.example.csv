@@ -1,0 +1,13 @@
+domain,ja,ja_reading,th,en,forbidden
+quality,不良率,ふりょうりつ,อัตราของเสีย,defect rate,欠陥率
+quality,是正処置,ぜせいしょち,การแก้ไข,corrective action,修正措置|修正処置
+quality,水平展開,すいへいてんかい,การขยายผล,horizontal deployment,横展開
+quality,現象,げんしょう,ปรากฏการณ์,phenomenon (what was observed),事象
+quality,原因,げんいん,สาเหตุ,cause,
+quality,対策,たいさく,มาตรการ,countermeasure,
+quality,効果確認,こうかかくにん,การยืนยันผล,effectiveness verification,効果検証
+quality,管理限界,かんりげんかい,ขีดจำกัดควบคุม,control limit,制御限界
+quality,工程能力,こうていのうりょく,ความสามารถของกระบวนการ,process capability,プロセス能力
+quality,暫定処置,ざんていしょち,มาตรการชั่วคราว,containment action,応急処置
+quality,再発防止,さいはつぼうし,การป้องกันการเกิดซ้ำ,recurrence prevention,
+quality,要検証,ようけんしょう,ต้องตรวจสอบ,to be verified,未確認

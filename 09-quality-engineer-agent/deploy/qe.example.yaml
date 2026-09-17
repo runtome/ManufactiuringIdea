@@ -1,0 +1,165 @@
+# QE-Agent configuration — deploy/qe.example.yaml
+# Loaded with:  qectl config load qe.yaml   (admin; PUT /config; validated against schemas/qe-config.schema.json)
+# Every analysis run, draft and approval made after a load carries the version (quality.analysis_run.config_version).
+# These are the values the seed was computed with (DDS-09 §9): ranking weights .35/.25/.20/.20, min sample 50,
+# baselines 7/30 days, Nelson rules {1,2,3,5,6}, AIAG-VDA AP, temperature 0.2.
+
+version: "2026-09"
+
+spc:                                   # FR-01 … FR-06
+  constants_table: montgomery          # A2/D3/D4/d2 source (n = 2 … 25); the engine and the SQL twin use the same table
+  default_rules: [1, 2, 3, 5, 6]       # FR-02 — the minimum set {1,2,3,5,6} may be extended (4, 7, 8), never reduced
+  rule_parameters:
+    rule2_run_length: 9
+    rule3_trend_length: 6
+    rule5_two_of_three: true
+    rule6_four_of_five: true
+  baseline:
+    default_days: 30                   # window used when limits are (re)calculated
+    min_subgroups: 25                  # Montgomery's recommendation; fewer → limits are marked provisional
+  limits:
+    reason_required: true              # FR-06 — constant
+    keep_history: true                 # constant
+  subgroup_rules:                      # FR-03 — per characteristic override in the UI; defaults by chart type
+    xbar_r: { kind: fixed_n, n: 5 }
+    x_mr:   { kind: fixed_n, n: 1 }
+    p:      { kind: time_window, minutes: 60 }
+    c:      { kind: batch }
+
+capability:                            # FR-04, FR-05, C-03
+  normality_test: anderson_darling     # constant
+  alpha: 0.05
+  min_n: 100                           # below: indices reported as provisional with the n printed
+  non_normal:
+    suppress_cp_cpk: true              # C-03 / AC-03 — constant
+    methods: [box_cox, johnson, percentile_ppk]
+    recommend: box_cox
+  print_context_in_exports: true       # n, period, subgroup rule, normality — constant
+
+signals:                               # FR-08 … FR-12
+  baselines_days: [7, 30]
+  test: two_proportion_z               # with continuity correction
+  small_count_test: fisher_exact       # when any expected cell < 5
+  alpha: 0.001
+  change_point:
+    methods: [cusum, binary_segmentation]
+    window_minutes: 40                 # reported ± window
+  min_sample: 50                       # FR-11 — signals with n < min_sample are suppressed (seed: S-242, n 25)
+  trial_run_suppression: true          # FR-11 — declared trial runs suppress signals on their line/window
+  ranking:                             # FR-10 — weights sum to 1
+    weights: { impact: 0.35, criticality: 0.25, volume: 0.20, slope: 0.20 }
+    defect_criticality:                # per defect class, 0–1
+      SCR: 0.8
+      FLS: 0.5
+      DIM: 0.9
+      CRK: 1.0
+  auto_case:
+    open_for: [HIGH, CRITICAL]         # FR-12
+    notify_owner: true
+    default_owner_role: engineer
+
+correlation:                           # FR-13 … FR-18
+  factors: [material_lot, machine, mould, shift, operator_group, sku, parameter_change, ambient]
+  window_days: 30
+  tests:
+    categorical: chi_square            # → fisher_exact when expected < 5
+    two_group: two_proportion
+  multiple_comparison: benjamini_hochberg
+  effect_size_required: true           # FR-14 — constant
+  meaningful:
+    p_adjusted_max: 0.05
+    risk_ratio_min: 1.5
+  timeline_kinds: [lot_change, maintenance, tool_change, parameter_edit, personnel_change, environment, alarm]
+  retrieval:                           # FR-16, AI-02
+    embedding_model: bge-m3            # multilingual TH/JA/EN
+    hybrid: { bm25_weight: 0.4, vector_weight: 0.6, rerank: true, top_k: 5 }
+    min_similarity: 0.60
+  hypotheses:
+    max: 5
+    contra_required: true              # FR-17 — constant
+    verify_step_required: true         # FR-17 — constant
+    causal_language_only_when_confirmed: true   # C-04 — constant
+
+drafting:                              # FR-19 … FR-26, AI-01, AI-03, AI-04
+  model:
+    name: qwen2.5:7b-instruct
+    parameters_b: 7                    # AI-03 — ≤ 9
+    temperature: 0.2                   # AI-03 — ≤ 0.3
+    num_ctx: 8192
+    timeout_s: 90                      # NFR-03
+  prompts:                             # AI-03 — versioned in git; checksum verified at load
+    - { kind: five_why, lang: en, version: v1, path: prompts/five_why.en.v1.md }
+    - { kind: eight_d,  lang: en, version: v1, path: prompts/eight_d.en.v1.md }
+    - { kind: fmea,     lang: en, version: v1, path: prompts/fmea.en.v1.md }
+    - { kind: report,   lang: ja, version: v1, path: prompts/report.ja.v1.md }
+  facts_schema: schemas/facts-object.schema.json   # IF-51
+  evidence_policy:
+    numbers_only_from_evidence: true   # AI-04 — constant
+    block_approval_on_untraced: true   # AC-05 — constant
+    similar_case_summary_max_chars: 200
+  term_check:                          # AI-06, IF-52
+    enabled: true
+    languages: [ja, th]
+    block_approval_on_violation: true
+
+fmea:                                  # FR-21, C-05, AI-07
+  standard: aiag_vda_ap                # aiag_vda_ap | classic_rpn
+  criteria_table: aiag_vda_2019        # 30 rows: S1–10, O1–10, D1–10 (seed: quality.sod_criteria)
+  ap_table:                            # AP lookups used by the engine for the seed (S-O-D → AP); the full table ships with the criteria set
+    "7-4-5": M
+    "8-5-6": H
+    "7-4-2": L
+    "9-6-7": H
+    "5-3-4": L
+  require_rating_confirmation: true    # AI-07 — constant
+  ocap_suggestions: true               # FR-22
+
+export:                                # FR-25, FR-26, C-01, NFR-06, IF-50
+  formats: [docx, xlsx, pdf]
+  templates_dir: templates
+  watermark:
+    draft_text: "DRAFT — AI generated" # C-01 — constant
+    every_page: true                   # AC-06 — constant
+  version_stamp: true                  # NFR-06 — constant
+  signed_url_ttl_s: 900
+  japanese_report_sections: [現象, 原因, 対策, 効果確認, 水平展開]   # FR-26
+
+glossary:                              # AI-06
+  source: glossary.example.csv
+  domains: [quality]
+
+cases:                                 # FR-27 … FR-31
+  effectiveness:
+    test: two_proportion_z
+    alpha: 0.05
+    min_after_n: 500
+  closure:
+    require_all_actions_verified_or_cancelled: true   # constant
+    require_note: true
+    index_to_knowledge: true           # FR-29
+    horizontal_candidates: true        # FR-30
+  escalation:                          # FR-31
+    overdue_days: [1, 7]
+    notify: [owner, manager]
+
+golden:                                # AI-05, AC-04
+  bucket_prefix: golden
+  min_incidents: 20
+  top3_rate_min: 0.60
+  fabricated_max: 0
+  run_on: [prompt_change, model_change, ranking_change, facts_schema_change]
+
+notifications:                         # IF-08 / IF-13
+  channels: [discord, email]
+  content: statistics_and_links_only   # SEC-Q41 — constant
+  quiet_hours: { start: "22:00", end: "06:00", except: [CRITICAL] }
+
+retention:
+  measurements_years: 3
+  cases_years: 10
+  exports_years: 10
+  golden_runs_years: 5
+
+locale:
+  default: th
+  supported: [th, ja, en]              # NFR-09

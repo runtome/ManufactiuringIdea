@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qe.example/schemas/facts-object.schema.json",
+  "title": "QE-Agent facts object (ICD-09 IF-51)",
+  "description": "What the drafting model receives — and nothing else (SRS-09 C-02, AI-01, AI-04; SAD-09 ADR-Q02). Every number is a `Fact` carrying the evidence code it came from; the prompt forbids numbers not present here; the claim extractor traces the output back to these codes. No free text from documents or timelines is included beyond the fields below.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "case", "signal", "evidence", "hypotheses", "language", "wording_rules"],
+  "properties": {
+    "schema_version": { "const": "facts.v1" },
+    "case": {
+      "type": "object", "additionalProperties": false, "required": ["id", "title", "line", "sku", "severity", "opened_at"],
+      "properties": {
+        "id": { "type": "string" }, "title": { "type": "string", "maxLength": 200 }, "line": { "type": "string" }, "sku": { "type": "string" },
+        "machine": { "type": "string" }, "severity": { "type": "string", "enum": ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"] }, "opened_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "signal": {
+      "type": "object", "additionalProperties": false, "required": ["defect", "rate_now", "rate_baseline", "n_now", "n_baseline", "test", "p_value", "change_point"],
+      "properties": {
+        "defect": { "type": "string" },
+        "rate_now": { "$ref": "#/$defs/fact" }, "rate_baseline": { "$ref": "#/$defs/fact" },
+        "n_now": { "$ref": "#/$defs/fact" }, "n_baseline": { "$ref": "#/$defs/fact" },
+        "test": { "type": "string", "enum": ["two_proportion_z", "fisher_exact"] },
+        "p_value": { "$ref": "#/$defs/fact" },
+        "change_point": { "type": "object", "additionalProperties": false, "required": ["ts", "window_minutes", "evidence"], "properties": { "ts": { "type": "string", "format": "date-time" }, "window_minutes": { "type": "integer", "minimum": 0 }, "evidence": { "$ref": "#/$defs/code" } } }
+      }
+    },
+    "capability": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["characteristic", "n", "period_from", "period_to", "normality_ok", "evidence"],
+        "description": "C-03: an index never travels without n, period and normality; when normality_ok is false, cp/cpk are absent and method_note is required",
+        "properties": {
+          "characteristic": { "type": "string" }, "n": { "type": "integer", "minimum": 1 }, "period_from": { "type": "string", "format": "date-time" }, "period_to": { "type": "string", "format": "date-time" },
+          "normality_ok": { "type": "boolean" }, "normality_p": { "type": "number" }, "cp": { "type": "number" }, "cpk": { "type": "number" }, "pp": { "type": "number" }, "ppk": { "type": "number" },
+          "method_note": { "type": "string" }, "evidence": { "$ref": "#/$defs/code" }
+        },
+        "if": { "properties": { "normality_ok": { "const": false } } },
+        "then": { "required": ["method_note"], "not": { "anyOf": [{ "required": ["cpk"] }, { "required": ["cp"] }] } }
+      }
+    },
+    "correlations": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["factor", "test", "p_value", "p_adjusted", "effect_measure", "effect_size", "n", "meaningful", "evidence"],
+        "description": "FR-14: significance never without effect size and the adjusted p",
+        "properties": {
+          "factor": { "type": "string", "enum": ["material_lot", "machine", "mould", "shift", "operator_group", "sku", "parameter_change", "ambient"] }, "level": { "type": "string" },
+          "test": { "type": "string", "enum": ["chi_square", "fisher_exact", "two_proportion", "rate_ratio"] },
+          "p_value": { "type": "number", "minimum": 0, "maximum": 1 }, "p_adjusted": { "type": "number", "minimum": 0, "maximum": 1 },
+          "effect_measure": { "type": "string", "enum": ["risk_ratio", "rate_ratio", "cramers_v", "odds_ratio"] }, "effect_size": { "type": "number" },
+          "ci_low": { "type": "number" }, "ci_high": { "type": "number" }, "n": { "type": "integer", "minimum": 1 }, "meaningful": { "type": "boolean" }, "evidence": { "$ref": "#/$defs/code" }
+        }
+      }
+    },
+    "multiple_comparison": {
+      "type": "object", "additionalProperties": false, "required": ["method", "tests", "warning"],
+      "properties": { "method": { "const": "benjamini_hochberg" }, "tests": { "type": "integer", "minimum": 1 }, "warning": { "type": "string" } }
+    },
+    "no_meaningful_association": { "type": "array", "items": { "type": "string" }, "description": "FR-18 — the model must state these explicitly" },
+    "timeline": {
+      "type": "array",
+      "items": { "type": "object", "additionalProperties": false, "required": ["ts", "kind", "evidence"], "properties": { "ts": { "type": "string", "format": "date-time" }, "kind": { "type": "string" }, "summary": { "type": "string", "maxLength": 120 }, "evidence": { "$ref": "#/$defs/code" } } }
+    },
+    "hypotheses": {
+      "type": "array", "minItems": 0,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["rank", "statement", "score", "status", "supporting", "contra", "verify_step"],
+        "properties": {
+          "rank": { "type": "integer", "minimum": 1 }, "statement": { "type": "string", "maxLength": 300 }, "score": { "type": "number", "minimum": 0, "maximum": 1 },
+          "status": { "type": "string", "enum": ["proposed", "verifying", "confirmed", "rejected"] },
+          "supporting": { "type": "array", "items": { "$ref": "#/$defs/code" } }, "contra": { "type": "array", "items": { "$ref": "#/$defs/code" } },
+          "verify_step": { "type": "string", "maxLength": 300 }, "verify_result": { "type": "string", "maxLength": 300 }
+        }
+      }
+    },
+    "similar_cases": {
+      "type": "array",
+      "items": { "type": "object", "additionalProperties": false, "required": ["ref", "summary", "outcome", "evidence"], "properties": { "ref": { "type": "string" }, "date": { "type": "string" }, "summary": { "type": "string", "maxLength": 200 }, "outcome": { "type": "string", "enum": ["confirmed", "resolved", "not_resolved", "unknown"] }, "similarity": { "type": "number" }, "evidence": { "$ref": "#/$defs/code" } } }
+    },
+    "evidence": {
+      "type": "array", "minItems": 1,
+      "items": { "type": "object", "additionalProperties": false, "required": ["code", "kind", "value", "digest"], "properties": { "code": { "$ref": "#/$defs/code" }, "kind": { "type": "string", "enum": ["query", "chart", "test", "change_point", "correlation", "capability", "limits", "timeline", "case", "doc_chunk"] }, "value": { "type": "object", "additionalProperties": true }, "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" } } }
+    },
+    "language": { "type": "string", "enum": ["th", "ja", "en"] },
+    "wording_rules": {
+      "type": "object", "additionalProperties": false, "required": ["causal_language_only_for", "numbers_only_from_evidence", "mark_as_draft"],
+      "properties": {
+        "causal_language_only_for": { "type": "string", "const": "hypotheses with status confirmed" },
+        "numbers_only_from_evidence": { "type": "boolean", "const": true },
+        "mark_as_draft": { "type": "string", "const": "DRAFT — AI generated" },
+        "glossary": { "type": "array", "items": { "type": "object", "properties": { "en": { "type": "string" }, "ja": { "type": "string" }, "th": { "type": "string" }, "forbidden": { "type": "array", "items": { "type": "string" } } } } }
+      }
+    }
+  },
+  "$defs": {
+    "code": { "type": "string", "pattern": "^E-\\d{2,3}$" },
+    "fact": {
+      "type": "object", "additionalProperties": false, "required": ["value", "evidence"],
+      "description": "A number the model may quote, with the evidence code it must cite",
+      "properties": { "value": { "type": "number" }, "unit": { "type": "string" }, "evidence": { "$ref": "#/$defs/code" } }
+    }
+  }
+}

@@ -1,0 +1,1429 @@
+openapi: 3.1.0
+info:
+  title: QE-Agent API
+  version: 1.0.0
+  summary: SPC and capability by code, signals and correlations with effect sizes, ranked hypotheses with evidence, drafts a named engineer owns.
+  description: |
+    **Scope.** The QE-Agent API — standalone, and the `quality` module of FactoryBrain in platform mode.
+    SRS-09 §4.1's eight paths are kept verbatim under `/api/v1`. The platform's nine quality/knowledge paths
+    (`/spc/chart`, `/spc/capability`, `/signals`, `/cases`, `/cases/{caseId}`, `/cases/{caseId}/analyze`,
+    `/cases/{caseId}/artifacts/{kind}`, `/artifacts/{artifactId}/approve`, `/knowledge/search`) and their
+    components are copied byte-for-byte from API-00 and diffed by TEST-09 TC-008; in platform mode they are served
+    by the gateway.
+
+    **Four contracts (API-Specification.md §3–§6):**
+    - **Evidence** — every value the model may write comes from the case's evidence registry; a draft's claims are
+      traced sentence by sentence; an artefact with an untraced number or an unconfirmed causal claim cannot be
+      approved (`409 GROUNDING_FAILED`).
+    - **Hypothesis** — a ranked list with score, supporting and contradicting evidence and a verification step;
+      wording is "hypothesis to verify" until an engineer confirms it (`422 CAUSAL_WORDING` otherwise).
+    - **Approval & export** — approval needs role ≥ engineer, is immutable and audited; an unapproved artefact
+      exports only with the `DRAFT — AI generated` watermark; every export carries version and approver.
+    - **Statistics** — every capability index carries n, period and normality; every p-value carries an effect size
+      and the multiple-comparison correction; limits carry their baseline and reason.
+
+    Errors are RFC 7807 `application/problem+json` with a stable `code`.
+  contact: { name: Suphot N. }
+  license: { name: Proprietary }
+  x-document-id: API-09-QEAgent
+
+servers:
+  - url: https://qe.plant.local/api/v1
+    description: Standalone
+  - url: https://factorybrain.plant.local/api/v1
+    description: Platform mode (the platform's nine paths are served by the gateway)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - { name: spc,        description: "Characteristics, subgroups, limits, charts, violations, capability" }
+  - { name: signals,    description: "Ranked signals, change points, trial runs" }
+  - { name: cases,      description: "Cases, analysis, evidence, correlations, hypotheses" }
+  - { name: artifacts,  description: "Drafts, claims, revisions, approval, exports, term checks" }
+  - { name: fmea,       description: "FMEA proposals with S/O/D confirmation; OCAP suggestions" }
+  - { name: actions,    description: "Actions, effectiveness, closure, horizontal deployment" }
+  - { name: governance, description: "Golden set, prompts, glossary, configuration" }
+  - { name: quality,    description: "Platform-mode paths (identical to API-00)" }
+  - { name: knowledge,  description: "Platform-mode retrieval (identical to API-00)" }
+  - { name: system,     description: "Health and metrics" }
+
+paths:
+  # ------------------------------------------------------------------ SRS-09 §4.1 (verbatim paths; the platform spellings follow below)
+  /capability:
+    get:
+      tags: [spc]
+      summary: Cp/Cpk + normality (SRS §4.1) — same payload as the platform's /spc/capability; indices never without n, period and normality
+      operationId: getCapabilitySrs
+      parameters:
+        - { name: char, in: query, required: true, schema: { type: string } }
+        - { name: line, in: query, schema: { type: string } }
+        - { name: period, in: query, description: "e.g. 30d or from/to ISO", schema: { type: string } }
+      responses:
+        '200': { description: Capability with normality assessment, content: { application/json: { schema: { $ref: '#/components/schemas/CapabilityDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /cases/{id}/draft/{artifact}:
+    post:
+      tags: [artifacts]
+      summary: Draft 5why | 8d | fmea | report (SRS §4.1) — facts object → model → claims traced; always a DRAFT
+      operationId: draftCaseArtifact
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { name: artifact, in: path, required: true, schema: { type: string, enum: [5why, 8d, fmea, report, ocap] } }
+        - { name: lang, in: query, schema: { $ref: '#/components/schemas/Language' } }
+      responses:
+        '201': { description: "Draft created with its claim trace; grounding_status may be failed (untraced claims listed)", content: { application/json: { schema: { $ref: '#/components/schemas/ArtifactDetail' } } } }
+        '409': { description: "NO_ANALYSIS — run /analyze first", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '503': { $ref: '#/components/responses/ModelUnavailable' }
+
+  /cases/{id}/approve:
+    post:
+      tags: [artifacts]
+      summary: Engineer approval (SRS §4.1) — approves the case's listed draft artefacts; each must have passed grounding and term checks
+      operationId: approveCaseArtifacts
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { artifact_ids: { type: array, items: { type: string, format: uuid }, description: "default: every draft of the case whose grounding passed" }, note: { type: string, maxLength: 500 } } }
+      responses:
+        '200': { description: Per-artefact results, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ApprovalResult' } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ------------------------------------------------------------------ SPC
+  /characteristics:
+    get:
+      tags: [spc]
+      summary: Characteristics with chart type, subgroup rule, active limits and enabled Nelson rules
+      operationId: listCharacteristics
+      parameters: [ { name: sku, in: query, schema: { type: string } }, { $ref: '#/components/parameters/LineFilter' } ]
+      responses:
+        '200': { description: Characteristics, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Characteristic' } } } } }
+    post:
+      tags: [spc]
+      summary: Create a characteristic (admin/engineer)
+      operationId: createCharacteristic
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CharacteristicCreate' }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Characteristic' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /characteristics/{id}/limits:
+    get:
+      tags: [spc]
+      summary: Control-limit history — every row with baseline, sample size, reason and author (FR-06)
+      operationId: listLimits
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200': { description: History, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ControlLimits' } } } } }
+    post:
+      tags: [spc]
+      summary: Recalculate limits from a baseline period — a reason is mandatory; the previous row is kept and deactivated
+      operationId: recalculateLimits
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LimitsRecalcRequest' }
+      responses:
+        '201': { description: New active limits, content: { application/json: { schema: { $ref: '#/components/schemas/ControlLimits' } } } }
+        '422': { description: "REASON_REQUIRED or baseline too small", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /characteristics/{id}/rules:
+    put:
+      tags: [spc]
+      summary: Enabled Nelson rules (rules 1, 2, 3, 5, 6 cannot be disabled — FR-02)
+      operationId: setRules
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [enabled_rules], properties: { enabled_rules: { type: array, items: { type: integer, minimum: 1, maximum: 8 }, minItems: 5 } } }
+      responses:
+        '200': { description: Updated }
+        '422': { description: RULES_MINIMUM_SET, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /spc/violations:
+    get:
+      tags: [spc]
+      summary: Rule violations with rule id and the points involved (FR-02)
+      operationId: listViolations
+      parameters:
+        - { name: char, in: query, schema: { type: string } }
+        - { $ref: '#/components/parameters/LineFilter' }
+        - { $ref: '#/components/parameters/DateFrom' }
+        - { $ref: '#/components/parameters/DateTo' }
+      responses:
+        '200': { description: Violations, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Violation' } } } } }
+  /spc/chart/export:
+    get:
+      tags: [spc]
+      summary: Chart as PNG or CSV for reports (FR-07) — signed URL
+      operationId: exportChart
+      parameters:
+        - { name: char, in: query, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/LineFilter' }
+        - { $ref: '#/components/parameters/DateFrom' }
+        - { $ref: '#/components/parameters/DateTo' }
+        - { name: format, in: query, schema: { type: string, enum: [png, csv], default: png } }
+        - { name: lang, in: query, schema: { $ref: '#/components/schemas/Language' } }
+      responses:
+        '200': { description: Signed URL, content: { application/json: { schema: { type: object, properties: { url: { type: string, format: uri }, expires_at: { type: string, format: date-time } } } } } }
+
+  # ------------------------------------------------------------------ signals
+  /signals/{id}:
+    get:
+      tags: [signals]
+      summary: One signal with its statistic, rank components, change point and suppression reason
+      operationId: getSignal
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200': { description: Signal, content: { application/json: { schema: { $ref: '#/components/schemas/SignalDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /signals/{id}/triage:
+    post:
+      tags: [signals]
+      summary: Triage — open a case, dismiss with a reason, or snooze
+      operationId: triageSignal
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [action], properties: { action: { type: string, enum: [open_case, dismiss, snooze] }, reason: { type: string }, owner_id: { type: string, format: uuid } } }
+      responses:
+        '200': { description: Result, content: { application/json: { schema: { $ref: '#/components/schemas/SignalDetail' } } } }
+  /trial-runs:
+    post:
+      tags: [signals]
+      summary: Declare a trial run — signals inside the window are suppressed with a reason (FR-11)
+      operationId: declareTrialRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TrialRun' }
+      responses:
+        '201': { description: Declared, content: { application/json: { schema: { $ref: '#/components/schemas/TrialRun' } } } }
+
+  # ------------------------------------------------------------------ cases (QE additions)
+  /cases/{id}/evidence:
+    get:
+      tags: [cases]
+      summary: The evidence registry of the case — every value an artefact may quote, with digest (FR-23, AI-04)
+      operationId: listEvidence
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200': { description: Evidence, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Evidence' } } } } }
+  /cases/{id}/correlations:
+    get:
+      tags: [cases]
+      summary: Factor tests with statistic, p, BH-adjusted p, effect size and CI, n, and the "no meaningful association" list (FR-13, FR-14, FR-18)
+      operationId: listCorrelations
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200': { description: Tests, content: { application/json: { schema: { $ref: '#/components/schemas/CorrelationReport' } } } }
+  /cases/{id}/timeline:
+    get:
+      tags: [cases]
+      summary: Events around the change point — lot change, maintenance, tool change, parameter edit, personnel, environment (FR-15)
+      operationId: caseTimeline
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200': { description: Events, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/TimelineEvent' } } } } }
+  /cases/{id}/hypotheses:
+    get:
+      tags: [cases]
+      summary: Ranked hypotheses with supporting, contradicting and verification evidence (FR-17) — the Appendix A shape
+      operationId: listHypotheses
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200': { description: Hypotheses, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/HypothesisDetail' } } } } }
+  /hypotheses/{id}/verify:
+    post:
+      tags: [cases]
+      summary: Record the verification result — confirm or reject (C-04); only a confirmed hypothesis may be cited causally
+      operationId: verifyHypothesis
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [result, note], properties: { result: { type: string, enum: [confirmed, rejected] }, note: { type: string, minLength: 5, maxLength: 1000 }, evidence_refs: { type: array, items: { type: string } } } }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/HypothesisDetail' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /cases/{id}/similar:
+    get:
+      tags: [cases]
+      summary: Similar past cases ranked by similarity × outcome (FR-16)
+      operationId: similarCases
+      parameters: [ { $ref: '#/components/parameters/Id' }, { name: top_k, in: query, schema: { type: integer, default: 5, maximum: 20 } } ]
+      responses:
+        '200': { description: Cases, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/KnowledgeHit' } } } } }
+
+  # ------------------------------------------------------------------ artefacts
+  /artifacts/{id}:
+    get:
+      tags: [artifacts]
+      summary: Artefact with content, claim trace, grounding status, term checks, revisions and export history
+      operationId: getArtifact
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200': { description: Artefact, content: { application/json: { schema: { $ref: '#/components/schemas/ArtifactDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /artifacts/{id}/revisions:
+    post:
+      tags: [artifacts]
+      summary: Save an engineer's edit as a new revision with the diff against the AI version (FR-24); claims are re-extracted
+      operationId: reviseArtifact
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [content], properties: { content: { type: object, additionalProperties: true }, note: { type: string } } }
+      responses:
+        '201': { description: Revision stored, content: { application/json: { schema: { $ref: '#/components/schemas/ArtifactDetail' } } } }
+        '409': { description: "APPROVAL_IMMUTABLE — approved artefacts are versioned, not edited", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /artifacts/{id}/diff:
+    get:
+      tags: [artifacts]
+      summary: "Diff between two revisions (default: current vs the AI version)"
+      operationId: artifactDiff
+      parameters: [ { $ref: '#/components/parameters/Id' }, { name: from, in: query, schema: { type: integer, default: 1 } }, { name: to, in: query, schema: { type: integer } } ]
+      responses:
+        '200': { description: Diff, content: { application/json: { schema: { type: array, items: { type: object, properties: { path: { type: string }, op: { type: string }, from: {}, to: {} } } } } } }
+  /artifacts/{id}/export:
+    post:
+      tags: [artifacts]
+      summary: Export DOCX/XLSX/PDF from the company template — DRAFT watermark unless approved; version and approver stamped (FR-25, NFR-06, AC-06)
+      operationId: exportArtifact
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [format], properties: { format: { type: string, enum: [docx, xlsx, pdf] }, template: { type: string } } }
+      responses:
+        '201': { description: Export record with signed URL, content: { application/json: { schema: { $ref: '#/components/schemas/Export' } } } }
+  /artifacts/{id}/term-check:
+    post:
+      tags: [artifacts]
+      summary: Re-run the glossary consistency check (AI-06); violations block approval until resolved
+      operationId: termCheck
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200': { description: Violations, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/TermViolation' } } } } }
+
+  # ------------------------------------------------------------------ FMEA / OCAP
+  /cases/{id}/fmea-proposals:
+    get:
+      tags: [fmea]
+      summary: Proposed FMEA rows with S/O/D each referencing a criteria row and an evidence justification (FR-21, AI-07)
+      operationId: listFmeaProposals
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200': { description: Proposals, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/FmeaProposal' } } } } }
+  /fmea-proposals/{id}/confirm:
+    post:
+      tags: [fmea]
+      summary: Confirm one rating (S, O or D) — the row is written only when all three are confirmed by engineers
+      operationId: confirmRating
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [dimension], properties: { dimension: { type: string, enum: [S, O, D] }, rating: { type: integer, minimum: 1, maximum: 10, description: "override the proposed value (must match a criteria row)" }, criteria_id: { type: string, format: uuid } } }
+      responses:
+        '200': { description: Proposal state; `fmea_row_id` set when complete, content: { application/json: { schema: { $ref: '#/components/schemas/FmeaProposal' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: CRITERIA_MISMATCH, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /cases/{id}/ocap:
+    get:
+      tags: [fmea]
+      summary: Suggested control-plan / OCAP updates (FR-22)
+      operationId: listOcap
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200': { description: Suggestions, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/OcapSuggestion' } } } } }
+
+  # ------------------------------------------------------------------ actions, closure
+  /cases/{id}/actions:
+    get:
+      tags: [actions]
+      summary: Actions with owners, due dates, status and effectiveness (FR-27)
+      operationId: listActions
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200': { description: Actions, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Action' } } } } }
+    post:
+      tags: [actions]
+      summary: Add an action
+      operationId: createAction
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActionCreate' }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Action' } } } }
+  /actions/{id}/effectiveness:
+    post:
+      tags: [actions]
+      summary: Run the before/after effectiveness test (FR-28) — the action becomes verified only on a significant improvement
+      operationId: effectivenessCheck
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [before_from, before_to, after_from, after_to], properties: { before_from: { type: string, format: date-time }, before_to: { type: string, format: date-time }, after_from: { type: string, format: date-time }, after_to: { type: string, format: date-time } } }
+      responses:
+        '201': { description: Result — improved true/false with the test, content: { application/json: { schema: { $ref: '#/components/schemas/EffectivenessCheck' } } } }
+  /cases/{id}/close:
+    post:
+      tags: [actions]
+      summary: Close the case — refused with open actions; indexes the case as precedent and suggests horizontal deployment (FR-29, FR-30)
+      operationId: closeCase
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [closure_note], properties: { closure_note: { type: string, minLength: 10 } } }
+      responses:
+        '200': { description: Closed; horizontal candidates returned, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/HorizontalCandidate' } } } } }
+        '409': { description: "ACTIONS_OPEN or CLOSURE_NOTE_REQUIRED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /cases/{id}/horizontal:
+    get:
+      tags: [actions]
+      summary: Horizontal-deployment candidates with decisions (FR-30)
+      operationId: listHorizontal
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200': { description: Candidates, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/HorizontalCandidate' } } } } }
+
+  # ------------------------------------------------------------------ governance
+  /golden/runs:
+    get:
+      tags: [governance]
+      summary: Golden-set runs — top-3 rate, fabricated evidence, release gate (AI-05)
+      operationId: listGoldenRuns
+      responses:
+        '200': { description: Runs, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/GoldenRun' } } } } }
+    post:
+      tags: [governance]
+      summary: Run the golden set against the active model, prompts and ranking (≥ 20 incidents); blocks release below 60 % or with any fabricated evidence
+      operationId: runGolden
+      responses:
+        '202': { description: Started, content: { application/json: { schema: { $ref: '#/components/schemas/GoldenRun' } } } }
+  /glossary/terms:
+    get:
+      tags: [governance]
+      summary: Mandated terminology (社内用語) used by the term check (AI-06)
+      operationId: listGlossary
+      responses:
+        '200': { description: Terms, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/GlossaryTerm' } } } } }
+  /config:
+    get:
+      tags: [governance]
+      summary: Active configuration — Nelson set, min sample, baselines, ranking weights, FMEA standard, criteria, prompts, templates
+      operationId: getConfig
+      responses:
+        '200': { description: Config, content: { application/json: { schema: { $ref: '#/components/schemas/ConfigVersion' } } } }
+    put:
+      tags: [governance]
+      summary: Load a configuration document (validated against deploy/schemas/qe-config.schema.json); versioned and audited
+      operationId: putConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: Loaded, content: { application/json: { schema: { $ref: '#/components/schemas/ConfigVersion' } } } }
+        '422': { description: "CONFIG_INVALID — e.g. minimum Nelson set missing, temperature > 0.3, weights not summing to 1", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # ------------------------------------------------------------------ platform mode — identical to API-00 (TC-008)
+  /spc/chart:
+    get:
+      tags: [quality]
+      summary: Control chart data with rule violations
+      operationId: getSpcChart
+      parameters:
+        - name: characteristic
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/LineFilter'
+        - $ref: '#/components/parameters/DateFrom'
+        - $ref: '#/components/parameters/DateTo'
+      responses:
+        '200':
+          description: Chart data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpcChart'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /spc/capability:
+    get:
+      tags: [quality]
+      summary: Process capability (Cp, Cpk, Pp, Ppk)
+      description: |
+        The response always carries `n`, the evaluated period and a normality
+        assessment. When `normality_ok` is `false` the indices are returned but
+        `interpretation_warning` is populated — a Cpk computed on non-normal
+        data must not be presented as valid (SRS-09 C-03).
+      operationId: getCapability
+      parameters:
+        - name: characteristic
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/LineFilter'
+        - $ref: '#/components/parameters/DateFrom'
+        - $ref: '#/components/parameters/DateTo'
+      responses:
+        '200':
+          description: Capability result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilityResult'
+              examples:
+                nonNormal:
+                  summary: Non-normal data — indices returned with a warning
+                  value:
+                    characteristic: fin_pitch
+                    period: { from: '2026-08-12', to: '2026-09-10' }
+                    n: 1250
+                    cp: 1.41
+                    cpk: 1.12
+                    pp: 1.33
+                    ppk: 1.05
+                    normality_p: 0.002
+                    normality_ok: false
+                    interpretation_warning: >-
+                      Anderson-Darling p = 0.002 rejects normality. Cp/Cpk assume a
+                      normal distribution and must not be quoted for this dataset.
+                      Consider a transformation or a non-normal capability method.
+
+  /signals:
+    get:
+      tags: [quality]
+      summary: Open quality signals ranked by severity
+      operationId: listSignals
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [open, triaged, case_opened, dismissed, expired]
+            default: open
+        - $ref: '#/components/parameters/LineFilter'
+      responses:
+        '200':
+          description: Signals
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Signal'
+
+  /cases:
+    get:
+      tags: [quality]
+      summary: List quality cases
+      operationId: listCases
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/CaseStatus'
+        - $ref: '#/components/parameters/LineFilter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Cases
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Case'
+                  next_cursor:
+                    type: [string, 'null']
+    post:
+      tags: [quality]
+      summary: Open a quality case
+      operationId: createCase
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string }
+                signal_id: { type: string, format: uuid }
+                line_id: { type: string, format: uuid }
+                sku_id: { type: string, format: uuid }
+                severity:
+                  $ref: '#/components/schemas/Severity'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Case'
+
+  /cases/{caseId}:
+    get:
+      tags: [quality]
+      summary: Case detail with steps, hypotheses, artifacts and actions
+      operationId: getCase
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      responses:
+        '200':
+          description: Case detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /cases/{caseId}/analyze:
+    post:
+      tags: [quality]
+      summary: Run correlation analysis and generate ranked hypotheses
+      description: |
+        Tests association between the defect and material lot, machine, mould,
+        shift, operator group and recent parameter changes. Returns effect
+        sizes alongside p-values and flags multiple-comparison risk.
+
+        Hypotheses are explicitly **unverified** — each carries a proposed
+        verification step rather than a claimed cause.
+      operationId: analyzeCase
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      responses:
+        '200':
+          description: Ranked hypotheses
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hypotheses:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Hypothesis'
+                  no_association_found:
+                    type: array
+                    items: { type: string }
+                    description: Factors tested that showed no meaningful association
+                  multiple_comparison_note:
+                    type: string
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /cases/{caseId}/artifacts/{kind}:
+    post:
+      tags: [quality]
+      summary: Draft a quality artifact (5-Why, 8D, FMEA, report)
+      description: |
+        The result is always created as a **draft**: `ai_generated = true`,
+        `approved_by = null`. A draft cannot be exported without a watermark
+        and cannot be cited as precedent until approved (SRS FR-A-04).
+      operationId: draftArtifact
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - name: kind
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/ArtifactKind'
+        - name: lang
+          in: query
+          schema:
+            $ref: '#/components/schemas/Language'
+      responses:
+        '201':
+          description: Draft created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '503':
+          $ref: '#/components/responses/ModelUnavailable'
+
+  /artifacts/{artifactId}/approve:
+    post:
+      tags: [quality]
+      summary: Approve an AI-drafted artifact
+      description: |
+        Requires role `engineer` or above. Approval is recorded with the
+        approver and timestamp, is immutable, and is what allows the artifact
+        to be exported clean and indexed as precedent.
+      operationId: approveArtifact
+      parameters:
+        - name: artifactId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string }
+      responses:
+        '200':
+          description: Approved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Already approved
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /knowledge/search:
+    post:
+      tags: [knowledge]
+      summary: Hybrid search over documents and past cases
+      description: |
+        Combines lexical (trigram) and vector retrieval with reranking, and
+        supports cross-language retrieval — a Thai query can surface a Japanese
+        8D report.
+
+        Results are filtered by the caller's document ACL at query time, not
+        after retrieval.
+      operationId: searchKnowledge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string }
+                top_k: { type: integer, default: 5, maximum: 50 }
+                filters:
+                  type: object
+                  properties:
+                    machine: { type: string }
+                    line: { type: string }
+                    sku: { type: string }
+                    verified_only:
+                      type: boolean
+                      default: true
+                      description: >-
+                        When true (default) only human-verified case records are
+                        returned. Unverified LLM extractions are never presented
+                        as established fact.
+      responses:
+        '200':
+          description: Ranked results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/KnowledgeHit'
+
+  # ------------------------------------------------------------------ system
+  /healthz:
+    get:
+      tags: [system]
+      summary: Liveness
+      operationId: healthz
+      security: []
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { ok: { type: boolean } } } } } }
+  /readyz:
+    get:
+      tags: [system]
+      summary: Readiness — DB, Redis, object store, engine, model (a stopped model does not fail readiness — statistics-only mode, AI-08)
+      operationId: readyz
+      security: []
+      responses:
+        '200': { description: Ready, content: { application/json: { schema: { type: object, properties: { db: { type: boolean }, redis: { type: boolean }, object_store: { type: boolean }, engine: { type: boolean }, llm: { type: boolean }, mode: { type: string, enum: [full, statistics_only] }, backlog: { type: object, additionalProperties: { type: integer } } } } } } }
+        '503': { description: "DB, Redis or object store unavailable", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /metrics:
+    get:
+      tags: [system]
+      summary: Prometheus metrics (ICD-09 IF-14) — internal network only
+      operationId: metrics
+      security: []
+      responses:
+        '200': { description: Metrics, content: { text/plain: { schema: { type: string } } } }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Platform-shape roles viewer < inspector (QC supervisor) < engineer (quality_engineer, production engineer) < manager < admin
+
+  parameters:
+    Id: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    CaseId:
+      name: caseId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Opaque cursor from the previous page's `next_cursor`
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    DateFrom:
+      name: from
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive start date (plant timezone)
+    DateTo:
+      name: to
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive end date (plant timezone)
+    LineFilter:
+      name: line
+      in: query
+      schema: { type: string }
+      description: Line code. Restricted users only see lines in their scope.
+
+  responses:
+    Forbidden:
+      description: |
+        Authenticated but not permitted. For line-scoped resources the rows are
+        never retrieved in the first place — this is not response filtering.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Resource does not exist
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ValidationFailed:
+      description: Request was well-formed but semantically invalid
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ModelUnavailable:
+      description: |
+        The language model is unavailable. Deterministic features (charts,
+        statistics, queues) remain available.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    # ------------------------------------------------ identical to API-00 (TC-008)
+    Problem:
+      type: object
+      description: RFC 7807 problem details with a stable machine-readable `code`.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          description: Stable error code — see API-Specification.md §7
+        correlation_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+
+    Language:
+      type: string
+      enum: [th, ja, en]
+      default: th
+
+    Severity:
+      type: string
+      enum: [INFO, LOW, MEDIUM, HIGH, CRITICAL]
+
+    ArtifactKind:
+      type: string
+      enum: [five_why, eight_d, fmea, report, ocap]
+
+    CaseStatus:
+      type: string
+      enum: [open, containment, analysis, action, verification, closed, cancelled]
+
+    SpcChart:
+      type: object
+      properties:
+        characteristic: { type: string }
+        chart_type:
+          type: string
+          enum: [xbar_r, x_mr, p, np, c, u]
+        limits:
+          type: object
+          properties:
+            ucl: { type: number }
+            cl: { type: number }
+            lcl: { type: number }
+            baseline_from: { type: string, format: date-time }
+            baseline_to: { type: string, format: date-time }
+            sample_size: { type: integer }
+            reason:
+              type: string
+              description: Why these limits were set — limits are never recalculated silently
+        points:
+          type: array
+          items:
+            type: object
+            properties:
+              ts: { type: string, format: date-time }
+              value: { type: number }
+              subgroup_n: { type: integer }
+        violations:
+          type: array
+          items:
+            type: object
+            properties:
+              rule:
+                type: integer
+                minimum: 1
+                maximum: 8
+                description: Nelson rule number
+              ts: { type: string, format: date-time }
+              points: { type: array, items: { type: integer } }
+
+    CapabilityResult:
+      type: object
+      properties:
+        characteristic: { type: string }
+        period:
+          type: object
+          properties:
+            from: { type: string, format: date }
+            to: { type: string, format: date }
+        n:
+          type: integer
+          description: Sample size — always returned, so an index is never quoted without context
+        cp: { type: [number, 'null'] }
+        cpk: { type: [number, 'null'] }
+        pp: { type: [number, 'null'] }
+        ppk: { type: [number, 'null'] }
+        normality_p: { type: [number, 'null'] }
+        normality_ok: { type: boolean }
+        interpretation_warning:
+          type: [string, 'null']
+          description: Populated when normality_ok is false
+
+    Signal:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string }
+        line: { type: [string, 'null'] }
+        sku: { type: [string, 'null'] }
+        severity:
+          $ref: '#/components/schemas/Severity'
+        statistic:
+          type: object
+          additionalProperties: true
+          description: p-value, effect size, baseline, n — the agent may only quote values present here
+        status: { type: string }
+        opened_at: { type: string, format: date-time }
+
+    Case:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        status:
+          $ref: '#/components/schemas/CaseStatus'
+        severity:
+          $ref: '#/components/schemas/Severity'
+        line: { type: [string, 'null'] }
+        sku: { type: [string, 'null'] }
+        owner: { type: [string, 'null'] }
+        opened_at: { type: string, format: date-time }
+        closed_at: { type: [string, 'null'], format: date-time }
+
+    CaseDetail:
+      allOf:
+        - $ref: '#/components/schemas/Case'
+        - type: object
+          properties:
+            steps:
+              type: array
+              items:
+                type: object
+                properties:
+                  kind: { type: string }
+                  content: { type: object, additionalProperties: true }
+                  ai_generated: { type: boolean }
+                  approved: { type: boolean }
+                  approved_by: { type: [string, 'null'] }
+            hypotheses:
+              type: array
+              items:
+                $ref: '#/components/schemas/Hypothesis'
+            artifacts:
+              type: array
+              items:
+                $ref: '#/components/schemas/Artifact'
+            actions:
+              type: array
+              items:
+                type: object
+                properties:
+                  kind: { type: string }
+                  description: { type: string }
+                  owner: { type: [string, 'null'] }
+                  due_date: { type: [string, 'null'], format: date }
+                  status: { type: string }
+                  effectiveness: { type: [object, 'null'], additionalProperties: true }
+
+    Hypothesis:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        statement: { type: string }
+        score: { type: number, minimum: 0, maximum: 1 }
+        evidence:
+          type: array
+          items: { type: object, additionalProperties: true }
+        contradicting_evidence:
+          type: array
+          items: { type: object, additionalProperties: true }
+        verify_step:
+          type: string
+          description: How to confirm or reject this hypothesis
+        status:
+          type: string
+          enum: [proposed, verifying, confirmed, rejected]
+
+    Artifact:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind:
+          $ref: '#/components/schemas/ArtifactKind'
+        version: { type: integer }
+        lang:
+          $ref: '#/components/schemas/Language'
+        content: { type: object, additionalProperties: true }
+        ai_generated: { type: boolean }
+        approved: { type: boolean }
+        approved_by: { type: [string, 'null'] }
+        approved_at: { type: [string, 'null'], format: date-time }
+        watermark:
+          type: [string, 'null']
+          description: Present while unapproved. Cannot be suppressed by any parameter.
+
+    KnowledgeHit:
+      type: object
+      properties:
+        kind: { type: string, enum: [case, document_chunk] }
+        case_id: { type: [string, 'null'], format: uuid }
+        document_id: { type: [string, 'null'], format: uuid }
+        title: { type: string }
+        snippet: { type: string }
+        lang:
+          $ref: '#/components/schemas/Language'
+        score: { type: number }
+        verified:
+          type: boolean
+          description: False means LLM-extracted and not human-confirmed
+        outcome: { type: [string, 'null'] }
+        matched_on:
+          type: array
+          items: { type: string }
+          description: Why this result matched — shown to the user
+        source_url: { type: [string, 'null'] }
+
+    # ------------------------------------------------ QE-Agent
+    GroundingStatus: { type: string, enum: [pending, passed, failed] }
+    ClaimKind: { type: string, enum: [numeric, date, count, causal, other] }
+    Factor: { type: string, enum: [material_lot, machine, mould, shift, operator_group, sku, parameter_change, ambient] }
+
+    Characteristic:
+      type: object
+      required: [id, name, chart_type, subgroup_rule]
+      properties:
+        id: { type: string, format: uuid }
+        sku: { type: string }
+        name: { type: string }
+        unit: { type: string }
+        usl: { type: number }
+        lsl: { type: number }
+        target: { type: number }
+        chart_type: { type: string, enum: [xbar_r, x_mr, p, np, c, u] }
+        subgroup_rule: { type: object, additionalProperties: true, description: "{kind: fixed_n|time_window|batch, n?, minutes?}" }
+        enabled_rules: { type: array, items: { type: integer } }
+        active_limits: { $ref: '#/components/schemas/ControlLimits' }
+    CharacteristicCreate:
+      type: object
+      required: [sku, name, chart_type]
+      properties:
+        sku: { type: string }
+        name: { type: string }
+        unit: { type: string }
+        usl: { type: number }
+        lsl: { type: number }
+        target: { type: number }
+        chart_type: { type: string, enum: [xbar_r, x_mr, p, np, c, u] }
+        subgroup_rule: { type: object, additionalProperties: true }
+    ControlLimits:
+      type: object
+      required: [ucl, cl, lcl, baseline_from, baseline_to, sample_size, reason, created_at, active]
+      properties:
+        id: { type: string, format: uuid }
+        ucl: { type: number }
+        cl: { type: number }
+        lcl: { type: number }
+        baseline_from: { type: string, format: date-time }
+        baseline_to: { type: string, format: date-time }
+        sample_size: { type: integer }
+        reason: { type: string }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        active: { type: boolean }
+    LimitsRecalcRequest:
+      type: object
+      required: [baseline_from, baseline_to, reason]
+      properties:
+        baseline_from: { type: string, format: date-time }
+        baseline_to: { type: string, format: date-time }
+        reason: { type: string, minLength: 10, maxLength: 500 }
+        line: { type: string }
+    Violation:
+      type: object
+      required: [id, characteristic, ts, rule, points, severity]
+      properties:
+        id: { type: string, format: uuid }
+        characteristic: { type: string }
+        line: { type: string }
+        ts: { type: string, format: date-time }
+        rule: { type: integer, minimum: 1, maximum: 8 }
+        points: { type: array, items: { type: integer }, description: "1-based indexes of the points involved" }
+        severity: { $ref: '#/components/schemas/Severity' }
+    CapabilityDetail:
+      allOf:
+        - $ref: '#/components/schemas/CapabilityResult'
+        - type: object
+          description: The platform result plus what C-03 requires — the indices are never shown without these.
+          required: [n, period_from, period_to, normality_ok]
+          properties:
+            n: { type: integer }
+            period_from: { type: string, format: date-time }
+            period_to: { type: string, format: date-time }
+            subgroup_rule: { type: object, additionalProperties: true }
+            normality_test: { type: string, const: anderson_darling }
+            normality_p: { type: number }
+            normality_ok: { type: boolean }
+            method_note: { type: string, description: "mandatory when normality_ok is false — the transformation or non-normal method used (FR-05)" }
+            warning: { type: string, description: "present when normality_ok is false: the indices must not be presented as a plain Cpk" }
+    SignalDetail:
+      allOf:
+        - $ref: '#/components/schemas/Signal'
+        - type: object
+          properties:
+            defect_code: { type: string }
+            score: { type: number }
+            rank_components: { type: object, properties: { impact: { type: number }, criticality: { type: number }, volume: { type: number }, slope: { type: number } } }
+            statistic: { type: object, description: "n, x, rate, baseline_n, baseline_x, baseline_rate, test, z, p_value — the only numbers the agent may quote", additionalProperties: true }
+            change_point: { type: object, properties: { estimated_ts: { type: string, format: date-time }, window_minutes: { type: integer }, method: { type: string } } }
+            suppressed_reason: { type: string }
+            case_id: { type: string, format: uuid }
+    TrialRun:
+      type: object
+      required: [line, from, to, reason]
+      properties:
+        id: { type: string, format: uuid }
+        line: { type: string }
+        sku: { type: string }
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        reason: { type: string, minLength: 5 }
+        declared_by: { type: string }
+    Evidence:
+      type: object
+      required: [id, code, kind, value, digest]
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, description: "E-01 … within the case" }
+        kind: { type: string, enum: [query, chart, test, change_point, correlation, capability, limits, timeline, case, doc_chunk] }
+        value: { type: object, additionalProperties: true }
+        source_query: { type: string }
+        source_ref: { type: string }
+        digest: { type: string }
+    CorrelationTest:
+      type: object
+      required: [factor, test, p_value, effect_measure, effect_size, n, meaningful]
+      properties:
+        factor: { $ref: '#/components/schemas/Factor' }
+        level: { type: string }
+        test: { type: string, enum: [chi_square, fisher_exact, two_proportion, rate_ratio] }
+        statistic: { type: number }
+        p_value: { type: number }
+        p_adjusted: { type: number, description: "Benjamini–Hochberg across the factor scan (FR-14)" }
+        effect_measure: { type: string, enum: [risk_ratio, rate_ratio, cramers_v, odds_ratio] }
+        effect_size: { type: number }
+        ci_low: { type: number }
+        ci_high: { type: number }
+        n: { type: integer }
+        table: { type: object, additionalProperties: true }
+        meaningful: { type: boolean }
+    CorrelationReport:
+      type: object
+      required: [tests, no_meaningful_association, multiple_comparison]
+      properties:
+        tests: { type: array, items: { $ref: '#/components/schemas/CorrelationTest' } }
+        no_meaningful_association: { type: array, items: { $ref: '#/components/schemas/Factor' }, description: "FR-18 — stated explicitly" }
+        multiple_comparison: { type: object, properties: { method: { type: string, const: benjamini_hochberg }, tests: { type: integer }, warning: { type: string } } }
+    TimelineEvent:
+      type: object
+      required: [ts, kind]
+      properties:
+        ts: { type: string, format: date-time }
+        kind: { type: string, description: "lot_change · maintenance · tool_change · parameter_edit · personnel · environment · startup" }
+        line: { type: string }
+        machine: { type: string }
+        mould: { type: string }
+        detail: { type: object, additionalProperties: true }
+        minutes_from_change_point: { type: number }
+    HypothesisDetail:
+      allOf:
+        - $ref: '#/components/schemas/Hypothesis'
+        - type: object
+          description: "Wording is a hypothesis to verify until status = confirmed (C-04)."
+          properties:
+            rank: { type: integer }
+            factor: { $ref: '#/components/schemas/Factor' }
+            level: { type: string }
+            effect_size: { type: number }
+            p_adjusted: { type: number }
+            supporting: { type: array, items: { $ref: '#/components/schemas/Evidence' } }
+            contra: { type: array, items: { $ref: '#/components/schemas/Evidence' } }
+            verify_step: { type: string }
+            verified_by: { type: string }
+            verified_at: { type: string, format: date-time }
+            verify_result: { type: string }
+    Claim:
+      type: object
+      required: [ordinal, sentence, kind, traced]
+      properties:
+        ordinal: { type: integer }
+        section: { type: string }
+        sentence: { type: string }
+        kind: { $ref: '#/components/schemas/ClaimKind' }
+        evidence_code: { type: string }
+        hypothesis_id: { type: string, format: uuid }
+        traced: { type: boolean }
+    ArtifactDetail:
+      allOf:
+        - $ref: '#/components/schemas/Artifact'
+        - type: object
+          properties:
+            revision: { type: integer }
+            grounding_status: { $ref: '#/components/schemas/GroundingStatus' }
+            claims_total: { type: integer }
+            claims_untraced: { type: integer }
+            claims: { type: array, items: { $ref: '#/components/schemas/Claim' } }
+            term_violations: { type: integer }
+            facts_digest: { type: string }
+            prompt_template: { type: string, description: "kind.lang.version" }
+            model_version: { type: string }
+            revisions: { type: array, items: { type: object, properties: { revision: { type: integer }, edited_by: { type: string }, note: { type: string }, created_at: { type: string, format: date-time } } } }
+            exports: { type: array, items: { $ref: '#/components/schemas/Export' } }
+            is_draft: { type: boolean, description: "ai_generated and not approved — every export carries the DRAFT watermark (C-01)" }
+    ApprovalResult:
+      type: object
+      required: [artifact_id, result]
+      properties:
+        artifact_id: { type: string, format: uuid }
+        result: { type: string, enum: [approved, refused] }
+        code: { type: string, description: "GROUNDING_FAILED · TERM_CHECK · ROLE_INSUFFICIENT · APPROVAL_IMMUTABLE" }
+        untraced_claims: { type: array, items: { $ref: '#/components/schemas/Claim' } }
+    Export:
+      type: object
+      required: [id, format, watermark, version_stamp, url]
+      properties:
+        id: { type: string, format: uuid }
+        format: { type: string, enum: [docx, xlsx, pdf] }
+        template: { type: string }
+        watermark: { type: string, enum: ["DRAFT — AI generated", "APPROVED"] }
+        version_stamp: { type: string, description: "v<version>.<revision>" }
+        approved_by: { type: string }
+        url: { type: string, format: uri, description: "signed, 15 min" }
+        sha256: { type: string }
+        created_at: { type: string, format: date-time }
+    TermViolation:
+      type: object
+      required: [found_text, expected_text, resolved]
+      properties:
+        term_id: { type: string, format: uuid }
+        found_text: { type: string }
+        expected_text: { type: string }
+        position: { type: integer }
+        resolved: { type: boolean }
+    FmeaProposal:
+      type: object
+      required: [id, process_step, failure_mode, s, o, d, status]
+      properties:
+        id: { type: string, format: uuid }
+        case_id: { type: string, format: uuid }
+        process_step: { type: string }
+        failure_mode: { type: string }
+        effect: { type: string }
+        cause: { type: string }
+        control_prev: { type: string }
+        control_det: { type: string }
+        s: { type: integer }
+        o: { type: integer }
+        d: { type: integer }
+        criteria: { type: object, properties: { S: { $ref: '#/components/schemas/Criteria' }, O: { $ref: '#/components/schemas/Criteria' }, D: { $ref: '#/components/schemas/Criteria' } } }
+        justification: { type: object, properties: { S: { type: string }, O: { type: string }, D: { type: string } }, description: "evidence codes" }
+        confirmed: { type: object, properties: { S: { type: string }, O: { type: string }, D: { type: string } }, description: "confirming engineer per rating" }
+        rpn: { type: integer, description: "s × o × d (classic)" }
+        ap: { type: string, enum: [H, M, L], description: "AIAG-VDA action priority from the configured table" }
+        standard: { type: string, enum: [aiag_vda_ap, classic_rpn] }
+        status: { type: string, enum: [proposed, confirmed, rejected] }
+        fmea_row_id: { type: string, format: uuid }
+    Criteria:
+      type: object
+      required: [id, rating, criteria_text]
+      properties:
+        id: { type: string, format: uuid }
+        rating: { type: integer }
+        criteria_text: { type: string }
+    OcapSuggestion:
+      type: object
+      required: [id, suggestion, status]
+      properties:
+        id: { type: string, format: uuid }
+        characteristic: { type: string }
+        suggestion: { type: string }
+        evidence_code: { type: string }
+        status: { type: string, enum: [proposed, accepted, rejected] }
+    ActionCreate:
+      type: object
+      required: [kind, description, owner_id, due_date]
+      properties:
+        kind: { type: string, enum: [containment, corrective, preventive, horizontal] }
+        description: { type: string }
+        owner_id: { type: string, format: uuid }
+        due_date: { type: string, format: date }
+    Action:
+      allOf:
+        - $ref: '#/components/schemas/ActionCreate'
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            status: { type: string, enum: [open, in_progress, done, verified, cancelled] }
+            applied_at: { type: string, format: date-time }
+            effectiveness: { $ref: '#/components/schemas/EffectivenessCheck' }
+            overdue_days: { type: integer }
+    EffectivenessCheck:
+      type: object
+      required: [test, rate_before, rate_after, p_value, improved]
+      properties:
+        test: { type: string, enum: [two_proportion_z, fisher_exact] }
+        before: { type: object, properties: { from: { type: string, format: date-time }, to: { type: string, format: date-time }, x: { type: integer }, n: { type: integer } } }
+        after: { type: object, properties: { from: { type: string, format: date-time }, to: { type: string, format: date-time }, x: { type: integer }, n: { type: integer } } }
+        rate_before: { type: number }
+        rate_after: { type: number }
+        z: { type: number }
+        p_value: { type: number }
+        improved: { type: boolean, description: "p < 0.05 and the rate fell; false is a recorded, honest outcome (AC-08)" }
+    HorizontalCandidate:
+      type: object
+      required: [target_kind, target_code, reason, status]
+      properties:
+        id: { type: string, format: uuid }
+        target_kind: { type: string, enum: [line, sku, mould] }
+        target_code: { type: string }
+        reason: { type: string }
+        status: { type: string, enum: [suggested, accepted, dismissed] }
+    GoldenRun:
+      type: object
+      required: [id, ran_at, n, top3_hits, fabricated, top3_rate, release_blocked]
+      properties:
+        id: { type: string, format: uuid }
+        ran_at: { type: string, format: date-time }
+        model_version: { type: string }
+        prompt_version: { type: string }
+        ranking_version: { type: string }
+        n: { type: integer, minimum: 20 }
+        top3_hits: { type: integer }
+        top1_hits: { type: integer }
+        fabricated: { type: integer }
+        top3_rate: { type: number }
+        release_blocked: { type: boolean }
+        block_reason: { type: string }
+    GlossaryTerm:
+      type: object
+      required: [id, en]
+      properties:
+        id: { type: string, format: uuid }
+        ja: { type: string }
+        ja_reading: { type: string }
+        th: { type: string }
+        en: { type: string }
+        domain: { type: string }
+        forbidden: { type: array, items: { type: string } }
+    ConfigVersion:
+      type: object
+      required: [version, loaded_at, doc]
+      properties:
+        version: { type: string }
+        loaded_at: { type: string, format: date-time }
+        loaded_by: { type: string }
+        doc: { type: object, additionalProperties: true }
