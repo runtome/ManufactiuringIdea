@@ -1,0 +1,1707 @@
+openapi: 3.1.0
+info:
+  title: MoldMind API
+  version: 1.0.0
+  summary: Injection-moulding defects joined to shots and cavities, parameters analysed by code, causes ranked transparently, advice ordered checks-first and bounded by the process window.
+  description: |
+    **Scope.** The MoldMind API — standalone, and the injection-moulding module of FactoryBrain in platform mode.
+    SRS-11 §4.1's eight paths are kept verbatim under `/api/v1`. The platform's `/inspections/{inspectionId}`,
+    `/inspections/{inspectionId}/verdict`, `/reviews`, `/cases/{caseId}/artifacts/{kind}` and `/knowledge/search`
+    and their components are copied byte-for-byte from API-00 and diffed by TEST-11 TC-008.
+
+    **Five contracts (API-Specification.md §3–§7):**
+    - **Shot** — every inspection result is joined to exactly one shot (by id, or by timestamp within tolerance) and
+      one cavity (OCR marking, robot position or sequence — the method is returned); a result that cannot be joined
+      is `409`, never stored loose.
+    - **Analysis** — every rate carries `n`; every parameter delta carries the effect size (Cohen's d) and Welch t;
+      startup transients are excluded and counted; drift is a slope against the setup sheet.
+    - **RCA** — the ranking is the scoring function's output with its components and weights; the dialogue updates
+      components, never the score directly; advice lists checks before changes; a suggestion outside the documented
+      window is returned `blocked` with the window, never `allowed`; effectiveness is a significance test.
+    - **Knowledge** — versions with author, approver (not the author) and sources; only approved versions rank.
+    - **Handoff** — the 8D is created by QE-Agent from the session; MoldMind never writes an 8D itself.
+
+    Errors are RFC 7807 `application/problem+json` with a stable `code`.
+  contact: { name: Suphot N. }
+  license: { name: Proprietary }
+  x-document-id: API-11-MoldMind
+
+servers:
+  - url: https://moldmind.plant.local/api/v1
+    description: Standalone
+  - url: https://factorybrain.plant.local/api/v1
+    description: Platform mode (the platform's five paths are served by the gateway; the rest under /moldmind/)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - { name: shots, description: "SRS §4.1 — shot records, inspection results, alignment and cavity attribution (FR-01…FR-11)" }
+  - { name: machines, description: "Connections and node maps (IF-05, read-only)" }
+  - { name: moulds, description: "Moulds, setup sheets (golden run), process windows" }
+  - { name: analysis, description: "Cavity analysis, parameter delta, drift, timeline, transients, scrap cost (FR-12…FR-18)" }
+  - { name: rca, description: "Guided RCA sessions: ranking, dialogue, advice, suggestions, outcomes, handoff (FR-20…FR-26)" }
+  - { name: knowledge, description: "Knowledge base versions, causes, evidence; platform search (FR-19, FR-25)" }
+  - { name: evaluation, description: "Vision and golden-set evaluation runs (AI-02, AI-07)" }
+  - { name: inspections, description: "Platform paths (API-00, verbatim) — review queue and human verdicts (FR-11)" }
+  - { name: quality, description: "Platform path (API-00, verbatim) — QE-Agent artefacts (FR-26)" }
+  - { name: admin, description: "Scoring config, glossary, config" }
+  - { name: system, description: "Health, readiness, metrics" }
+
+paths:
+  # ------------------------------------------------------------------
+  # SRS-11 §4.1 — verbatim paths
+  # ------------------------------------------------------------------
+  /shots:
+    post:
+      tags: [shots]
+      summary: Shot record from the machine gateway (FR-01, FR-02)
+      description: One row per cycle completion. `params` carries the FR-01 parameters as delivered by the node map; context (lot, regrind, dryer, ambient, operator group) is stored beside it. Idempotent on `shot_id`; a replay (buffered batch) reports `duplicate` and is not an error (AC-09).
+      operationId: createShot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShotCreate' }
+      responses:
+        '201': { description: Stored, content: { application/json: { schema: { $ref: '#/components/schemas/Shot' } } } }
+        '200': { description: Duplicate (already stored) — returned unchanged, content: { application/json: { schema: { $ref: '#/components/schemas/Shot' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    get:
+      tags: [shots]
+      summary: Shots with context, data-quality flags and transient classification
+      operationId: listShots
+      parameters: [ { $ref: '#/components/parameters/MouldFilter' }, { $ref: '#/components/parameters/From' }, { $ref: '#/components/parameters/To' }, { name: include_transients, in: query, schema: { type: boolean, default: true } }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses:
+        '200': { description: Shots, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Shot' } }, next_cursor: { type: [string, 'null'] } } } } } }
+  /shots/{id}/inspection:
+    post:
+      tags: [shots]
+      summary: Vision result for a shot — parts per cavity with detections; aligned and attributed (FR-03, FR-06…FR-11, C-02)
+      description: |
+        Each part is joined to the shot (`align_method`) within the configured tolerance and to a cavity (`cavity_method`);
+        a part outside the tolerance or on a cavity the mould does not have is refused (`409 ALIGNMENT_TOLERANCE`,
+        `409 CAVITY_OUT_OF_RANGE`). Low-confidence detections are routed to the review queue (`review_required`);
+        colour deviation carries the measured ΔE against the reference chart.
+      operationId: postShotInspection
+      parameters: [ { $ref: '#/components/parameters/ShotId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShotInspection' }
+      responses:
+        '201': { description: Parts stored with alignment and attribution, content: { application/json: { schema: { $ref: '#/components/schemas/ShotInspectionResult' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "ALIGNMENT_TOLERANCE, CAVITY_OUT_OF_RANGE or SHOT_WITHOUT_MOULD (C-02)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /cavity-analysis:
+    get:
+      tags: [analysis]
+      summary: Per-cavity defect rates with the flag test against the other cavities; transients excluded (FR-12, FR-16)
+      operationId: getCavityAnalysis
+      parameters: [ { name: mould, in: query, required: true, schema: { type: string } }, { $ref: '#/components/parameters/From' }, { $ref: '#/components/parameters/To' }, { name: defect, in: query, schema: { $ref: '#/components/schemas/DefectClass' } } ]
+      responses:
+        '200': { description: Cavity analysis, content: { application/json: { schema: { $ref: '#/components/schemas/CavityAnalysis' } } } }
+  /parameter-delta:
+    get:
+      tags: [analysis]
+      summary: Good-vs-defective parameter comparison with effect sizes (FR-13)
+      operationId: getParameterDelta
+      parameters: [ { name: defect, in: query, required: true, schema: { $ref: '#/components/schemas/DefectClass' } }, { name: window, in: query, required: true, schema: { type: string, pattern: '^[0-9]+[hd]$' }, description: "e.g. 24h, 7d" }, { $ref: '#/components/parameters/MouldFilter' } ]
+      responses:
+        '200': { description: Deltas, content: { application/json: { schema: { $ref: '#/components/schemas/ParameterDeltaReport' } } } }
+  /golden-run/{mould}:
+    get:
+      tags: [analysis]
+      summary: Current parameters vs the approved setup sheet with deviations highlighted (FR-18)
+      operationId: getGoldenRun
+      parameters: [ { name: mould, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200': { description: Golden-run comparison, content: { application/json: { schema: { $ref: '#/components/schemas/GoldenRunDiff' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /rca/sessions:
+    post:
+      tags: [rca]
+      summary: Start a guided RCA — ranked causes from the scoring function, first question (FR-20, FR-21, AI-05)
+      operationId: startRcaSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RcaSessionCreate' }
+      responses:
+        '201': { description: Session with ranking, content: { application/json: { schema: { $ref: '#/components/schemas/RcaSession' } } } }
+        '409': { description: "KB_NOT_APPROVED or SCORING_INACTIVE", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '503': { $ref: '#/components/responses/ModelUnavailable' }
+    get:
+      tags: [rca]
+      summary: RCA board
+      operationId: listRcaSessions
+      parameters: [ { name: status, in: query, schema: { $ref: '#/components/schemas/RcaStatus' } }, { $ref: '#/components/parameters/MouldFilter' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses:
+        '200': { description: Sessions, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/RcaSessionSummary' } }, next_cursor: { type: [string, 'null'] } } } } } }
+  /rca/sessions/{id}/answer:
+    post:
+      tags: [rca]
+      summary: Answer the agent's question — components and ranking are updated, the next question returned (FR-21)
+      operationId: answerRcaQuestion
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RcaAnswer' }
+      responses:
+        '200': { description: Updated session, content: { application/json: { schema: { $ref: '#/components/schemas/RcaSession' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "No open question (NO_OPEN_QUESTION) or session closed (SESSION_CLOSED)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /knowledge/defect/{class}:
+    get:
+      tags: [knowledge]
+      summary: Knowledge-base entry for a defect class from the approved version (FR-19)
+      operationId: getKbDefect
+      parameters: [ { name: class, in: path, required: true, schema: { $ref: '#/components/schemas/DefectClass' } }, { name: version, in: query, schema: { type: string }, description: "defaults to the active approved version" } ]
+      responses:
+        '200': { description: Entry, content: { application/json: { schema: { $ref: '#/components/schemas/KbEntry' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------
+  # Machines (IF-05) and gateway buffering (NFR-05, AC-09)
+  # ------------------------------------------------------------------
+  /machines/connections:
+    get:
+      tags: [machines]
+      summary: Machine connections (read-only credentials; secrets never returned)
+      operationId: listConnections
+      responses:
+        '200': { description: Connections, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/MachineConnection' } } } } }
+    post:
+      tags: [machines]
+      summary: Register a connection (admin) — a non-read-only credential is refused (C-01, NFR-06)
+      operationId: createConnection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MachineConnection' }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/MachineConnection' } } } }
+        '409': { description: "MACHINE_READONLY or MACHINE_SECURITY", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /machines/connections/{id}/node-map:
+    get:
+      tags: [machines]
+      summary: Active node map
+      operationId: getNodeMap
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Node map, content: { application/json: { schema: { $ref: '#/components/schemas/NodeMap' } } } }
+    put:
+      tags: [machines]
+      summary: Load a node map version (admin) — validated against schemas/opcua-nodemap.schema.json; every node must be read-only
+      operationId: putNodeMap
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodeMap' }
+      responses:
+        '200': { description: Loaded (activates after validation), content: { application/json: { schema: { $ref: '#/components/schemas/NodeMap' } } } }
+        '422': { description: "NODE_MAP_WRITE, NODE_MAP_SHAPE or unresolvable node", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /machines/connections/{id}/test:
+    post:
+      tags: [machines]
+      summary: Test the connection — resolves every node, confirms the server refuses writes, reports lag
+      operationId: testConnection
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Test result, content: { application/json: { schema: { $ref: '#/components/schemas/ConnectionTest' } } } }
+  /gateway/batches:
+    get:
+      tags: [machines]
+      summary: Buffered batches and their reconciliation (NFR-05, AC-09)
+      operationId: listGatewayBatches
+      responses:
+        '200': { description: Batches, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/GatewayBatch' } } } } }
+    post:
+      tags: [machines]
+      summary: Upload a buffered batch after an outage — reconciled by shot id (duplicates reported, not errors)
+      operationId: uploadGatewayBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [connection_id, outage_from, outage_to, shots], properties: { connection_id: { type: string, format: uuid }, outage_from: { type: string, format: date-time }, outage_to: { type: string, format: date-time }, reason: { type: string }, shots: { type: array, items: { $ref: '#/components/schemas/ShotCreate' }, maxItems: 20000 } } }
+      responses:
+        '202': { description: Reconciled, content: { application/json: { schema: { $ref: '#/components/schemas/GatewayBatch' } } } }
+
+  # ------------------------------------------------------------------
+  # Moulds, setup sheets, windows
+  # ------------------------------------------------------------------
+  /moulds:
+    get:
+      tags: [moulds]
+      summary: Moulds
+      operationId: listMoulds
+      responses:
+        '200': { description: Moulds, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Mould' } } } } }
+    post:
+      tags: [moulds]
+      summary: Register a mould (engineer+)
+      operationId: createMould
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Mould' }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Mould' } } } }
+  /moulds/{id}/setup-sheets:
+    get:
+      tags: [moulds]
+      summary: Setup-sheet versions (the active one is the golden run) (FR-18)
+      operationId: listSetupSheets
+      parameters: [ { $ref: '#/components/parameters/MouldId' } ]
+      responses:
+        '200': { description: Versions, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/SetupSheet' } } } } }
+    post:
+      tags: [moulds]
+      summary: Create a setup-sheet version (engineer+) — approved versions are immutable
+      operationId: createSetupSheet
+      parameters: [ { $ref: '#/components/parameters/MouldId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetupSheet' }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/SetupSheet' } } } }
+  /moulds/{id}/setup-sheets/{version}/approve:
+    post:
+      tags: [moulds]
+      summary: Approve and activate a setup-sheet version (engineer+, not the author)
+      operationId: approveSetupSheet
+      parameters: [ { $ref: '#/components/parameters/MouldId' }, { name: version, in: path, required: true, schema: { type: integer } } ]
+      responses:
+        '200': { description: Active, content: { application/json: { schema: { $ref: '#/components/schemas/SetupSheet' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /moulds/{id}/windows:
+    get:
+      tags: [moulds]
+      summary: Documented process windows per material grade and parameter (C-05)
+      operationId: listWindows
+      parameters: [ { $ref: '#/components/parameters/MouldId' } ]
+      responses:
+        '200': { description: Windows, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ParameterWindow' } } } } }
+    put:
+      tags: [moulds]
+      summary: Replace the windows (engineer+) — each with its source
+      operationId: putWindows
+      parameters: [ { $ref: '#/components/parameters/MouldId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: array, items: { $ref: '#/components/schemas/ParameterWindow' } }
+      responses:
+        '200': { description: Windows, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ParameterWindow' } } } } }
+
+  # ------------------------------------------------------------------
+  # Shots, defects, timeline, data quality
+  # ------------------------------------------------------------------
+  /shots/{id}:
+    get:
+      tags: [shots]
+      summary: One shot with context, parts, alignments, defects and data-quality flags
+      operationId: getShot
+      parameters: [ { $ref: '#/components/parameters/ShotId' } ]
+      responses:
+        '200': { description: Shot detail, content: { application/json: { schema: { $ref: '#/components/schemas/ShotDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /defects:
+    get:
+      tags: [shots]
+      summary: Defects by class, cavity, region and window (FR-06, FR-07)
+      operationId: listDefects
+      parameters: [ { $ref: '#/components/parameters/MouldFilter' }, { name: defect, in: query, schema: { $ref: '#/components/schemas/DefectClass' } }, { name: cavity, in: query, schema: { type: integer } }, { $ref: '#/components/parameters/From' }, { $ref: '#/components/parameters/To' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses:
+        '200': { description: Defects, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/ShotDefect' } }, next_cursor: { type: [string, 'null'] } } } } } }
+  /defects/{id}/review:
+    post:
+      tags: [shots]
+      summary: Human verdict on a low-confidence detection (FR-11) — also recorded as a platform verdict override
+      operationId: reviewDefect
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [verdict], properties: { verdict: { $ref: '#/components/schemas/Verdict' }, reason_code: { type: string }, note: { type: string } } }
+      responses:
+        '200': { description: Reviewed, content: { application/json: { schema: { $ref: '#/components/schemas/ShotDefect' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /timeline:
+    get:
+      tags: [analysis]
+      summary: Timeline events around a mould/machine — lot change, parameter edit, maintenance, purge, startup (FR-04, FR-15)
+      operationId: getTimeline
+      parameters: [ { $ref: '#/components/parameters/MouldFilter' }, { name: machine, in: query, schema: { type: string } }, { $ref: '#/components/parameters/From' }, { $ref: '#/components/parameters/To' } ]
+      responses:
+        '200': { description: Events, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/TimelineEvent' } } } } }
+  /parameter-changes:
+    get:
+      tags: [analysis]
+      summary: Parameter changes (who / when / old / new) (FR-04)
+      operationId: listParameterChanges
+      parameters: [ { name: machine, in: query, schema: { type: string } }, { $ref: '#/components/parameters/From' }, { $ref: '#/components/parameters/To' } ]
+      responses:
+        '200': { description: Changes, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ParameterChange' } } } } }
+    post:
+      tags: [analysis]
+      summary: Record a change the controller did not expose (manual entry, technician+) — becomes a timeline event
+      operationId: createParameterChange
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ParameterChange' }
+      responses:
+        '201': { description: Recorded, content: { application/json: { schema: { $ref: '#/components/schemas/ParameterChange' } } } }
+  /startup-events:
+    post:
+      tags: [analysis]
+      summary: Record a startup / mould change / purge / material change (technician+) — the next N shots are transients (FR-16)
+      operationId: createStartupEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartupEvent' }
+      responses:
+        '201': { description: Recorded, content: { application/json: { schema: { $ref: '#/components/schemas/StartupEvent' } } } }
+  /data-quality:
+    get:
+      tags: [analysis]
+      summary: Data-quality flags per day (missing zone temperature, stuck values, clock skew) (FR-05)
+      operationId: getDataQuality
+      parameters: [ { $ref: '#/components/parameters/MouldFilter' }, { $ref: '#/components/parameters/From' }, { $ref: '#/components/parameters/To' } ]
+      responses:
+        '200': { description: Data quality, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/DataQualityDay' } } } } }
+  /drift:
+    get:
+      tags: [analysis]
+      summary: Parameter drift — slopes over the last N shots vs the setup sheet (FR-14)
+      operationId: getDrift
+      parameters: [ { name: mould, in: query, required: true, schema: { type: string } }, { name: shots, in: query, schema: { type: integer, default: 200, minimum: 50, maximum: 5000 } } ]
+      responses:
+        '200': { description: Drift, content: { application/json: { schema: { $ref: '#/components/schemas/DriftReport' } } } }
+  /transients:
+    get:
+      tags: [analysis]
+      summary: Startup transients in a window (shown, excluded from trends) (FR-16)
+      operationId: listTransients
+      parameters: [ { $ref: '#/components/parameters/MouldFilter' }, { $ref: '#/components/parameters/From' }, { $ref: '#/components/parameters/To' } ]
+      responses:
+        '200': { description: Transients, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/StartupEvent' } } } } }
+  /scrap-cost:
+    get:
+      tags: [analysis]
+      summary: Scrap cost per defect class per period (FR-17)
+      operationId: getScrapCost
+      parameters: [ { $ref: '#/components/parameters/MouldFilter' }, { $ref: '#/components/parameters/From' }, { $ref: '#/components/parameters/To' } ]
+      responses:
+        '200': { description: Scrap cost, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ScrapCostRow' } } } } }
+  /colour-references:
+    get:
+      tags: [shots]
+      summary: Colour references (Lab, chart, threshold) per SKU (FR-09, AI-04)
+      operationId: listColourReferences
+      responses:
+        '200': { description: References, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ColourReference' } } } } }
+    post:
+      tags: [shots]
+      summary: Add a colour reference (engineer+)
+      operationId: createColourReference
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ColourReference' }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/ColourReference' } } } }
+
+  # ------------------------------------------------------------------
+  # RCA sessions (FR-20…FR-26)
+  # ------------------------------------------------------------------
+  /rca/sessions/{id}:
+    get:
+      tags: [rca]
+      summary: Session with ranking, dialogue, advice, suggestions, outcomes
+      operationId: getRcaSession
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      responses:
+        '200': { description: Session, content: { application/json: { schema: { $ref: '#/components/schemas/RcaSession' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /rca/sessions/{id}/ranking:
+    get:
+      tags: [rca]
+      summary: The ranking with components and weights — "why this order" (AI-05)
+      operationId: getRcaRanking
+      parameters: [ { $ref: '#/components/parameters/SessionId' }, { name: turn, in: query, schema: { type: integer }, description: "defaults to the latest turn" } ]
+      responses:
+        '200': { description: Ranking, content: { application/json: { schema: { $ref: '#/components/schemas/CauseRanking' } } } }
+  /rca/sessions/{id}/advice:
+    get:
+      tags: [rca]
+      summary: Advice — checks first, then parameter changes with direction, range, window and side effects (FR-22, FR-23, C-04)
+      operationId: getRcaAdvice
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      responses:
+        '200': { description: Advice, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Advice' } } } } }
+  /rca/sessions/{id}/advice/{ordinal}/done:
+    post:
+      tags: [rca]
+      summary: Mark a check or action as done (technician+)
+      operationId: markAdviceDone
+      parameters: [ { $ref: '#/components/parameters/SessionId' }, { name: ordinal, in: path, required: true, schema: { type: integer } } ]
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Advice' } } } }
+  /rca/sessions/{id}/suggestions:
+    get:
+      tags: [rca]
+      summary: Suggestions with their window verdict (allowed | blocked)
+      operationId: listSuggestions
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      responses:
+        '200': { description: Suggestions, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ParameterSuggestion' } } } } }
+    post:
+      tags: [rca]
+      summary: Validate a concrete parameter value against the documented window (C-05, AI-09) — outside → blocked and audited, never allowed
+      operationId: createSuggestion
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [parameter, current_value, suggested_value], properties: { parameter: { type: string }, unit: { type: string }, current_value: { type: number }, suggested_value: { type: number }, advice_ordinal: { type: integer } } }
+      responses:
+        '201': { description: Suggestion (check `blocked`), content: { application/json: { schema: { $ref: '#/components/schemas/ParameterSuggestion' } } } }
+  /rca/sessions/{id}/actions:
+    post:
+      tags: [rca]
+      summary: Record what the technician applied (FR-24)
+      operationId: recordAction
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [action, applied_at], properties: { action: { type: string }, advice_ordinal: { type: integer }, applied_at: { type: string, format: date-time }, parameter: { type: string }, value: { type: number } } }
+      responses:
+        '201': { description: Recorded, content: { application/json: { schema: { $ref: '#/components/schemas/ActionOutcome' } } } }
+  /rca/sessions/{id}/outcomes:
+    get:
+      tags: [rca]
+      summary: Effectiveness results (FR-24)
+      operationId: listOutcomes
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      responses:
+        '200': { description: Outcomes, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ActionOutcome' } } } } }
+    post:
+      tags: [rca]
+      summary: Verify effectiveness — before/after defect rates with the two-proportion test; `effective` is computed, never typed (FR-24, AC-07)
+      operationId: verifyEffectiveness
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [action_id, after_from, after_to], properties: { action_id: { type: string, format: uuid }, after_from: { type: string, format: date-time }, after_to: { type: string, format: date-time } } }
+      responses:
+        '201': { description: Outcome, content: { application/json: { schema: { $ref: '#/components/schemas/ActionOutcome' } } } }
+        '409': { description: "Insufficient after-window shots (INSUFFICIENT_SAMPLE)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /rca/sessions/{id}/verify:
+    post:
+      tags: [rca]
+      summary: Record the verified cause (engineer+) — must be one of the ranked causes
+      operationId: verifyCause
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [cause_code], properties: { cause_code: { type: string }, note: { type: string } } }
+      responses:
+        '200': { description: Verified, content: { application/json: { schema: { $ref: '#/components/schemas/RcaSession' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: "CAUSE_NOT_RANKED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /rca/sessions/{id}/close:
+    post:
+      tags: [rca]
+      summary: Close the session — verified, design cause or unresolved; verified outcomes become knowledge (FR-25)
+      operationId: closeRcaSession
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [closure_kind], properties: { closure_kind: { type: string, enum: [verified, design_cause, unresolved] }, note: { type: string } } }
+      responses:
+        '200': { description: Closed, content: { application/json: { schema: { $ref: '#/components/schemas/RcaSession' } } } }
+        '409': { description: "CLOSURE_UNVERIFIED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /rca/sessions/{id}/handoff-8d:
+    post:
+      tags: [rca]
+      summary: Hand the session to QE-Agent — creates the quality case and the 8D draft there (FR-26, IF-62)
+      operationId: handoff8d
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      responses:
+        '201': { description: QE case and draft created, content: { application/json: { schema: { type: object, properties: { case_id: { type: string, format: uuid }, artifact: { $ref: '#/components/schemas/Artifact' } } } } } }
+        '503': { description: "QE-Agent unavailable (QE_UNAVAILABLE)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /rca/sessions/{id}/term-check:
+    get:
+      tags: [rca]
+      summary: Japanese moulding-terminology check of the dialogue texts (FR-27, AC-08)
+      operationId: getRcaTermCheck
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      responses:
+        '200': { description: Hits, content: { application/json: { schema: { type: array, items: { type: object, properties: { found: { type: string }, expected: { type: string }, turn: { type: integer } } } } } } }
+
+  # ------------------------------------------------------------------
+  # Knowledge base (FR-19, FR-25, C-03, AI-08, NFR-08)
+  # ------------------------------------------------------------------
+  /knowledge/defects:
+    get:
+      tags: [knowledge]
+      summary: Defect classes covered by the active version
+      operationId: listKbDefects
+      responses:
+        '200': { description: Defects, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/KbDefect' } } } } }
+  /knowledge/versions:
+    get:
+      tags: [knowledge]
+      summary: Knowledge-base versions with author, approver, status
+      operationId: listKbVersions
+      responses:
+        '200': { description: Versions, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/KbVersion' } } } } }
+    post:
+      tags: [knowledge]
+      summary: Import a draft version from YAML entries (engineer+) — validated against schemas/kb-entry.schema.json
+      operationId: importKbVersion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [version, entries], properties: { version: { type: string }, notes: { type: string }, entries: { type: array, items: { $ref: '#/components/schemas/KbEntry' } } } }
+      responses:
+        '201': { description: Draft created, content: { application/json: { schema: { $ref: '#/components/schemas/KbVersion' } } } }
+        '422': { description: "KB_SHAPE / KB_ACTION_SHAPE / source missing", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /knowledge/versions/{id}/approve:
+    post:
+      tags: [knowledge]
+      summary: Approve a version (process engineer, not the author) — becomes the active ranking source; immutable afterwards
+      operationId: approveKbVersion
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Approved, content: { application/json: { schema: { $ref: '#/components/schemas/KbVersion' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: "KB_SELF_APPROVAL", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /knowledge/versions/{id}/causes:
+    get:
+      tags: [knowledge]
+      summary: Causes of a version
+      operationId: listKbCauses
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Causes, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/KbCause' } } } } }
+  /knowledge/evidence:
+    get:
+      tags: [knowledge]
+      summary: Verified cause–action–outcome evidence written back from sessions (FR-25)
+      operationId: listKbEvidence
+      parameters: [ { name: cause_code, in: query, schema: { type: string } } ]
+      responses:
+        '200': { description: Evidence, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/KbEvidence' } } } } }
+
+  # ------------------------------------------------------------------
+  # Evaluation (AI-02, AI-07)
+  # ------------------------------------------------------------------
+  /eval/vision-runs:
+    get:
+      tags: [evaluation]
+      summary: Vision evaluation runs with computed gates (mAP ≥ 0.80; recall ≥ 0.95 on critical classes)
+      operationId: listVisionEvalRuns
+      responses:
+        '200': { description: Runs, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/VisionEvalRun' } } } } }
+    post:
+      tags: [evaluation]
+      summary: Record a hold-out evaluation (ML owner)
+      operationId: createVisionEvalRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VisionEvalRun' }
+      responses:
+        '201': { description: Recorded (passed computed), content: { application/json: { schema: { $ref: '#/components/schemas/VisionEvalRun' } } } }
+  /eval/golden-runs:
+    get:
+      tags: [evaluation]
+      summary: Golden-set runs (≥ 15 incidents; top-3 ≥ 70 %)
+      operationId: listGoldenRuns
+      responses:
+        '200': { description: Runs, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/GoldenRun' } } } } }
+    post:
+      tags: [evaluation]
+      summary: Run the golden set against a KB version and scoring config (admin)
+      operationId: startGoldenRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [kb_version_id], properties: { kb_version_id: { type: string, format: uuid }, scoring_config_id: { type: string, format: uuid } } }
+      responses:
+        '202': { description: Started, content: { application/json: { schema: { $ref: '#/components/schemas/GoldenRun' } } } }
+
+  # ------------------------------------------------------------------
+  # Admin and system
+  # ------------------------------------------------------------------
+  /scoring-config:
+    get:
+      tags: [admin]
+      summary: Active scoring weights (AI-05)
+      operationId: getScoringConfig
+      responses:
+        '200': { description: Config, content: { application/json: { schema: { $ref: '#/components/schemas/ScoringConfig' } } } }
+    put:
+      tags: [admin]
+      summary: Set a new weight version (admin) — weights sum to 1; a golden run is required before it becomes active
+      operationId: putScoringConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScoringConfig' }
+      responses:
+        '201': { description: Created (inactive until the golden run passes), content: { application/json: { schema: { $ref: '#/components/schemas/ScoringConfig' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /glossary/terms:
+    get:
+      tags: [admin]
+      summary: Moulding terminology (ヒケ, バリ, ショートショット …) with forbidden variants (FR-27)
+      operationId: listGlossaryTerms
+      responses:
+        '200': { description: Terms, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/GlossaryTerm' } } } } }
+  /config:
+    get:
+      tags: [admin]
+      summary: Effective configuration (deploy/moldmind.yaml, schema-validated)
+      operationId: getConfig
+      responses:
+        '200': { description: Configuration, content: { application/json: { schema: { $ref: '#/components/schemas/Config' } } } }
+    put:
+      tags: [admin]
+      summary: Load a configuration (admin) — validated against schemas/moldmind-config.schema.json
+      operationId: putConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Config' }
+      responses:
+        '200': { description: Loaded, content: { application/json: { schema: { $ref: '#/components/schemas/Config' } } } }
+        '422': { description: "CONFIG_INVALID", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /healthz:
+    get:
+      tags: [system]
+      summary: Liveness
+      operationId: healthz
+      security: []
+      responses:
+        '200': { description: Alive, content: { application/json: { schema: { type: object, properties: { status: { type: string } } } } } }
+  /readyz:
+    get:
+      tags: [system]
+      summary: Readiness — machine connections, vision, model (dialogue degrades to scripted questions without it)
+      operationId: readyz
+      security: []
+      responses:
+        '200': { description: Ready, content: { application/json: { schema: { $ref: '#/components/schemas/Readiness' } } } }
+        '503': { description: Not ready (NOT_READY), content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /metrics:
+    get:
+      tags: [system]
+      summary: Prometheus metrics (ICD-11 IF-14)
+      operationId: metrics
+      security: []
+      responses:
+        '200': { description: Metrics, content: { text/plain: { schema: { type: string } } } }
+
+  # ------------------------------------------------------------------
+  # Platform paths — API-00, verbatim (TEST-11 TC-008)
+  # ------------------------------------------------------------------
+  /inspections/{inspectionId}:
+    get:
+      tags: [inspections]
+      summary: Single inspection with detections, measurements and evidence
+      operationId: getInspection
+      parameters:
+        - $ref: '#/components/parameters/InspectionId'
+      responses:
+        '200':
+          description: Inspection detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InspectionDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /inspections/{inspectionId}/verdict:
+    patch:
+      tags: [inspections]
+      summary: Human override of a verdict
+      description: |
+        Requires role `inspector` or above. The override is recorded with user
+        and timestamp and never overwrites the model's original verdict
+        (SRS FR-V-03).
+      operationId: overrideVerdict
+      parameters:
+        - $ref: '#/components/parameters/InspectionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [verdict]
+              properties:
+                verdict:
+                  $ref: '#/components/schemas/Verdict'
+                reason_code:
+                  type: string
+                note:
+                  type: string
+      responses:
+        '200':
+          description: Override recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Inspection'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: New verdict identical to current verdict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /reviews:
+    get:
+      tags: [inspections]
+      summary: Pending review queue
+      description: Inspections with verdict `REVIEW` that have no override yet.
+      operationId: getReviewQueue
+      parameters:
+        - $ref: '#/components/parameters/LineFilter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Review queue page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InspectionPage'
+
+  /cases/{caseId}/artifacts/{kind}:
+    post:
+      tags: [quality]
+      summary: Draft a quality artifact (5-Why, 8D, FMEA, report)
+      description: |
+        The result is always created as a **draft**: `ai_generated = true`,
+        `approved_by = null`. A draft cannot be exported without a watermark
+        and cannot be cited as precedent until approved (SRS FR-A-04).
+      operationId: draftArtifact
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - name: kind
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/ArtifactKind'
+        - name: lang
+          in: query
+          schema:
+            $ref: '#/components/schemas/Language'
+      responses:
+        '201':
+          description: Draft created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '503':
+          $ref: '#/components/responses/ModelUnavailable'
+
+  /knowledge/search:
+    post:
+      tags: [knowledge]
+      summary: Hybrid search over documents and past cases
+      description: |
+        Combines lexical (trigram) and vector retrieval with reranking, and
+        supports cross-language retrieval — a Thai query can surface a Japanese
+        8D report.
+
+        Results are filtered by the caller's document ACL at query time, not
+        after retrieval.
+      operationId: searchKnowledge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string }
+                top_k: { type: integer, default: 5, maximum: 50 }
+                filters:
+                  type: object
+                  properties:
+                    machine: { type: string }
+                    line: { type: string }
+                    sku: { type: string }
+                    verified_only:
+                      type: boolean
+                      default: true
+                      description: >-
+                        When true (default) only human-verified case records are
+                        returned. Unverified LLM extractions are never presented
+                        as established fact.
+      responses:
+        '200':
+          description: Ranked results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/KnowledgeHit'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    ShotId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SessionId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    MouldId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    MouldFilter:
+      name: mould
+      in: query
+      schema: { type: string }
+      description: Mould code
+    From:
+      name: from
+      in: query
+      schema: { type: string, format: date-time }
+    To:
+      name: to
+      in: query
+      schema: { type: string, format: date-time }
+    InspectionId:
+      name: inspectionId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    CaseId:
+      name: caseId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    LineFilter:
+      name: line
+      in: query
+      schema: { type: string }
+      description: Line code. Restricted users only see lines in their scope.
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Opaque cursor from the previous page's `next_cursor`
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+
+  responses:
+    Forbidden:
+      description: |
+        Authenticated but not permitted. For line-scoped resources the rows are
+        never retrieved in the first place — this is not response filtering.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Resource does not exist
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ValidationFailed:
+      description: Request was well-formed but semantically invalid
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ModelUnavailable:
+      description: |
+        The language model is unavailable. Deterministic features (charts,
+        statistics, queues) remain available.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 7807 problem details with a stable machine-readable `code`.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          description: Stable error code — see API-Specification.md §7
+        correlation_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+    Language:
+      type: string
+      enum: [th, ja, en]
+      default: th
+    Verdict:
+      type: string
+      enum: [PASS, FAIL, REVIEW, NO_READ]
+      description: |
+        `NO_READ` means the frame failed the quality gate and nothing was
+        judged. It is deliberately distinct from `PASS`.
+    Inspection:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        line: { type: string }
+        sku: { type: [string, 'null'] }
+        station: { type: [string, 'null'] }
+        lot: { type: [string, 'null'] }
+        verdict:
+          $ref: '#/components/schemas/Verdict'
+        original_verdict:
+          $ref: '#/components/schemas/Verdict'
+        overridden:
+          type: boolean
+          description: True when a human changed the model's verdict
+        model_version: { type: [string, 'null'] }
+        latency_ms: { type: [integer, 'null'] }
+        image_url:
+          type: [string, 'null']
+          description: Signed URL, short-lived
+        overlay_url: { type: [string, 'null'] }
+    InspectionDetail:
+      allOf:
+        - $ref: '#/components/schemas/Inspection'
+        - type: object
+          properties:
+            detections:
+              type: array
+              items:
+                type: object
+                properties:
+                  class_name: { type: string }
+                  confidence: { type: number }
+                  bbox: { type: object, additionalProperties: true }
+            measurements:
+              type: array
+              items:
+                type: object
+                properties:
+                  parameter: { type: string }
+                  value: { type: number }
+                  unit: { type: string }
+                  usl: { type: [number, 'null'] }
+                  lsl: { type: [number, 'null'] }
+                  in_spec: { type: boolean }
+            override_history:
+              type: array
+              items:
+                type: object
+                properties:
+                  from: { $ref: '#/components/schemas/Verdict' }
+                  to: { $ref: '#/components/schemas/Verdict' }
+                  user: { type: string }
+                  reason_code: { type: [string, 'null'] }
+                  at: { type: string, format: date-time }
+    InspectionPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Inspection'
+        next_cursor: { type: [string, 'null'] }
+        total_estimate:
+          type: [integer, 'null']
+          description: Approximate; exact counts on partitioned tables are expensive
+    ArtifactKind:
+      type: string
+      enum: [five_why, eight_d, fmea, report, ocap]
+    Artifact:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind:
+          $ref: '#/components/schemas/ArtifactKind'
+        version: { type: integer }
+        lang:
+          $ref: '#/components/schemas/Language'
+        content: { type: object, additionalProperties: true }
+        ai_generated: { type: boolean }
+        approved: { type: boolean }
+        approved_by: { type: [string, 'null'] }
+        approved_at: { type: [string, 'null'], format: date-time }
+        watermark:
+          type: [string, 'null']
+          description: Present while unapproved. Cannot be suppressed by any parameter.
+    KnowledgeHit:
+      type: object
+      properties:
+        kind: { type: string, enum: [case, document_chunk] }
+        case_id: { type: [string, 'null'], format: uuid }
+        document_id: { type: [string, 'null'], format: uuid }
+        title: { type: string }
+        snippet: { type: string }
+        lang:
+          $ref: '#/components/schemas/Language'
+        score: { type: number }
+        verified:
+          type: boolean
+          description: False means LLM-extracted and not human-confirmed
+        outcome: { type: [string, 'null'] }
+        matched_on:
+          type: array
+          items: { type: string }
+          description: Why this result matched — shown to the user
+        source_url: { type: [string, 'null'] }
+
+    # ---- MoldMind schemas
+    DefectClass:
+      type: string
+      enum: [short_shot, flash, sink_mark, burn_mark, weld_line, silver_streak, warpage, contamination, colour_deviation, scratch]
+      description: FR-06 — the ten injection-moulding classes
+    PartRegion:
+      type: string
+      enum: [gate_area, far_end, rib, boss, parting_line, other]
+    RcaStatus:
+      type: string
+      enum: [open, dialogue, advised, acting, verifying, closed]
+    ShotParams:
+      type: object
+      description: FR-01 parameters as delivered by the node map (units per node map)
+      required: [holding_pressure, holding_time, injection_pressure, injection_speed, cushion_mm, cooling_time, cycle_time_s, clamping_force]
+      properties:
+        holding_pressure: { type: number }
+        holding_time: { type: number }
+        injection_pressure: { type: number }
+        injection_speed: { type: number }
+        back_pressure: { type: number }
+        screw_rpm: { type: number }
+        cushion_mm: { type: number }
+        melt_temperature: { type: object, additionalProperties: { type: [number, 'null'] }, description: "per zone; null = missing (data-quality flag)" }
+        mould_temperature: { type: object, properties: { fixed: { type: number }, moving: { type: number } } }
+        cooling_time: { type: number }
+        cycle_time_s: { type: number }
+        clamping_force: { type: number }
+        injection_profile: { type: array, items: { type: object, properties: { t_ms: { type: integer }, pressure: { type: number }, speed: { type: number } } } }
+    ShotCreate:
+      type: object
+      required: [shot_id, ts, machine, mould, params, context]
+      properties:
+        shot_id: { type: string, format: uuid, description: "UUIDv7 generated at the gateway (idempotency key)" }
+        controller_shot_no: { type: integer }
+        ts: { type: string, format: date-time }
+        machine: { type: string }
+        mould: { type: string }
+        params: { $ref: '#/components/schemas/ShotParams' }
+        context: { $ref: '#/components/schemas/ShotContext' }
+        batch_id: { type: [string, 'null'], format: uuid, description: "set when replayed from a gateway buffer" }
+    ShotContext:
+      type: object
+      description: FR-02
+      required: [cavity_count, material_grade, lot_code]
+      properties:
+        cavity_count: { type: integer, minimum: 1 }
+        sku: { type: string }
+        material_grade: { type: string }
+        lot_code: { type: string }
+        regrind_pct: { type: number, minimum: 0, maximum: 100 }
+        dryer_temp_c: { type: number }
+        dryer_hours: { type: number }
+        ambient_temp_c: { type: number }
+        ambient_rh_pct: { type: number }
+        operator_group: { type: string }
+        shift: { type: string, enum: [A, B, C, OT] }
+    Shot:
+      allOf:
+        - { $ref: '#/components/schemas/ShotCreate' }
+        - type: object
+          properties:
+            startup_transient: { type: boolean, description: "FR-16" }
+            dq_flags: { type: array, items: { type: string }, description: "FR-05" }
+            duplicate: { type: boolean }
+    ShotDetail:
+      allOf:
+        - { $ref: '#/components/schemas/Shot' }
+        - type: object
+          properties:
+            parts: { type: array, items: { $ref: '#/components/schemas/ShotPart' } }
+            timeline_nearby: { type: array, items: { $ref: '#/components/schemas/TimelineEvent' } }
+    ShotInspection:
+      type: object
+      required: [parts]
+      properties:
+        model_version: { type: string }
+        parts:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [cavity_no, image_ts, cavity_method, verdict, detections]
+            properties:
+              cavity_no: { type: integer, minimum: 1 }
+              image_ts: { type: string, format: date-time }
+              image_uri: { type: string }
+              align_method: { type: string, enum: [shot_id, timestamp], default: shot_id }
+              cavity_method: { type: string, enum: [ocr_marking, robot_position, sequence] }
+              ocr_text: { type: [string, 'null'] }
+              verdict: { $ref: '#/components/schemas/Verdict' }
+              anomaly_score: { type: [number, 'null'] }
+              colour_lab: { type: [array, 'null'], items: { type: number }, minItems: 3, maxItems: 3, description: "measured Lab of the part; ΔE computed against the reference chart (AI-04)" }
+              detections:
+                type: array
+                items:
+                  type: object
+                  required: [defect_class, confidence, region]
+                  properties:
+                    defect_class: { $ref: '#/components/schemas/DefectClass' }
+                    confidence: { type: number, minimum: 0, maximum: 1 }
+                    region: { $ref: '#/components/schemas/PartRegion' }
+                    bbox: { type: object, additionalProperties: { type: number } }
+    ShotInspectionResult:
+      type: object
+      properties:
+        shot_id: { type: string, format: uuid }
+        parts:
+          type: array
+          items:
+            type: object
+            properties:
+              shot_part_id: { type: string, format: uuid }
+              cavity_no: { type: integer }
+              delta_ms: { type: integer }
+              tolerance_ms: { type: integer }
+              align_method: { type: string }
+              cavity_method: { type: string }
+              defects: { type: array, items: { $ref: '#/components/schemas/ShotDefect' } }
+              review_required: { type: boolean }
+    ShotPart:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        cavity_no: { type: integer }
+        verdict: { $ref: '#/components/schemas/Verdict' }
+        inspection_id: { type: [string, 'null'], format: uuid }
+        alignment: { type: object, properties: { delta_ms: { type: integer }, tolerance_ms: { type: integer }, align_method: { type: string }, cavity_method: { type: string }, ocr_text: { type: [string, 'null'] } } }
+        defects: { type: array, items: { $ref: '#/components/schemas/ShotDefect' } }
+    ShotDefect:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        shot_id: { type: string, format: uuid }
+        cavity_no: { type: integer }
+        defect_class: { $ref: '#/components/schemas/DefectClass' }
+        confidence: { type: number }
+        region: { $ref: '#/components/schemas/PartRegion' }
+        bbox: { type: [object, 'null'], additionalProperties: { type: number } }
+        delta_e: { type: [number, 'null'] }
+        anomaly_score: { type: [number, 'null'] }
+        model_version: { type: string }
+        review_required: { type: boolean }
+        review_verdict: { oneOf: [ { $ref: '#/components/schemas/Verdict' }, { type: 'null' } ] }
+        reviewed_by: { type: [string, 'null'] }
+        ts: { type: string, format: date-time }
+    ColourReference:
+      type: object
+      required: [sku, chart_id, lab]
+      properties:
+        id: { type: string, format: uuid }
+        sku: { type: string }
+        chart_id: { type: string }
+        lab: { type: array, items: { type: number }, minItems: 3, maxItems: 3 }
+        delta_e_threshold: { type: number, default: 2.0 }
+        lighting_ref: { type: string }
+        formula: { type: string, enum: [cie76, cie2000], default: cie76 }
+    CavityAnalysis:
+      type: object
+      properties:
+        mould: { type: string }
+        window: { type: object, properties: { from: { type: string, format: date-time }, to: { type: string, format: date-time } } }
+        transients_excluded: { type: integer }
+        min_parts_for_flag: { type: integer, default: 200 }
+        alpha: { type: number, default: 0.01 }
+        cavities:
+          type: array
+          items:
+            type: object
+            properties:
+              cavity_no: { type: integer }
+              parts: { type: integer }
+              failed: { type: integer }
+              fail_rate_pct: { type: number }
+              defects_by_class: { type: object, additionalProperties: { type: integer } }
+              flag: { type: object, properties: { x: { type: integer }, n: { type: integer }, others_x: { type: integer }, others_n: { type: integer }, z: { type: number }, p_value: { type: number }, flagged: { type: boolean } } }
+    ParameterDeltaReport:
+      type: object
+      properties:
+        mould: { type: string }
+        defect_class: { $ref: '#/components/schemas/DefectClass' }
+        window: { type: string }
+        transients_excluded: { type: integer }
+        rows:
+          type: array
+          items:
+            type: object
+            properties:
+              parameter: { type: string }
+              unit: { type: string }
+              n_defective: { type: integer }
+              mean_defective: { type: number }
+              sd_defective: { type: number }
+              n_good: { type: integer }
+              mean_good: { type: number }
+              sd_good: { type: number }
+              delta: { type: number }
+              cohens_d: { type: [number, 'null'] }
+              welch_t: { type: [number, 'null'] }
+              ci95: { type: [array, 'null'], items: { type: number } }
+              kb_direction_match: { type: [string, 'null'], description: "which KB causes' typical_params this delta supports" }
+    GoldenRunDiff:
+      type: object
+      properties:
+        mould: { type: string }
+        setup_version: { type: integer }
+        approved_by: { type: string }
+        as_of: { type: string, format: date-time }
+        rows: { type: array, items: { type: object, properties: { parameter: { type: string }, target: { type: number }, tolerance: { type: number }, current_value: { type: number }, deviation: { type: number }, out_of_tolerance: { type: boolean } } } }
+    DriftReport:
+      type: object
+      properties:
+        mould: { type: string }
+        shots: { type: integer }
+        rows: { type: array, items: { type: object, properties: { parameter: { type: string }, slope_per_shot: { type: number }, unit: { type: string }, projected_out_of_tolerance_in_shots: { type: [integer, 'null'] } } } }
+    TimelineEvent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        kind: { type: string, description: "lot_change | parameter_edit | maintenance | tool_change | purge | mould_change | shift_change | startup:… | alarm" }
+        machine: { type: [string, 'null'] }
+        mould: { type: [string, 'null'] }
+        detail: { type: object, additionalProperties: true }
+    ParameterChange:
+      type: object
+      required: [machine, ts, parameter, new_value]
+      properties:
+        id: { type: string, format: uuid }
+        machine: { type: string }
+        mould: { type: [string, 'null'] }
+        ts: { type: string, format: date-time }
+        parameter: { type: string }
+        old_value: { type: [number, 'null'] }
+        new_value: { type: number }
+        unit: { type: string }
+        changed_by: { type: [string, 'null'] }
+        source: { type: string, enum: [controller, manual_entry] }
+        timeline_event_id: { type: [string, 'null'], format: uuid }
+    StartupEvent:
+      type: object
+      required: [machine, ts, kind]
+      properties:
+        id: { type: string, format: uuid }
+        machine: { type: string }
+        mould: { type: [string, 'null'] }
+        ts: { type: string, format: date-time }
+        kind: { type: string, enum: [startup_after_stop, mould_change, purge, material_change] }
+        stop_minutes: { type: [integer, 'null'] }
+        transient_shots: { type: integer, default: 20 }
+    DataQualityDay:
+      type: object
+      properties:
+        day: { type: string, format: date }
+        mould: { type: string }
+        shots: { type: integer }
+        flagged_shots: { type: integer }
+        transient_shots: { type: integer }
+        flags: { type: object, additionalProperties: { type: integer } }
+    ScrapCostRow:
+      type: object
+      properties:
+        day: { type: string, format: date }
+        mould: { type: string }
+        sku: { type: string }
+        defect_class: { $ref: '#/components/schemas/DefectClass' }
+        defects: { type: integer }
+        unit_cost_thb: { type: number }
+        cost_thb: { type: number }
+    MachineConnection:
+      type: object
+      required: [machine, protocol, endpoint, credential_ref]
+      properties:
+        id: { type: string, format: uuid }
+        machine: { type: string }
+        protocol: { type: string, enum: [opcua_euromap77, euromap63_file, mqtt] }
+        endpoint: { type: string }
+        security_policy: { type: string, default: Basic256Sha256/SignAndEncrypt }
+        credential_ref: { type: string, description: "secret file name — the account is read-only, enforced on the server" }
+        credential_kind: { type: string, enum: [read_only], default: read_only }
+        buffer_hours: { type: integer, minimum: 24, default: 24 }
+        active: { type: boolean }
+        node_map_version: { type: [string, 'null'] }
+        last_shot_ts: { type: [string, 'null'], format: date-time }
+    NodeMap:
+      type: object
+      description: deploy/machines/<machine>.opcua.yaml (schemas/opcua-nodemap.schema.json)
+      additionalProperties: true
+      required: [version, nodes]
+      properties:
+        version: { type: string }
+        checksum: { type: string }
+        validated_at: { type: [string, 'null'], format: date-time }
+        nodes: { type: array, items: { type: object, properties: { node_id: { type: string }, signal: { type: string }, unit: { type: string }, access: { type: string, enum: [read] } } } }
+    ConnectionTest:
+      type: object
+      properties:
+        reachable: { type: boolean }
+        nodes_resolved: { type: integer }
+        nodes_unresolved: { type: array, items: { type: string } }
+        write_refused_by_server: { type: boolean, description: "a deliberate write attempt must be refused (NFR-06)" }
+        lag_ms: { type: [integer, 'null'] }
+    GatewayBatch:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        connection_id: { type: string, format: uuid }
+        outage_from: { type: string, format: date-time }
+        outage_to: { type: string, format: date-time }
+        shots_buffered: { type: integer }
+        shots_inserted: { type: integer }
+        duplicates: { type: integer }
+        reconciled_at: { type: [string, 'null'], format: date-time }
+        reason: { type: [string, 'null'] }
+    Mould:
+      type: object
+      required: [code, cavities]
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        cavities: { type: integer, minimum: 1 }
+        material_spec: { type: string }
+        last_maintenance: { type: [string, 'null'], format: date-time }
+        active_setup_version: { type: [integer, 'null'] }
+    SetupSheet:
+      type: object
+      required: [material_grade, params]
+      properties:
+        id: { type: string, format: uuid }
+        mould: { type: string }
+        version: { type: integer }
+        material_grade: { type: string }
+        params: { type: object, additionalProperties: { type: object, required: [target, tol], properties: { target: { type: number }, tol: { type: number } } }, description: "FR-18 golden run" }
+        author: { type: [string, 'null'] }
+        approved_by: { type: [string, 'null'] }
+        approved_at: { type: [string, 'null'], format: date-time }
+        active: { type: boolean }
+    ParameterWindow:
+      type: object
+      required: [material_grade, parameter, unit, lo, hi, source]
+      properties:
+        id: { type: string, format: uuid }
+        material_grade: { type: string }
+        parameter: { type: string }
+        unit: { type: string }
+        lo: { type: number }
+        hi: { type: number }
+        source: { type: string, description: "mould datasheet / material datasheet / process validation (C-05)" }
+        approved_by: { type: [string, 'null'] }
+    RcaSessionCreate:
+      type: object
+      required: [defect_class, mould]
+      properties:
+        defect_class: { $ref: '#/components/schemas/DefectClass' }
+        mould: { type: string }
+        machine: { type: string }
+        window_from: { type: string, format: date-time }
+        window_to: { type: string, format: date-time }
+        lang: { $ref: '#/components/schemas/Language' }
+    RcaSessionSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        opened_at: { type: string, format: date-time }
+        defect_class: { $ref: '#/components/schemas/DefectClass' }
+        mould: { type: string }
+        status: { $ref: '#/components/schemas/RcaStatus' }
+        top_cause: { type: [string, 'null'] }
+        answers: { type: integer }
+        blocked_suggestions: { type: integer }
+        effective: { type: [boolean, 'null'] }
+        handed_off: { type: boolean }
+    RcaSession:
+      allOf:
+        - { $ref: '#/components/schemas/RcaSessionSummary' }
+        - type: object
+          properties:
+            machine: { type: [string, 'null'] }
+            window: { type: object, properties: { from: { type: string, format: date-time }, to: { type: string, format: date-time } } }
+            kb_version: { type: string }
+            scoring_version: { type: string }
+            lang: { $ref: '#/components/schemas/Language' }
+            ranking: { $ref: '#/components/schemas/CauseRanking' }
+            next_question: { type: [object, 'null'], properties: { key: { type: string }, text: { type: string }, lang: { $ref: '#/components/schemas/Language' } } }
+            turns: { type: array, items: { type: object, properties: { turn_no: { type: integer }, question_key: { type: string }, question_text: { type: string }, answer: { type: [string, 'null'] }, answer_norm: { type: [string, 'null'] }, answered_at: { type: [string, 'null'], format: date-time } } } }
+            advice: { type: array, items: { $ref: '#/components/schemas/Advice' } }
+            suggestions: { type: array, items: { $ref: '#/components/schemas/ParameterSuggestion' } }
+            outcomes: { type: array, items: { $ref: '#/components/schemas/ActionOutcome' } }
+            verified_cause: { type: [string, 'null'] }
+            verified_by: { type: [string, 'null'] }
+            closure_kind: { type: [string, 'null'], enum: [verified, design_cause, unresolved, null] }
+            qe_case_id: { type: [string, 'null'], format: uuid }
+            facts_digest: { type: string, description: "sha256 of the rca-facts object handed to the dialogue model (IF-60)" }
+            mode: { type: string, enum: [full, scripted], description: "scripted = model unavailable; questions come from the KB check list" }
+    CauseRanking:
+      type: object
+      description: AI-05 — inspectable; score = Σ weight × component
+      properties:
+        turn_no: { type: integer }
+        weights: { type: object, properties: { prior: { type: number }, delta: { type: number }, timeline: { type: number }, case: { type: number } } }
+        causes:
+          type: array
+          items:
+            type: object
+            properties:
+              rank: { type: integer }
+              cause_code: { type: string }
+              cause: { type: object, properties: { th: { type: string }, ja: { type: string }, en: { type: string } } }
+              components: { type: object, properties: { prior: { type: number }, delta: { type: number }, timeline: { type: number }, case: { type: number } } }
+              score: { type: number }
+              evidence: { type: array, items: { type: string } }
+              design_cause: { type: boolean }
+    RcaAnswer:
+      type: object
+      required: [question_key, answer]
+      properties:
+        question_key: { type: string }
+        answer: { type: string, maxLength: 500 }
+        answer_norm: { type: string, enum: [yes, no, unknown, value] }
+        value: { type: [number, 'null'] }
+    Advice:
+      type: object
+      properties:
+        ordinal: { type: integer }
+        kind: { type: string, enum: [check, action] }
+        cause_code: { type: [string, 'null'] }
+        text: { type: object, properties: { th: { type: string }, ja: { type: string }, en: { type: string } } }
+        parameter: { type: [string, 'null'] }
+        direction: { type: [string, 'null'], enum: [up, down, null] }
+        magnitude_range: { type: [string, 'null'] }
+        window_ref: { type: [string, 'null'] }
+        side_effects: { type: [string, 'null'] }
+        done: { type: boolean }
+        done_by: { type: [string, 'null'] }
+        done_at: { type: [string, 'null'], format: date-time }
+    ParameterSuggestion:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        parameter: { type: string }
+        unit: { type: [string, 'null'] }
+        current_value: { type: number }
+        suggested_value: { type: number }
+        direction: { type: string, enum: [up, down] }
+        magnitude_pct: { type: number }
+        window: { type: [object, 'null'], properties: { lo: { type: number }, hi: { type: number }, source: { type: string } } }
+        allowed: { type: boolean }
+        blocked: { type: boolean }
+        block_reason: { type: [string, 'null'] }
+    ActionOutcome:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        action: { type: string }
+        applied_at: { type: string, format: date-time }
+        applied_by: { type: [string, 'null'] }
+        before: { type: object, properties: { x: { type: integer }, n: { type: integer }, rate: { type: number } } }
+        after: { type: [object, 'null'], properties: { x: { type: integer }, n: { type: integer }, rate: { type: number } } }
+        z: { type: [number, 'null'] }
+        p_value: { type: [number, 'null'] }
+        effective: { type: [boolean, 'null'], description: "computed: p < 0.05 and after < before" }
+        outcome: { type: [string, 'null'], enum: [effective, not_effective, inconclusive, null] }
+    KbDefect:
+      type: object
+      properties:
+        class: { $ref: '#/components/schemas/DefectClass' }
+        description: { type: object, properties: { th: { type: string }, ja: { type: string }, en: { type: string } } }
+        causes: { type: integer }
+    KbEntry:
+      type: object
+      description: deploy/kb/<class>.yaml (schemas/kb-entry.schema.json) — SRS-11 Appendix A shape
+      required: [defect, causes]
+      properties:
+        defect: { $ref: '#/components/schemas/DefectClass' }
+        description_th: { type: string }
+        description_ja: { type: string }
+        description_en: { type: string }
+        version: { type: string }
+        causes: { type: array, items: { $ref: '#/components/schemas/KbCause' } }
+    KbCause:
+      type: object
+      required: [cause, prior_weight, source]
+      properties:
+        cause: { type: string }
+        name_th: { type: string }
+        name_ja: { type: string }
+        name_en: { type: string }
+        prior_weight: { type: number, minimum: 0, maximum: 1 }
+        typical_params: { type: object, additionalProperties: { type: string, enum: [up, down, low, high, unstable] } }
+        checks: { type: array, items: { type: string } }
+        actions: { type: array, items: { type: object, required: [param, direction, range, window_ref, side_effects], properties: { param: { type: string }, direction: { type: string, enum: [up, down] }, range: { type: string }, window_ref: { type: string }, side_effects: { type: string } } } }
+        design_cause: { type: boolean }
+        note: { type: string }
+        source: { type: string }
+        evidence_count: { type: integer, description: "verified outcomes written back (FR-25)" }
+    KbVersion:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        version: { type: string }
+        status: { type: string, enum: [draft, approved, retired] }
+        author: { type: string }
+        approved_by: { type: [string, 'null'] }
+        approved_at: { type: [string, 'null'], format: date-time }
+        checksum: { type: string }
+        causes: { type: integer }
+        defects_covered: { type: integer }
+        notes: { type: [string, 'null'] }
+    KbEvidence:
+      type: object
+      properties:
+        cause_code: { type: string }
+        session_id: { type: string, format: uuid }
+        outcome: { type: string, enum: [effective, not_effective, inconclusive] }
+        action: { type: string }
+        before_rate: { type: number }
+        after_rate: { type: number }
+        p_value: { type: number }
+        created_at: { type: string, format: date-time }
+    ScoringConfig:
+      type: object
+      required: [version, w_prior, w_delta, w_timeline, w_case]
+      properties:
+        id: { type: string, format: uuid }
+        version: { type: string }
+        w_prior: { type: number, minimum: 0, maximum: 1 }
+        w_delta: { type: number, minimum: 0, maximum: 1 }
+        w_timeline: { type: number, minimum: 0, maximum: 1 }
+        w_case: { type: number, minimum: 0, maximum: 1 }
+        active: { type: boolean }
+    VisionEvalRun:
+      type: object
+      required: [model_version, family, holdout_n, map50, recall]
+      properties:
+        id: { type: string, format: uuid }
+        ran_at: { type: string, format: date-time }
+        model_version: { type: string }
+        family: { type: string }
+        holdout_n: { type: integer }
+        map50: { type: number }
+        recall: { type: object, additionalProperties: { type: number } }
+        passed: { type: [boolean, 'null'], description: "computed: mAP ≥ 0.80 and recall ≥ 0.95 for short_shot, flash, contamination" }
+        notes: { type: [string, 'null'] }
+    GoldenRun:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ran_at: { type: string, format: date-time }
+        kb_version: { type: string }
+        scoring_version: { type: string }
+        incidents: { type: integer }
+        top3_hits: { type: integer }
+        top3_rate: { type: [number, 'null'] }
+        passed: { type: [boolean, 'null'], description: "computed: ≥ 15 incidents and top3_rate ≥ 0.70" }
+    GlossaryTerm:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ja: { type: string }
+        ja_reading: { type: [string, 'null'] }
+        th: { type: [string, 'null'] }
+        en: { type: [string, 'null'] }
+        forbidden: { type: array, items: { type: string } }
+    Config:
+      type: object
+      description: The deploy/moldmind.yaml document (schemas/moldmind-config.schema.json)
+      additionalProperties: true
+      properties:
+        version: { type: string }
+    Readiness:
+      type: object
+      properties:
+        ready: { type: boolean }
+        mode: { type: string, enum: [full, scripted] }
+        machines: { type: object, additionalProperties: { type: string } }
+        vision: { type: string }
+        model: { type: [string, 'null'] }

@@ -1,0 +1,59 @@
+# MoldMind knowledge-base entry — SRS-11 Appendix A (verbatim content, IF-59 shape)
+# Loaded with:  mmctl kb import kb/*.yaml --version kb-2026.09.1   → draft version; a process engineer (not the author) approves it.
+# Rules the loader and the database enforce: every cause cites a source; every non-design cause has at least one check;
+# every action carries param, direction, range, window_ref and side_effects (FR-23); prior weights are 0–1.
+defect: sink_mark
+description_th: "รอยยุบ — รอยบุ๋มบนผิวจากการหดตัวเชิงปริมาตรของส่วนหนา"
+description_ja: "ヒケ — 厚肉部の体積収縮による表面のくぼみ"
+description_en: "Sink mark — surface depression from volumetric shrinkage at thick sections"
+causes:
+  - cause: insufficient_holding_pressure
+    name_ja: 保圧不足
+    name_th: แรงดันย้ำไม่พอ
+    prior_weight: 0.30
+    typical_params: { holding_pressure: down, cushion: low }
+    checks:
+      - "Verify cushion value vs setup sheet (target 3–6 mm)"
+      - "Check holding pressure trace against golden run"
+    actions:
+      - { param: holding_pressure, direction: up, range: "+5..+15 %",
+          window_ref: setup_sheet, side_effects: "risk of flash, increased internal stress" }
+    source: "Internal case #178; molding troubleshooting guide §4.2"
+  - cause: holding_time_too_short
+    name_ja: 保圧時間不足
+    prior_weight: 0.20
+    typical_params: { holding_time: down }
+    checks: ["Confirm gate seal time by gate-freeze study"]
+    actions:
+      - { param: holding_time, direction: up, range: "+1..+2 s", window_ref: setup_sheet, side_effects: "longer cycle time" }
+    source: "molding troubleshooting guide §4.2"
+  - cause: melt_temperature_too_high
+    name_ja: 樹脂温度過高
+    prior_weight: 0.15
+    typical_params: { melt_temperature: up }
+    checks: ["Compare zone temperatures with the setup sheet"]
+    actions:
+      - { param: melt_temperature, direction: down, range: "-5..-10 C", window_ref: material_datasheet, side_effects: "short shot risk, higher injection pressure" }
+    source: "material datasheet PP-H-2000 §3"
+  - cause: mould_temperature_too_high_local
+    name_ja: 金型温度局所過高
+    prior_weight: 0.15
+    typical_params: { mould_temperature: up }
+    checks: ["Measure mould surface temperature near the thick section"]
+    actions:
+      - { param: mould_temperature, direction: down, range: "-3..-8 C", window_ref: mould_datasheet, side_effects: "weld line visibility, warpage" }
+    source: "molding troubleshooting guide §4.2; mould datasheet MLD-0417"
+  - cause: part_wall_thickness_design
+    name_ja: 肉厚設計
+    prior_weight: 0.10
+    design_cause: true
+    note: "Design cause — not correctable by parameters; route to engineering"
+    source: "design review DR-0417-02"
+  - cause: insufficient_cooling_time
+    name_ja: 冷却時間不足
+    prior_weight: 0.10
+    typical_params: { cooling_time: down }
+    checks: ["Compare cooling time with the setup sheet"]
+    actions:
+      - { param: cooling_time, direction: up, range: "+1..+3 s", window_ref: setup_sheet, side_effects: "longer cycle time" }
+    source: "molding troubleshooting guide §4.2"

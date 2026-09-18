@@ -1,0 +1,35 @@
+# MoldMind machine node map — ICD-11 IF-05 (OPC-UA / Euromap 77), validated against schemas/opcua-nodemap.schema.json at startup.
+# The account referenced by `credential` is READ-ONLY, enforced on the OPC-UA server (C-01, NFR-06); every node is access: read.
+machine: M-3
+protocol: opcua_euromap77
+endpoint: opc.tcp://10.20.3.3:4840
+security: Basic256Sha256/SignAndEncrypt
+credential: opcua_readonly_m3          # secret file name — never the secret
+version: v1
+publishing_interval_ms: 1000
+shot_trigger: { node_id: "ns=2;s=Cycle.ShotCounter", mode: on_change }   # one shot row per counter increment (cycle completion)
+buffer_hours: 24
+nodes:
+  - { node_id: "ns=2;s=Injection.HoldingPressure", signal: holding_pressure,   unit: bar,   access: read }
+  - { node_id: "ns=2;s=Injection.HoldingTime",     signal: holding_time,       unit: s,     access: read }
+  - { node_id: "ns=2;s=Injection.Pressure",        signal: injection_pressure, unit: bar,   access: read }
+  - { node_id: "ns=2;s=Injection.Speed",           signal: injection_speed,    unit: mm/s,  access: read }
+  - { node_id: "ns=2;s=Plasticising.BackPressure", signal: back_pressure,      unit: bar,   access: read }
+  - { node_id: "ns=2;s=Plasticising.ScrewSpeed",   signal: screw_rpm,          unit: rpm,   access: read }
+  - { node_id: "ns=2;s=Injection.Cushion",         signal: cushion_mm,         unit: mm,    access: read }
+  - { node_id: "ns=2;s=Temperature.Zone1",         signal: melt_z1,            unit: C,     access: read }
+  - { node_id: "ns=2;s=Temperature.Zone2",         signal: melt_z2,            unit: C,     access: read }
+  - { node_id: "ns=2;s=Temperature.Zone3",         signal: melt_z3,            unit: C,     access: read }
+  - { node_id: "ns=2;s=Temperature.Zone4",         signal: melt_z4,            unit: C,     access: read }
+  - { node_id: "ns=2;s=Mould.TempFixed",           signal: mould_temp_fixed,   unit: C,     access: read }
+  - { node_id: "ns=2;s=Mould.TempMoving",          signal: mould_temp_moving,  unit: C,     access: read }
+  - { node_id: "ns=2;s=Cycle.CoolingTime",         signal: cooling_time,       unit: s,     access: read }
+  - { node_id: "ns=2;s=Cycle.Time",                signal: cycle_time_s,       unit: s,     access: read }
+  - { node_id: "ns=2;s=Clamp.Force",               signal: clamping_force,     unit: kN,    access: read }
+  - { node_id: "ns=2;s=Cycle.ShotCounter",         signal: controller_shot_no, unit: count, access: read }
+setpoint_change_nodes:                   # FR-04: setpoint edits become parameter_change rows (who from the controller's user node when exposed)
+  - { node_id: "ns=2;s=Setpoint.HoldingPressure", signal: holding_pressure, unit: bar, access: read }
+  - { node_id: "ns=2;s=Setpoint.HoldingTime",     signal: holding_time,     unit: s,   access: read }
+  - { node_id: "ns=2;s=Setpoint.MeltTemperature", signal: melt_temperature, unit: C,   access: read }
+  - { node_id: "ns=2;s=Setpoint.CoolingTime",     signal: cooling_time,     unit: s,   access: read }
+  - { node_id: "ns=2;s=Controller.ActiveUser",    signal: controller_user,  unit: text, access: read }

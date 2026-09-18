@@ -1,0 +1,108 @@
+# MoldMind configuration — deploy/moldmind.example.yaml
+# Loaded with:  mmctl config load moldmind.yaml   (admin; PUT /config; validated against schemas/moldmind-config.schema.json)
+# Every session opened after a load carries the version. These are the values the seed was written with (DDS-11 §9):
+# alignment tolerance 1.5 s, transient window 20 shots, ΔE threshold 2.0 (CIE76), cavity flag α 0.01 / n ≥ 200,
+# scoring weights 0.35/0.30/0.20/0.15, effectiveness α 0.05, vision gates mAP ≥ 0.80 / recall ≥ 0.95, golden ≥ 15 / ≥ 0.70.
+
+version: "2026-09"
+
+acquisition:                           # FR-01…FR-05, IF-05
+  protocols: [opcua_euromap77, euromap63_file, mqtt]
+  node_maps_dir: machines              # one <machine>.opcua.yaml per press, schema-validated at startup
+  read_only: true                      # C-01 / NFR-06 — constant
+  security_policy: Basic256Sha256/SignAndEncrypt
+  shot_latency_budget_s: 2             # NFR-01
+  buffer_hours: 24                     # NFR-05
+  setpoint_changes_to_timeline: true   # FR-04 — constant
+  data_quality:                        # FR-05
+    stuck_value_shots: 30
+    clock_skew_max_s: 2.0
+    missing_zone_temp_flag: true
+
+alignment:                             # FR-03, FR-08, IF-58
+  tolerance_ms: 1500
+  align_methods: [shot_id, timestamp]
+  cavity_methods: [ocr_marking, robot_position, sequence]   # tried in this order
+  store_method: true                   # constant — AC-02 measures accuracy per method
+  unaligned_parts: exclude_from_analysis   # constant
+
+vision:                                # FR-06…FR-11, AI-01…AI-04
+  classes: [short_shot, flash, sink_mark, burn_mark, weld_line, silver_streak, warpage, contamination, colour_deviation, scratch]
+  per_family_heads: true               # AI-01
+  lighting_required_for: [sink_mark, weld_line]   # AI-03
+  review_threshold: 0.70               # FR-11
+  anomaly_review_threshold: 0.60       # FR-10
+  colour:                              # FR-09, AI-04
+    formula: cie76
+    chart_required: true               # constant — ΔE is measured against a chart in frame, never inferred
+    default_threshold: 2.0
+  eval_gates:                          # AI-02, AC-01
+    map50_min: 0.80
+    recall_min: { short_shot: 0.95, flash: 0.95, contamination: 0.95 }
+  inference_budget_ms: 150             # NFR-02
+
+analysis:                              # FR-12…FR-18
+  cavity_flag: { alpha: 0.01, min_parts: 200, test: two_proportion_z }
+  parameter_delta: { min_shots_per_group: 20, effect_size: cohens_d, test: welch_t }
+  drift: { shots: 200, method: least_squares }
+  startup_transient_shots: 20          # FR-16 / AC-06
+  transients_excluded_from_trends: true   # constant
+  scrap_cost_currency: THB
+  golden_run_source: setup_sheet_active   # FR-18 — constant
+
+knowledge:                             # FR-19, FR-25, C-03, AI-08, NFR-08, IF-59
+  dir: kb
+  schema: schemas/kb-entry.schema.json
+  source_required: true                # constant
+  approval: { required: true, min_role: engineer, approver_not_author: true }   # constants
+  approved_versions_immutable: true    # constant
+  writeback_verified_outcomes: true    # FR-25 — constant
+  stale_after_days: 365
+
+scoring:                               # AI-05, IF-60
+  weights: { prior: 0.35, delta: 0.30, timeline: 0.20, case: 0.15 }   # sum 1
+  delta_component: { d_cap: 0.8 }      # |Cohen's d| ≥ 0.8 → 1.0
+  timeline_component: { decay_hours: 24 }
+  case_component: { laplace: 1, internal_case_bonus: 0.2 }
+  transparent: true                    # constant — components stored, score recomputed by the database
+
+rca:                                   # FR-20…FR-24, C-04, C-05, AI-06, AI-09, IF-61
+  check_before_change: true            # constant
+  window_enforcement: block            # constant — never "warn"
+  suggestion_audit: true               # constant
+  effectiveness: { alpha: 0.05, test: two_proportion_z, min_after_shots: 200 }
+  dialogue:
+    model: { name: qwen2.5:7b-instruct-q4_K_M, parameters_b: 7, temperature: 0.2, num_ctx: 8192, timeout_s: 15 }   # AI-06, NFR-04
+    prompts:
+      - { kind: rca_question, version: v1, path: prompts/rca_question.v1.md }
+      - { kind: explain,      version: v1, path: prompts/explain.v1.md }
+    facts_schema: schemas/rca-facts.schema.json   # constant
+    scripted_fallback: true            # constant — questions from the KB when the model is unavailable
+    term_check: { enabled: true, languages: [ja, th], block_on_violation: false }
+  handoff_8d: { target: qe_agent, retry_minutes: 15 }   # FR-26 — constant target
+
+golden:                                # AI-07, AC-04
+  min_incidents: 15
+  top3_rate_min: 0.70
+  run_on: [kb_change, scoring_change, prompt_change, model_change]
+
+glossary:                              # FR-27, AC-08
+  source: glossary.example.csv
+  domains: [moulding]
+
+notifications:
+  channels: [discord, email]
+  content: statistics_and_links_only   # constant — no images
+  cavity_flag_severity: HIGH
+  quiet_hours: { start: "22:00", end: "06:00", except: [CRITICAL] }
+
+retention:
+  shots_years: 2
+  defect_images_years: 2
+  pass_images_days: 90
+  knowledge_years: 10
+  sessions_years: 10
+
+locale:
+  default: th
+  supported: [th, ja, en]              # NFR-09

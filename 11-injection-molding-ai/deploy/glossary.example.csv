@@ -1,0 +1,21 @@
+domain,ja,ja_reading,th,en,forbidden
+moulding,ヒケ,ひけ,รอยยุบ,sink mark,引け跡|シンクマーク
+moulding,バリ,ばり,ครีบ,flash,フラッシュ
+moulding,ショートショット,しょーとしょっと,ฉีดไม่เต็ม,short shot,充填不足|ショート不良
+moulding,ウェルドライン,うぇるどらいん,รอยประสาน,weld line,溶着線
+moulding,シルバーストリーク,しるばーすとりーく,ริ้วสีเงิน,silver streak,銀条
+moulding,焼け,やけ,รอยไหม้,burn mark,バーンマーク
+moulding,反り,そり,บิดงอ,warpage,ワープ
+moulding,異物,いぶつ,สิ่งปนเปื้อน,contamination,コンタミ
+moulding,保圧,ほあつ,แรงดันย้ำ,holding pressure,保持圧力
+moulding,保圧時間,ほあつじかん,เวลาย้ำ,holding time,保持時間
+moulding,クッション,くっしょん,คุชชั่น,cushion,残量
+moulding,射出圧,しゃしゅつあつ,แรงดันฉีด,injection pressure,注入圧
+moulding,樹脂温度,じゅしおんど,อุณหภูมิหลอม,melt temperature,溶融温度
+moulding,金型温度,かながたおんど,อุณหภูมิแม่พิมพ์,mould temperature,モールド温度
+moulding,冷却時間,れいきゃくじかん,เวลาหล่อเย็น,cooling time,クーリング
+moulding,型締力,かたじめりょく,แรงปิดแม่พิมพ์,clamping force,クランプ力
+moulding,キャビティ,きゃびてぃ,โพรงแม่พิมพ์,cavity,キャビテイ
+moulding,立ち上げ,たちあげ,การเริ่มเดินเครื่อง,startup,スタートアップ
+moulding,条件表,じょうけんひょう,ใบเงื่อนไขการฉีด,setup sheet,セットアップシート
+moulding,要検証,ようけんしょう,ต้องตรวจสอบ,to be verified,未確認

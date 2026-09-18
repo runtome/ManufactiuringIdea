@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moldmind.example/schemas/rca-facts.schema.json",
+  "title": "MoldMind RCA facts object (ICD-11 IF-60)",
+  "description": "What the dialogue/explanation model receives — and nothing else (SRS-11 AI-05, AI-06; SAD-11 ADR-M05). The ranking, its components and the weights are computed by the scoring function and stored here; the model phrases questions and explanations, never ranks, never computes and never proposes a magnitude. Every number carries an evidence code.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "lang", "defect_class", "mould", "machine", "window", "trend", "causes", "weights", "questions", "wording_rules"],
+  "properties": {
+    "schema_version": { "const": "rca-facts.v1" },
+    "lang": { "type": "string", "enum": ["th", "ja", "en"] },
+    "defect_class": { "type": "string", "enum": ["short_shot", "flash", "sink_mark", "burn_mark", "weld_line", "silver_streak", "warpage", "contamination", "colour_deviation", "scratch"] },
+    "mould": { "type": "string" },
+    "machine": { "type": "string" },
+    "window": { "type": "object", "additionalProperties": false, "required": ["from", "to"], "properties": { "from": { "type": "string", "format": "date-time" }, "to": { "type": "string", "format": "date-time" } } },
+    "trend": {
+      "type": "object", "additionalProperties": false, "required": ["before_x", "before_n", "before_rate_pct", "after_x", "after_n", "after_rate_pct", "z", "p_value", "evidence"],
+      "properties": { "before_x": { "type": "integer" }, "before_n": { "type": "integer" }, "before_rate_pct": { "type": "number" }, "after_x": { "type": "integer" }, "after_n": { "type": "integer" }, "after_rate_pct": { "type": "number" }, "z": { "type": "number" }, "p_value": { "type": "number" }, "evidence": { "$ref": "#/$defs/code" } }
+    },
+    "cavities": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["cavity", "x", "n", "others_x", "others_n", "flagged", "evidence"], "properties": { "cavity": { "type": "integer", "minimum": 1 }, "x": { "type": "integer" }, "n": { "type": "integer" }, "others_x": { "type": "integer" }, "others_n": { "type": "integer" }, "flagged": { "type": "boolean" }, "evidence": { "$ref": "#/$defs/code" } } } },
+    "parameter_deltas": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["parameter", "unit", "defective_mean", "good_mean", "direction", "evidence"], "properties": { "parameter": { "type": "string" }, "unit": { "type": "string" }, "defective_mean": { "type": "number" }, "good_mean": { "type": "number" }, "cohens_d": { "type": "number" }, "direction": { "type": "string", "enum": ["up", "down", "none"] }, "evidence": { "$ref": "#/$defs/code" } } } },
+    "timeline": { "type": "array", "items": { "type": "object", "required": ["ts", "kind", "evidence"], "properties": { "ts": { "type": "string", "format": "date-time" }, "kind": { "type": "string" }, "evidence": { "$ref": "#/$defs/code" } }, "additionalProperties": { "type": ["string", "number", "boolean"] } } },
+    "causes": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["rank", "code", "score", "components"],
+        "properties": {
+          "rank": { "type": "integer", "minimum": 1 },
+          "code": { "type": "string" },
+          "score": { "type": "number", "minimum": 0, "maximum": 1 },
+          "components": { "type": "object", "additionalProperties": false, "required": ["prior", "delta", "timeline", "case"], "properties": { "prior": { "$ref": "#/$defs/unit" }, "delta": { "$ref": "#/$defs/unit" }, "timeline": { "$ref": "#/$defs/unit" }, "case": { "$ref": "#/$defs/unit" } } },
+          "checks": { "type": "array", "items": { "type": "string" } },
+          "actions": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["param", "direction", "range", "window", "side_effects"], "properties": { "param": { "type": "string" }, "direction": { "type": "string", "enum": ["up", "down"] }, "range": { "type": "string" }, "window": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }, "side_effects": { "type": "string" } } } },
+          "design_cause": { "type": "boolean" }
+        }
+      }
+    },
+    "weights": { "type": "object", "additionalProperties": false, "required": ["prior", "delta", "timeline", "case"], "properties": { "prior": { "$ref": "#/$defs/unit" }, "delta": { "$ref": "#/$defs/unit" }, "timeline": { "$ref": "#/$defs/unit" }, "case": { "$ref": "#/$defs/unit" } } },
+    "questions": { "type": "array", "minItems": 1, "items": { "type": "object", "required": ["key"], "properties": { "key": { "type": "string", "pattern": "^[a-z][a-z0-9_]+$" }, "th": { "type": "string" }, "ja": { "type": "string" }, "en": { "type": "string" } }, "additionalProperties": false } },
+    "answers": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["key", "answer_norm"], "properties": { "key": { "type": "string" }, "answer_norm": { "type": "string", "enum": ["yes", "no", "unknown", "value"] }, "value": { "type": ["number", "string"] } } } },
+    "glossary": { "type": "array", "items": { "type": "object", "properties": { "ja": { "type": "string" }, "th": { "type": "string" }, "en": { "type": "string" } } } },
+    "wording_rules": {
+      "type": "object", "additionalProperties": false, "required": ["numbers_only_from_facts", "ranking_from_scoring_function", "checks_before_changes", "no_magnitude_outside_window"],
+      "properties": { "numbers_only_from_facts": { "const": true }, "ranking_from_scoring_function": { "const": true }, "checks_before_changes": { "const": true }, "no_magnitude_outside_window": { "const": true } }
+    }
+  },
+  "$defs": {
+    "code": { "type": "string", "pattern": "^E-\\d{2}$" },
+    "unit": { "type": "number", "minimum": 0, "maximum": 1 }
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moldmind.example/schemas/opcua-nodemap.schema.json",
+  "title": "MoldMind machine node map (ICD-11 IF-05)",
+  "description": "Per-machine mapping of controller nodes to the FR-01 shot parameters. Validated at gateway startup: an unresolvable node is a startup error (ICD-00 IF-05). Every node is read-only; the security policy must sign and encrypt; the credential is a secret file name (C-01, NFR-06).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["machine", "protocol", "endpoint", "security", "credential", "version", "publishing_interval_ms", "shot_trigger", "buffer_hours", "nodes"],
+  "properties": {
+    "machine": { "type": "string", "pattern": "^M-[0-9]{1,3}$" },
+    "protocol": { "type": "string", "enum": ["opcua_euromap77", "euromap63_file", "mqtt"] },
+    "endpoint": { "type": "string", "pattern": "^(opc\\.tcp://|mqtts?://|file://)" },
+    "security": { "type": "string", "enum": ["Basic256Sha256/SignAndEncrypt", "Aes256_Sha256_RsaPss/SignAndEncrypt", "n/a-file", "mqtts-tls"] },
+    "credential": { "type": "string", "pattern": "^[a-z0-9_]+$", "not": { "pattern": "(rw|write|admin)" }, "description": "secret file name; must be a read-only account" },
+    "version": { "type": "string", "pattern": "^v[0-9]+$" },
+    "publishing_interval_ms": { "type": "integer", "minimum": 100, "maximum": 5000 },
+    "shot_trigger": { "type": "object", "additionalProperties": false, "required": ["node_id", "mode"], "properties": { "node_id": { "type": "string" }, "mode": { "type": "string", "enum": ["on_change", "cycle_complete_event"] } } },
+    "buffer_hours": { "type": "integer", "minimum": 24 },
+    "nodes": {
+      "type": "array", "minItems": 10,
+      "items": { "$ref": "#/$defs/node" },
+      "allOf": [
+        { "contains": { "properties": { "signal": { "const": "holding_pressure" } } } },
+        { "contains": { "properties": { "signal": { "const": "holding_time" } } } },
+        { "contains": { "properties": { "signal": { "const": "injection_pressure" } } } },
+        { "contains": { "properties": { "signal": { "const": "injection_speed" } } } },
+        { "contains": { "properties": { "signal": { "const": "back_pressure" } } } },
+        { "contains": { "properties": { "signal": { "const": "screw_rpm" } } } },
+        { "contains": { "properties": { "signal": { "const": "cushion_mm" } } } },
+        { "contains": { "properties": { "signal": { "pattern": "^melt_z[1-9]$" } } } },
+        { "contains": { "properties": { "signal": { "const": "mould_temp_fixed" } } } },
+        { "contains": { "properties": { "signal": { "const": "mould_temp_moving" } } } },
+        { "contains": { "properties": { "signal": { "const": "cooling_time" } } } },
+        { "contains": { "properties": { "signal": { "const": "cycle_time_s" } } } },
+        { "contains": { "properties": { "signal": { "const": "clamping_force" } } } }
+      ],
+      "description": "FR-01: injection pressure & speed, holding pressure & time, back pressure, screw RPM, cushion, melt temperature per zone, mould temperature fixed/moving, cooling time, cycle time, clamping force"
+    },
+    "setpoint_change_nodes": { "type": "array", "items": { "$ref": "#/$defs/node" }, "description": "FR-04 — setpoint edits become parameter_change rows" }
+  },
+  "if": { "properties": { "protocol": { "const": "opcua_euromap77" } } },
+  "then": { "properties": { "security": { "pattern": "SignAndEncrypt$" }, "endpoint": { "pattern": "^opc\\.tcp://" } } },
+  "$defs": {
+    "node": {
+      "type": "object", "additionalProperties": false,
+      "required": ["node_id", "signal", "unit", "access"],
+      "properties": {
+        "node_id": { "type": "string", "pattern": "^ns=[0-9]+;[sig]=" },
+        "signal": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "unit": { "type": "string", "enum": ["bar", "s", "mm", "mm/s", "rpm", "C", "kN", "count", "text", "%"] },
+        "access": { "const": "read" }
+      }
+    }
+  }
+}

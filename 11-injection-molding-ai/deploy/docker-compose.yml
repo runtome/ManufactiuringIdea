@@ -1,0 +1,414 @@
+# MoldMind — docker-compose.yml (standalone; OPS-11 §4)
+# Profiles:  gpu (Ollama + vision on CUDA) | cpu (Ollama on CPU; vision on CPU for dev) | mqtt (alternative machine feed) | dev (mailpit, machine-sim OPC-UA simulator, camera replay)
+#   docker compose --profile gpu up -d
+#   docker compose --profile cpu --profile dev up -d
+# Networks:  frontend (reverse proxy → web/api) · machine (ONLY the gateways reach the press — read-only OPC-UA / Euromap / MQTT)
+#            camera (ONLY vision-infer reaches the camera station) · internal (no egress: postgres, redis, minio, ollama, aligner, analyser,
+#            kb-service, rca-agent, scheduler, gateways' server side) · egress (api and scheduler: Discord / SMTP notifications — statistics only)
+# Secrets are FILES under ${SECRETS_DIR} (OPS-11 §4.2) — never in this file or in .env (TEST-11 TC-004).
+# Platform mode (SAD-11 §9): the workers join the platform compose; postgres/redis/minio/ollama/web and the IF-05 ingest are the platform's.
+
+x-hardened: &hardened
+  user: "10001:10001"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp]
+  restart: unless-stopped
+  logging: { driver: json-file, options: { max-size: "20m", max-file: "5" } }
+
+x-app-env: &app-env
+  TZ: ${TZ}
+  DATABASE_URL_FILE: /run/secrets/database_url
+  REDIS_URL: redis://redis:6379/0
+  S3_ENDPOINT: http://minio:9000
+  S3_REGION: ${S3_REGION}
+  S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+  S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+  S3_BUCKET_PARTS: ${S3_BUCKET_PARTS}
+  S3_BUCKET_COLOUR: ${S3_BUCKET_COLOUR}
+  S3_BUCKET_EVAL: ${S3_BUCKET_EVAL}
+  CONFIG_DIR: /etc/moldmind
+  LOG_LEVEL: ${LOG_LEVEL}
+
+services:
+  # ------------------------------------------------------------------ edge
+  web:
+    <<: *hardened
+    image: ${MM_REGISTRY}/web:${MM_VERSION}
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL}
+      API_URL: http://api:8080
+      DEFAULT_LOCALE: ${DEFAULT_LOCALE}
+    ports: ["${BIND_ADDR}:${WEB_PORT}:3000"]
+    depends_on: [api]
+    networks: [frontend]
+
+  api:
+    <<: *hardened
+    image: ${MM_REGISTRY}/api:${MM_VERSION}
+    environment:
+      <<: *app-env
+      PUBLIC_URL: ${PUBLIC_URL}
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      URL_SIGNING_KEY_FILE: /run/secrets/url_signing_key
+      GATEWAY_TOKEN_FILE: /run/secrets/gateway_service_token
+      QE_URL: ${QE_URL}
+      QE_TOKEN_FILE: /run/secrets/qe_service_token
+      SMTP_URL_FILE: /run/secrets/smtp_url
+      DISCORD_WEBHOOK_FILE: /run/secrets/discord_webhook
+      MAIL_FROM: ${MAIL_FROM}
+      SIGNED_URL_TTL_S: ${SIGNED_URL_TTL_S}
+      SESSIONS_ENABLED: ${SESSIONS_ENABLED}
+      METRICS_ENABLED: "true"
+    secrets: [database_url, s3_access_key, s3_secret_key, jwt_secret, url_signing_key, gateway_service_token, qe_service_token, smtp_url, discord_webhook]
+    volumes:
+      - ${CONFIG_DIR}:/etc/moldmind:ro
+    ports: ["${BIND_ADDR}:${API_PORT}:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+      minio-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/v1/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    networks: [frontend, internal, egress]
+
+  # ------------------------------------------------------------------ machine gateways (IF-05) — the only containers on the machine network; read-only accounts; store-and-forward
+  gateway-opcua:
+    <<: *hardened
+    image: ${MM_REGISTRY}/gateway-opcua:${MM_VERSION}
+    environment:
+      TZ: ${TZ}
+      DATABASE_URL_FILE: /run/secrets/gateway_database_url        # role gateway_rw — INSERT shots/context/changes only (DDS-11 §8)
+      REDIS_URL: redis://redis:6379/0
+      NODE_MAPS_DIR: /etc/moldmind/machines
+      OPCUA_CLIENT_CERT_FILE: /run/secrets/opcua_client_cert
+      OPCUA_CLIENT_KEY_FILE: /run/secrets/opcua_client_key
+      OPCUA_CREDENTIALS_DIR: /run/secrets                          # one read-only account file per machine, named by the node map's `credential`
+      BUFFER_DIR: /var/lib/gateway/buffer
+      BUFFER_HOURS: ${BUFFER_HOURS}
+      SHOT_LATENCY_BUDGET_S: ${SHOT_LATENCY_BUDGET_S}
+      WRITE_METHODS_COMPILED: "false"                              # the image carries no OPC-UA write call (SEC-M02, TC-085)
+      LOG_LEVEL: ${LOG_LEVEL}
+    secrets: [gateway_database_url, opcua_client_cert, opcua_client_key, opcua_readonly_m3]
+    volumes:
+      - ${CONFIG_DIR}:/etc/moldmind:ro
+      - gateway_buffer:/var/lib/gateway/buffer
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [machine, internal]
+
+  gateway-mqtt:
+    <<: *hardened
+    profiles: [mqtt]
+    image: ${MM_REGISTRY}/gateway-mqtt:${MM_VERSION}
+    environment:
+      TZ: ${TZ}
+      DATABASE_URL_FILE: /run/secrets/gateway_database_url
+      REDIS_URL: redis://redis:6379/0
+      MQTT_URL: ${MQTT_URL}
+      MQTT_CREDENTIALS_FILE: /run/secrets/mqtt_readonly
+      BUFFER_DIR: /var/lib/gateway/buffer
+      BUFFER_HOURS: ${BUFFER_HOURS}
+      LOG_LEVEL: ${LOG_LEVEL}
+    secrets: [gateway_database_url, mqtt_readonly]
+    volumes:
+      - ${CONFIG_DIR}:/etc/moldmind:ro
+      - gateway_buffer_mqtt:/var/lib/gateway/buffer
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [machine, internal]
+
+  # ------------------------------------------------------------------ camera side (IF-02 / IF-58): vision + alignment
+  vision-infer:
+    <<: *hardened
+    profiles: [gpu]
+    image: ${MM_REGISTRY}/vision-infer:${MM_VERSION}
+    environment:
+      <<: *app-env
+      DATABASE_URL_FILE: /run/secrets/vision_database_url         # role vision_rw
+      CAMERA_STATION_URL: ${CAMERA_STATION_URL}
+      MODELS_DIR: /models
+      FAMILY_HEADS: "true"
+      INFERENCE_BUDGET_MS: ${INFERENCE_BUDGET_MS}
+      REVIEW_THRESHOLD: ${REVIEW_THRESHOLD}
+      COLOUR_FORMULA: ${COLOUR_FORMULA}
+    secrets: [vision_database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/moldmind:ro
+      - models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT}
+              capabilities: [gpu]
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [camera, internal]
+
+  vision-infer-cpu:
+    <<: *hardened
+    profiles: [cpu]
+    image: ${MM_REGISTRY}/vision-infer:${MM_VERSION}
+    environment:
+      <<: *app-env
+      DATABASE_URL_FILE: /run/secrets/vision_database_url
+      CAMERA_STATION_URL: ${CAMERA_STATION_URL}
+      MODELS_DIR: /models
+      FAMILY_HEADS: "true"
+      INFERENCE_BUDGET_MS: ${INFERENCE_BUDGET_MS}
+      REVIEW_THRESHOLD: ${REVIEW_THRESHOLD}
+      COLOUR_FORMULA: ${COLOUR_FORMULA}
+      CPU_ONLY: "true"
+    secrets: [vision_database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/moldmind:ro
+      - models:/models:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [camera, internal]
+
+  aligner:
+    <<: *hardened
+    image: ${MM_REGISTRY}/aligner:${MM_VERSION}
+    environment:
+      <<: *app-env
+      DATABASE_URL_FILE: /run/secrets/vision_database_url
+      ALIGN_TOLERANCE_MS: ${ALIGN_TOLERANCE_MS}
+      CAVITY_METHODS: ${CAVITY_METHODS}
+    secrets: [vision_database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/moldmind:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+    networks: [internal]
+
+  # ------------------------------------------------------------------ analytics and knowledge (code computes)
+  analyser:
+    <<: *hardened
+    image: ${MM_REGISTRY}/analyser:${MM_VERSION}
+    environment:
+      <<: *app-env
+      ANALYSIS_INTERVAL_S: ${ANALYSIS_INTERVAL_S}
+      CAVITY_ALPHA: ${CAVITY_ALPHA}
+      TRANSIENT_SHOTS: ${TRANSIENT_SHOTS}
+    secrets: [database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/moldmind:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    deploy:
+      resources:
+        limits:
+          cpus: "${ANALYSER_CPUS}"
+          memory: ${ANALYSER_MEMORY}
+    networks: [internal]
+
+  kb-service:
+    <<: *hardened
+    image: ${MM_REGISTRY}/kb-service:${MM_VERSION}
+    environment:
+      <<: *app-env
+      DATABASE_URL_FILE: /run/secrets/kb_database_url             # role kb_rw
+      KB_DIR: /etc/moldmind/kb
+      KB_SCHEMA: /etc/moldmind/schemas/kb-entry.schema.json
+    secrets: [kb_database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/moldmind:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal]
+
+  rca-agent:
+    <<: *hardened
+    image: ${MM_REGISTRY}/rca-agent:${MM_VERSION}
+    environment:
+      <<: *app-env
+      OLLAMA_URL: http://ollama:11434
+      DIALOGUE_MODEL: ${DIALOGUE_MODEL}
+      DIALOGUE_TIMEOUT_S: ${DIALOGUE_TIMEOUT_S}
+      PROMPTS_DIR: /etc/moldmind/prompts
+      FACTS_SCHEMA: /etc/moldmind/schemas/rca-facts.schema.json
+      QE_URL: ${QE_URL}
+      QE_TOKEN_FILE: /run/secrets/qe_service_token
+    secrets: [database_url, s3_access_key, s3_secret_key, qe_service_token]
+    volumes:
+      - ${CONFIG_DIR}:/etc/moldmind:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+    networks: [internal]
+
+  scheduler:
+    <<: *hardened
+    image: ${MM_REGISTRY}/scheduler:${MM_VERSION}
+    environment:
+      <<: *app-env
+      RETENTION_CRON: ${RETENTION_CRON}
+      PARTITION_CRON: ${PARTITION_CRON}
+      KB_STALE_CRON: ${KB_STALE_CRON}
+      HANDOFF_RETRY_MINUTES: ${HANDOFF_RETRY_MINUTES}
+      QE_URL: ${QE_URL}
+      QE_TOKEN_FILE: /run/secrets/qe_service_token
+      SMTP_URL_FILE: /run/secrets/smtp_url
+      DISCORD_WEBHOOK_FILE: /run/secrets/discord_webhook
+      MAIL_FROM: ${MAIL_FROM}
+    secrets: [database_url, s3_access_key, s3_secret_key, qe_service_token, smtp_url, discord_webhook]
+    volumes:
+      - ${CONFIG_DIR}:/etc/moldmind:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal, egress]
+
+  # ------------------------------------------------------------------ data
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      TZ: ${TZ}
+    command: ["postgres", "-c", "shared_buffers=${PG_SHARED_BUFFERS}", "-c", "wal_level=replica", "-c", "log_min_duration_statement=2000"]
+    secrets: [postgres_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+
+  redis:
+    image: redis:${REDIS_VERSION}
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "${REDIS_MAXMEMORY}", "--maxmemory-policy", "allkeys-lru"]
+    networks: [internal]
+
+  minio:
+    image: minio/minio:${MINIO_VERSION}
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/s3_access_key
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/s3_secret_key
+    secrets: [s3_access_key, s3_secret_key]
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+
+  minio-init:
+    image: minio/mc:${MINIO_MC_VERSION}
+    entrypoint: ["/bin/sh", "-c"]
+    # PASS images expire; defect images and evaluation artefacts are kept (lifecycle by prefix tag set by the services)
+    command:
+      - >
+        mc alias set local http://minio:9000 "$(cat /run/secrets/s3_access_key)" "$(cat /run/secrets/s3_secret_key)" &&
+        mc mb --ignore-existing local/${S3_BUCKET_PARTS} &&
+        mc ilm rule add --expire-days ${PASS_IMAGES_EXPIRE_DAYS} --tags "verdict=PASS" local/${S3_BUCKET_PARTS} &&
+        mc mb --ignore-existing --with-versioning local/${S3_BUCKET_COLOUR} &&
+        mc mb --ignore-existing --with-lock local/${S3_BUCKET_EVAL} &&
+        mc retention set --default GOVERNANCE 1825d local/${S3_BUCKET_EVAL}
+    secrets: [s3_access_key, s3_secret_key]
+    depends_on:
+      minio: { condition: service_healthy }
+    networks: [internal]
+
+  # ------------------------------------------------------------------ model runtime (IF-09) — dialogue and explanation only; no route out; no tools
+  ollama:
+    profiles: [gpu]
+    image: ollama/ollama:${OLLAMA_VERSION}
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: 30m
+      OLLAMA_NUM_PARALLEL: "1"
+    volumes:
+      - ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT}
+              capabilities: [gpu]
+    networks: [internal]
+
+  ollama-cpu:
+    profiles: [cpu]
+    image: ollama/ollama:${OLLAMA_VERSION}
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: 30m
+      OLLAMA_NUM_THREAD: ${CPU_THREADS}
+    volumes:
+      - ollama:/root/.ollama
+    networks:
+      internal:
+        aliases: [ollama]
+
+  # ------------------------------------------------------------------ dev only
+  mailpit:
+    profiles: [dev]
+    image: axllent/mailpit:${MAILPIT_VERSION}
+    ports: ["${BIND_ADDR}:8025:8025"]
+    networks: [internal, egress]
+
+  machine-sim:
+    profiles: [dev]
+    image: ${MM_REGISTRY}/machine-sim:${MM_VERSION}     # OPC-UA server replaying the seed's shots and the 10:40 setpoint edit; refuses writes (TEST-11 E1)
+    networks: [machine]
+
+  camera-replay:
+    profiles: [dev]
+    image: ${MM_REGISTRY}/camera-replay:${MM_VERSION}   # replays part images with trigger timestamps (TEST-11 E1)
+    networks: [camera]
+
+networks:
+  frontend: {}
+  machine:
+    internal: true
+  camera:
+    internal: true
+  internal:
+    internal: true
+  egress: {}
+
+volumes:
+  pgdata: {}
+  miniodata: {}
+  ollama: {}
+  models: {}
+  gateway_buffer: {}
+  gateway_buffer_mqtt: {}
+
+secrets:
+  database_url:          { file: "${SECRETS_DIR}/database_url" }            # app_rw
+  gateway_database_url:  { file: "${SECRETS_DIR}/gateway_database_url" }    # gateway_rw (insert-only)
+  vision_database_url:   { file: "${SECRETS_DIR}/vision_database_url" }     # vision_rw
+  kb_database_url:       { file: "${SECRETS_DIR}/kb_database_url" }         # kb_rw
+  postgres_password:     { file: "${SECRETS_DIR}/postgres_password" }
+  jwt_secret:            { file: "${SECRETS_DIR}/jwt_secret" }
+  url_signing_key:       { file: "${SECRETS_DIR}/url_signing_key" }
+  s3_access_key:         { file: "${SECRETS_DIR}/s3_access_key" }
+  s3_secret_key:         { file: "${SECRETS_DIR}/s3_secret_key" }
+  gateway_service_token: { file: "${SECRETS_DIR}/gateway_service_token" }
+  qe_service_token:      { file: "${SECRETS_DIR}/qe_service_token" }
+  opcua_client_cert:     { file: "${SECRETS_DIR}/opcua_client_cert" }
+  opcua_client_key:      { file: "${SECRETS_DIR}/opcua_client_key" }
+  opcua_readonly_m3:     { file: "${SECRETS_DIR}/opcua_readonly_m3" }       # the machine's read-only OPC-UA account (one file per machine)
+  mqtt_readonly:         { file: "${SECRETS_DIR}/mqtt_readonly" }
+  smtp_url:              { file: "${SECRETS_DIR}/smtp_url" }
+  discord_webhook:       { file: "${SECRETS_DIR}/discord_webhook" }

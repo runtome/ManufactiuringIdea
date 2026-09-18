@@ -1,0 +1,35 @@
+defect: flash
+description_th: "ครีบ — เนื้อพลาสติกส่วนเกินที่รอยแบ่งแม่พิมพ์"
+description_ja: "バリ — パーティングラインの余剰樹脂"
+description_en: "Flash — excess material at the parting line"
+causes:
+  - cause: clamping_force_too_low
+    name_ja: 型締力不足
+    prior_weight: 0.35
+    typical_params: { clamping_force: down, injection_pressure: up }
+    checks: ["Compare clamping force with the setup sheet", "Check parting-line contamination"]
+    actions:
+      - { param: clamping_force, direction: up, range: "+5..+10 %", window_ref: mould_datasheet, side_effects: "mould wear, venting problems" }
+    source: "molding troubleshooting guide §4.3"
+  - cause: holding_pressure_too_high
+    name_ja: 保圧過高
+    prior_weight: 0.30
+    typical_params: { holding_pressure: up }
+    checks: ["Check holding pressure trace against golden run"]
+    actions:
+      - { param: holding_pressure, direction: down, range: "-5..-10 %", window_ref: setup_sheet, side_effects: "sink marks" }
+    source: "molding troubleshooting guide §4.3"
+  - cause: parting_line_damage
+    name_ja: パーティング面損傷
+    prior_weight: 0.20
+    checks: ["Inspect parting surfaces for damage or deposits"]
+    note: "Mould maintenance cause — no parameter action"
+    source: "mould maintenance log MLD-0417"
+  - cause: melt_temperature_too_high
+    name_ja: 樹脂温度過高
+    prior_weight: 0.15
+    typical_params: { melt_temperature: up }
+    checks: ["Compare zone temperatures with the setup sheet"]
+    actions:
+      - { param: melt_temperature, direction: down, range: "-5..-10 C", window_ref: material_datasheet, side_effects: "short shot risk" }
+    source: "material datasheet PP-H-2000 §3"

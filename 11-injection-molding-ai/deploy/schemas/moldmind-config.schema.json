@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moldmind.example/schemas/moldmind-config.schema.json",
+  "title": "MoldMind configuration (deploy/moldmind.yaml)",
+  "description": "Validated by `mmctl config load` and by PUT /config (API-11). Constants the SRS fixes (read-only machine, transients excluded, source-cited and approved knowledge, transparent scoring, checks before changes, window enforcement by blocking, chart-based ΔE, evaluation gates) are `const` so a configuration cannot switch them off.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "acquisition", "alignment", "vision", "analysis", "knowledge", "scoring", "rca", "golden", "glossary", "notifications", "retention", "locale"],
+  "properties": {
+    "version": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}(-[0-9]{2})?$" },
+    "acquisition": {
+      "type": "object", "additionalProperties": false, "required": ["protocols", "node_maps_dir", "read_only", "security_policy", "shot_latency_budget_s", "buffer_hours", "setpoint_changes_to_timeline", "data_quality"],
+      "properties": {
+        "protocols": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["opcua_euromap77", "euromap63_file", "mqtt"] }, "contains": { "const": "opcua_euromap77" } },
+        "node_maps_dir": { "type": "string" },
+        "read_only": { "const": true },
+        "security_policy": { "type": "string", "pattern": "SignAndEncrypt$" },
+        "shot_latency_budget_s": { "type": "number", "exclusiveMinimum": 0, "maximum": 2 },
+        "buffer_hours": { "type": "integer", "minimum": 24 },
+        "setpoint_changes_to_timeline": { "const": true },
+        "data_quality": { "type": "object", "additionalProperties": false, "required": ["stuck_value_shots", "clock_skew_max_s", "missing_zone_temp_flag"], "properties": { "stuck_value_shots": { "type": "integer", "minimum": 5 }, "clock_skew_max_s": { "type": "number", "exclusiveMinimum": 0, "maximum": 10 }, "missing_zone_temp_flag": { "const": true } } }
+      }
+    },
+    "alignment": {
+      "type": "object", "additionalProperties": false, "required": ["tolerance_ms", "align_methods", "cavity_methods", "store_method", "unaligned_parts"],
+      "properties": {
+        "tolerance_ms": { "type": "integer", "minimum": 100, "maximum": 5000 },
+        "align_methods": { "type": "array", "items": { "type": "string", "enum": ["shot_id", "timestamp"] }, "minItems": 1 },
+        "cavity_methods": { "type": "array", "items": { "type": "string", "enum": ["ocr_marking", "robot_position", "sequence"] }, "minItems": 1 },
+        "store_method": { "const": true },
+        "unaligned_parts": { "const": "exclude_from_analysis" }
+      }
+    },
+    "vision": {
+      "type": "object", "additionalProperties": false, "required": ["classes", "per_family_heads", "lighting_required_for", "review_threshold", "anomaly_review_threshold", "colour", "eval_gates", "inference_budget_ms"],
+      "properties": {
+        "classes": { "type": "array", "const": ["short_shot", "flash", "sink_mark", "burn_mark", "weld_line", "silver_streak", "warpage", "contamination", "colour_deviation", "scratch"] },
+        "per_family_heads": { "type": "boolean" },
+        "lighting_required_for": { "type": "array", "items": { "type": "string" }, "allOf": [{ "contains": { "const": "sink_mark" } }, { "contains": { "const": "weld_line" } }] },
+        "review_threshold": { "type": "number", "minimum": 0.5, "maximum": 0.95 },
+        "anomaly_review_threshold": { "type": "number", "minimum": 0.3, "maximum": 0.95 },
+        "colour": { "type": "object", "additionalProperties": false, "required": ["formula", "chart_required", "default_threshold"], "properties": { "formula": { "type": "string", "enum": ["cie76", "cie2000"] }, "chart_required": { "const": true }, "default_threshold": { "type": "number", "exclusiveMinimum": 0, "maximum": 10 } } },
+        "eval_gates": {
+          "type": "object", "additionalProperties": false, "required": ["map50_min", "recall_min"],
+          "properties": {
+            "map50_min": { "type": "number", "minimum": 0.8, "maximum": 1 },
+            "recall_min": { "type": "object", "required": ["short_shot", "flash", "contamination"], "properties": { "short_shot": { "type": "number", "minimum": 0.95, "maximum": 1 }, "flash": { "type": "number", "minimum": 0.95, "maximum": 1 }, "contamination": { "type": "number", "minimum": 0.95, "maximum": 1 } }, "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 } }
+          }
+        },
+        "inference_budget_ms": { "type": "integer", "minimum": 10, "maximum": 150 }
+      }
+    },
+    "analysis": {
+      "type": "object", "additionalProperties": false, "required": ["cavity_flag", "parameter_delta", "drift", "startup_transient_shots", "transients_excluded_from_trends", "scrap_cost_currency", "golden_run_source"],
+      "properties": {
+        "cavity_flag": { "type": "object", "additionalProperties": false, "required": ["alpha", "min_parts", "test"], "properties": { "alpha": { "type": "number", "exclusiveMinimum": 0, "maximum": 0.05 }, "min_parts": { "type": "integer", "minimum": 100 }, "test": { "const": "two_proportion_z" } } },
+        "parameter_delta": { "type": "object", "additionalProperties": false, "required": ["min_shots_per_group", "effect_size", "test"], "properties": { "min_shots_per_group": { "type": "integer", "minimum": 5 }, "effect_size": { "const": "cohens_d" }, "test": { "const": "welch_t" } } },
+        "drift": { "type": "object", "additionalProperties": false, "required": ["shots", "method"], "properties": { "shots": { "type": "integer", "minimum": 50, "maximum": 5000 }, "method": { "const": "least_squares" } } },
+        "startup_transient_shots": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "transients_excluded_from_trends": { "const": true },
+        "scrap_cost_currency": { "type": "string", "enum": ["THB", "JPY", "USD"] },
+        "golden_run_source": { "const": "setup_sheet_active" }
+      }
+    },
+    "knowledge": {
+      "type": "object", "additionalProperties": false, "required": ["dir", "schema", "source_required", "approval", "approved_versions_immutable", "writeback_verified_outcomes", "stale_after_days"],
+      "properties": {
+        "dir": { "type": "string" },
+        "schema": { "const": "schemas/kb-entry.schema.json" },
+        "source_required": { "const": true },
+        "approval": { "type": "object", "additionalProperties": false, "required": ["required", "min_role", "approver_not_author"], "properties": { "required": { "const": true }, "min_role": { "type": "string", "enum": ["engineer", "manager", "admin"] }, "approver_not_author": { "const": true } } },
+        "approved_versions_immutable": { "const": true },
+        "writeback_verified_outcomes": { "const": true },
+        "stale_after_days": { "type": "integer", "minimum": 30 }
+      }
+    },
+    "scoring": {
+      "type": "object", "additionalProperties": false, "required": ["weights", "delta_component", "timeline_component", "case_component", "transparent"],
+      "properties": {
+        "weights": { "type": "object", "additionalProperties": false, "required": ["prior", "delta", "timeline", "case"], "description": "the loader additionally checks the sum is 1 ± 1e-6", "properties": { "prior": { "$ref": "#/$defs/unit" }, "delta": { "$ref": "#/$defs/unit" }, "timeline": { "$ref": "#/$defs/unit" }, "case": { "$ref": "#/$defs/unit" } } },
+        "delta_component": { "type": "object", "additionalProperties": false, "required": ["d_cap"], "properties": { "d_cap": { "type": "number", "minimum": 0.2, "maximum": 2 } } },
+        "timeline_component": { "type": "object", "additionalProperties": false, "required": ["decay_hours"], "properties": { "decay_hours": { "type": "number", "minimum": 1, "maximum": 168 } } },
+        "case_component": { "type": "object", "additionalProperties": false, "required": ["laplace", "internal_case_bonus"], "properties": { "laplace": { "type": "integer", "minimum": 0 }, "internal_case_bonus": { "type": "number", "minimum": 0, "maximum": 0.5 } } },
+        "transparent": { "const": true }
+      }
+    },
+    "rca": {
+      "type": "object", "additionalProperties": false, "required": ["check_before_change", "window_enforcement", "suggestion_audit", "effectiveness", "dialogue", "handoff_8d"],
+      "properties": {
+        "check_before_change": { "const": true },
+        "window_enforcement": { "const": "block" },
+        "suggestion_audit": { "const": true },
+        "effectiveness": { "type": "object", "additionalProperties": false, "required": ["alpha", "test", "min_after_shots"], "properties": { "alpha": { "type": "number", "exclusiveMinimum": 0, "maximum": 0.05 }, "test": { "const": "two_proportion_z" }, "min_after_shots": { "type": "integer", "minimum": 50 } } },
+        "dialogue": {
+          "type": "object", "additionalProperties": false, "required": ["model", "prompts", "facts_schema", "scripted_fallback", "term_check"],
+          "properties": {
+            "model": { "type": "object", "additionalProperties": false, "required": ["name", "parameters_b", "temperature", "num_ctx", "timeout_s"], "properties": { "name": { "type": "string" }, "parameters_b": { "type": "number", "exclusiveMinimum": 0, "maximum": 9 }, "temperature": { "type": "number", "minimum": 0, "maximum": 0.3 }, "num_ctx": { "type": "integer", "minimum": 4096 }, "timeout_s": { "type": "integer", "minimum": 3, "maximum": 15 } } },
+            "prompts": { "type": "array", "minItems": 2, "items": { "type": "object", "additionalProperties": false, "required": ["kind", "version", "path"], "properties": { "kind": { "type": "string", "enum": ["rca_question", "explain"] }, "version": { "type": "string", "pattern": "^v[0-9]+$" }, "path": { "type": "string", "pattern": "^prompts/[a-z_]+\\.v[0-9]+\\.md$" } } }, "allOf": [{ "contains": { "properties": { "kind": { "const": "rca_question" } } } }, { "contains": { "properties": { "kind": { "const": "explain" } } } }] },
+            "facts_schema": { "const": "schemas/rca-facts.schema.json" },
+            "scripted_fallback": { "const": true },
+            "term_check": { "type": "object", "additionalProperties": false, "required": ["enabled", "languages"], "properties": { "enabled": { "const": true }, "languages": { "type": "array", "contains": { "const": "ja" }, "items": { "type": "string", "enum": ["ja", "th"] } }, "block_on_violation": { "type": "boolean" } } }
+          }
+        },
+        "handoff_8d": { "type": "object", "additionalProperties": false, "required": ["target", "retry_minutes"], "properties": { "target": { "const": "qe_agent" }, "retry_minutes": { "type": "integer", "minimum": 1, "maximum": 1440 } } }
+      }
+    },
+    "golden": {
+      "type": "object", "additionalProperties": false, "required": ["min_incidents", "top3_rate_min", "run_on"],
+      "properties": { "min_incidents": { "type": "integer", "minimum": 15 }, "top3_rate_min": { "type": "number", "minimum": 0.7, "maximum": 1 }, "run_on": { "type": "array", "items": { "type": "string", "enum": ["kb_change", "scoring_change", "prompt_change", "model_change", "schedule"] }, "allOf": [{ "contains": { "const": "kb_change" } }, { "contains": { "const": "scoring_change" } }] } }
+    },
+    "glossary": { "type": "object", "additionalProperties": false, "required": ["source", "domains"], "properties": { "source": { "type": "string", "pattern": "\\.csv$" }, "domains": { "type": "array", "minItems": 1, "items": { "type": "string" } } } },
+    "notifications": {
+      "type": "object", "additionalProperties": false, "required": ["channels", "content", "cavity_flag_severity"],
+      "properties": { "channels": { "type": "array", "items": { "type": "string", "enum": ["discord", "email"] } }, "content": { "const": "statistics_and_links_only" }, "cavity_flag_severity": { "type": "string", "enum": ["MEDIUM", "HIGH", "CRITICAL"] }, "quiet_hours": { "type": "object", "additionalProperties": false, "required": ["start", "end"], "properties": { "start": { "$ref": "#/$defs/hhmm" }, "end": { "$ref": "#/$defs/hhmm" }, "except": { "type": "array", "items": { "type": "string", "enum": ["HIGH", "CRITICAL"] } } } } }
+    },
+    "retention": { "type": "object", "additionalProperties": false, "required": ["shots_years", "defect_images_years", "pass_images_days", "knowledge_years", "sessions_years"], "properties": { "shots_years": { "type": "integer", "minimum": 1 }, "defect_images_years": { "type": "integer", "minimum": 1 }, "pass_images_days": { "type": "integer", "minimum": 7 }, "knowledge_years": { "type": "integer", "minimum": 10 }, "sessions_years": { "type": "integer", "minimum": 5 } } },
+    "locale": { "type": "object", "additionalProperties": false, "required": ["default", "supported"], "properties": { "default": { "type": "string", "enum": ["th", "ja", "en"] }, "supported": { "type": "array", "const": ["th", "ja", "en"] } } }
+  },
+  "$defs": {
+    "unit": { "type": "number", "minimum": 0, "maximum": 1 },
+    "hhmm": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$" }
+  }
+}

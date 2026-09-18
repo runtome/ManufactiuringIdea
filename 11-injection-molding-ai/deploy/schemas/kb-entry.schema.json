@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moldmind.example/schemas/kb-entry.schema.json",
+  "title": "MoldMind knowledge-base entry (ICD-11 IF-59)",
+  "description": "One defect class with its causes, checks and actions — SRS-11 FR-19, C-03 (rules in a reviewable file, not in prompts), AI-08 (every cause cites a source), FR-22/FR-23 (checks are separate from actions; every action has direction, magnitude range, window reference and side effects). Appendix A's sink_mark entry validates against this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["defect", "description_th", "description_ja", "description_en", "causes"],
+  "properties": {
+    "defect": { "type": "string", "enum": ["short_shot", "flash", "sink_mark", "burn_mark", "weld_line", "silver_streak", "warpage", "contamination", "colour_deviation", "scratch"] },
+    "description_th": { "type": "string", "minLength": 3 },
+    "description_ja": { "type": "string", "minLength": 3 },
+    "description_en": { "type": "string", "minLength": 3 },
+    "causes": {
+      "type": "array", "minItems": 1, "maxItems": 12,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["cause", "prior_weight", "source"],
+        "properties": {
+          "cause": { "type": "string", "pattern": "^[a-z][a-z0-9_]{2,60}$" },
+          "name_ja": { "type": "string" },
+          "name_th": { "type": "string" },
+          "name_en": { "type": "string" },
+          "prior_weight": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+          "typical_params": {
+            "type": "object",
+            "propertyNames": { "enum": ["holding_pressure", "holding_time", "injection_pressure", "injection_speed", "back_pressure", "screw_rpm", "cushion", "melt_temperature", "mould_temperature", "cooling_time", "cycle_time", "clamping_force", "dryer_hours", "dryer_temp", "regrind_pct"] },
+            "additionalProperties": { "type": "string", "enum": ["up", "down", "low", "high", "unstable"] }
+          },
+          "checks": { "type": "array", "items": { "type": "string", "minLength": 8, "maxLength": 200 } },
+          "actions": {
+            "type": "array",
+            "items": {
+              "type": "object", "additionalProperties": false,
+              "required": ["param", "direction", "range", "window_ref", "side_effects"],
+              "properties": {
+                "param": { "type": "string", "enum": ["holding_pressure", "holding_time", "injection_pressure", "injection_speed", "back_pressure", "screw_rpm", "melt_temperature", "mould_temperature", "cooling_time", "clamping_force"] },
+                "direction": { "type": "string", "enum": ["up", "down"] },
+                "range": { "type": "string", "pattern": "^[+-][0-9]+(\\.[0-9]+)?\\.\\.[+-][0-9]+(\\.[0-9]+)? ?(%|C|s|bar|mm|kN)$" },
+                "window_ref": { "type": "string", "enum": ["setup_sheet", "material_datasheet", "mould_datasheet", "process_validation"] },
+                "side_effects": { "type": "string", "minLength": 5 }
+              }
+            }
+          },
+          "design_cause": { "type": "boolean", "default": false },
+          "note": { "type": "string" },
+          "source": { "type": "string", "minLength": 8, "description": "AI-08 — textbook, supplier datasheet or internal case; mandatory" }
+        },
+        "if": { "required": ["design_cause"], "properties": { "design_cause": { "const": true } } },
+        "then": { "properties": { "actions": { "maxItems": 0 } } },
+        "else": { "required": ["checks"], "properties": { "checks": { "minItems": 1 } } }
+      }
+    }
+  }
+}
