@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gapfarm.local/schemas/gap-export-manifest.schema.json",
+  "title": "GAPFarm audit package manifest (IF-66)",
+  "description": "manifest.json inside every GAP audit package (PDF + XLSX + manifest). Produced by trg_export_hash from farm.export_package; verify_hash = sha256(canonical manifest). An auditor recomputes it with GET /export/gap/{id}/verify or offline (OPS-12 section 10). The records array lists the CURRENT version of every record in the period with its chain hash; chain_heads carries each zone's chain head (seq + hash). NFR-04, FR-13, AC-05.",
+  "type": "object",
+  "required": ["scheme", "period_from", "period_to", "zone_id", "record_count", "gap_count", "chain_heads", "records"],
+  "additionalProperties": false,
+  "properties": {
+    "scheme": { "type": "string", "pattern": "^[a-z]+$" },
+    "period_from": { "type": "string", "format": "date" },
+    "period_to": { "type": "string", "format": "date" },
+    "zone_id": { "type": ["string", "null"], "format": "uuid" },
+    "record_count": { "type": "integer", "minimum": 0 },
+    "gap_count": { "type": "integer", "minimum": 0 },
+    "chain_heads": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[A-Z0-9-]{1,8}$" },
+      "additionalProperties": { "type": "object", "required": ["seq", "hash"], "additionalProperties": false,
+        "properties": { "seq": { "type": "integer", "minimum": 1 }, "hash": { "$ref": "#/$defs/sha256" } } }
+    },
+    "records": { "type": "array", "items": { "$ref": "#/$defs/record" } }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "record": {
+      "type": "object",
+      "required": ["kind", "record_no", "version", "zone", "at", "hash"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["scouting", "input_usage", "harvest"] },
+        "record_no": { "type": "string", "pattern": "^(SC|IU|HV)-[0-9]{4}-[0-9]{4,}$" },
+        "version": { "type": "integer", "minimum": 1 },
+        "zone": { "type": "string" },
+        "at": { "type": "string", "format": "date-time" },
+        "hash": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  },
+  "$comment": "Loader / verifier rules beyond the schema: record_count == len(records); every record.zone is a key of chain_heads; the package's verify_hash equals sha256 of the manifest serialised with PostgreSQL jsonb canonical text (keys ordered by length then bytes, ', ' and ': ' separators)."
+}

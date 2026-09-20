@@ -1,0 +1,280 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gapfarm.local/schemas/diagnosis-result.schema.json",
+  "title": "GAPFarm diagnosis result (IF-64)",
+  "description": "What worker-vision (server) or the on-device model returns for one observation, and what farm.diagnosis stores. 1..3 calibrated candidates ordered by probability with distinguishing features and a how-to-confirm note (FR-03), or an out-of-distribution refusal with no candidates (AI-06). Probabilities are calibrated (AI-05). Mirrors trg_diagnosis_shape.",
+  "type": "object",
+  "required": [
+    "observation_id",
+    "model_version",
+    "computed_on",
+    "ood",
+    "candidates",
+    "gate"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "observation_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "model_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "calibration_version": {
+      "type": "string"
+    },
+    "computed_on": {
+      "enum": [
+        "device",
+        "server"
+      ]
+    },
+    "crop": {
+      "type": "string"
+    },
+    "affected_part": {
+      "enum": [
+        "leaf",
+        "fruit",
+        "stem",
+        "root",
+        "flower",
+        "whole_plant",
+        "unknown"
+      ]
+    },
+    "growth_stage": {
+      "type": "string"
+    },
+    "ood": {
+      "type": "boolean"
+    },
+    "ood_score": {
+      "type": "number"
+    },
+    "candidates": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/candidate"
+      }
+    },
+    "severity": {
+      "type": "object",
+      "required": [
+        "level",
+        "area_pct_low",
+        "area_pct_high"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "enum": [
+            "none",
+            "low",
+            "moderate",
+            "severe"
+          ]
+        },
+        "area_pct_low": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "area_pct_high": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "plants_affected": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "plants_inspected": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "consult_agronomist": {
+      "type": "boolean"
+    },
+    "gate": {
+      "type": "object",
+      "required": [
+        "pass"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "pass": {
+          "type": "boolean"
+        },
+        "blur": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "exposure": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "distance": {
+          "enum": [
+            "ok",
+            "far",
+            "close"
+          ]
+        },
+        "guidance_th": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "latency_ms": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ood": {
+            "const": true
+          }
+        },
+        "required": [
+          "ood"
+        ]
+      },
+      "then": {
+        "properties": {
+          "candidates": {
+            "maxItems": 0
+          }
+        },
+        "required": [
+          "ood_score"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ood": {
+            "const": false
+          },
+          "gate": {
+            "properties": {
+              "pass": {
+                "const": true
+              }
+            },
+            "required": [
+              "pass"
+            ]
+          }
+        },
+        "required": [
+          "ood",
+          "gate"
+        ]
+      },
+      "then": {
+        "properties": {
+          "candidates": {
+            "minItems": 1
+          }
+        },
+        "required": [
+          "calibration_version",
+          "severity"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "gate": {
+            "properties": {
+              "pass": {
+                "const": false
+              }
+            },
+            "required": [
+              "pass"
+            ]
+          }
+        },
+        "required": [
+          "gate"
+        ]
+      },
+      "then": {
+        "properties": {
+          "gate": {
+            "required": [
+              "guidance_th"
+            ]
+          },
+          "candidates": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "candidate": {
+      "type": "object",
+      "required": [
+        "condition_code",
+        "probability",
+        "distinguishing_features_th",
+        "how_to_confirm_th"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "condition_code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]+$"
+        },
+        "name_th": {
+          "type": "string"
+        },
+        "name_en": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "disease",
+            "pest",
+            "deficiency",
+            "healthy",
+            "unknown"
+          ]
+        },
+        "probability": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "distinguishing_features_th": {
+          "type": "string",
+          "minLength": 1
+        },
+        "how_to_confirm_th": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  },
+  "$comment": "Two rules live in the loader / database, not in the schema: probabilities must be non-increasing and sum to <= 1 (trg_diagnosis_shape); condition_code must exist in farm.condition."
+}

@@ -1,0 +1,1756 @@
+openapi: 3.1.0
+info:
+  title: GAPFarm AI API
+  version: 1.0.0
+  summary: Photo diagnosis as calibrated probabilities; every confirmed diagnosis becomes a GAP record, a task list and a reminder; PHI is enforced; records are append-only and hash-chained; chemical advice comes only from the approved list.
+  description: |
+    **Scope.** The GAPFarm AI API — a separate deployment (SAD-00 §13 "none"). SRS-12 §4.1's nine paths are kept
+    verbatim under `/api/v1`. RFC 7807 `Problem`, the `Cursor` / `Limit` / `Idempotency-Key` parameters and the standard
+    error responses are copied byte-for-byte from API-00 and diffed by TEST-12 TC-008.
+
+    **Six contracts (API-Specification.md §3–§8):**
+    - **Diagnosis** — 1–3 calibrated candidates with distinguishing features and a how-to-confirm note, or a refusal
+      (`refused`, out-of-distribution) with photo guidance; low confidence goes to the agronomist queue; the farmer
+      confirms — the server never confirms on its own.
+    - **Record** — confirmation creates the scouting record, tasks and reminders in one transaction; records are
+      append-only versions with a per-zone hash chain; PHI is a `409 PHI_NOT_ELAPSED`, not a warning; every harvest lot
+      carries its traceability.
+    - **Task** — owner, due, zone, evidence; reminders respect quiet hours; critical overdue tasks escalate.
+    - **Advisory / agent** — answers cite records and crop-library chunks; a product name outside the approved list
+      is impossible (`409 UNAPPROVED_PRODUCT`); severe or fast-spreading cases carry `consult_agronomist`.
+    - **Sync** — client UUIDs and an idempotency key per batch; a replay returns the stored result.
+    - **Export** — the audit package (PDF + XLSX + manifest) for a period and zone; `/verify` recomputes the hashes.
+
+    Errors are RFC 7807 `application/problem+json` with a stable `code`. Thai is the primary language of every
+    user-facing string (`Accept-Language: th` default, `en` secondary).
+  contact: { name: Suphot N. }
+  license: { name: Proprietary }
+  x-document-id: API-12-GAPFarm
+
+servers:
+  - url: https://gapfarm.example.th/api/v1
+    description: Pilot VPS (reverse proxy, TLS)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - { name: diagnosis, description: "SRS §4.1 /diagnose — photos, candidates, refusal, confirmation, review, corrections (FR-01…FR-08)" }
+  - { name: records, description: "SRS §4.1 /records/* — append-only versioned GAP records, PHI, traceability, chain (FR-09…FR-14)" }
+  - { name: tasks, description: "SRS §4.1 /tasks — tasks, reminders, escalations (FR-16…FR-20)" }
+  - { name: telemetry, description: "SRS §4.1 /telemetry — sensors, faults, weather, advisories (FR-21…FR-26)" }
+  - { name: agent, description: "SRS §4.1 /ask and /forecast/harvest — questions with citations, harvest prediction, weekly summary (FR-27…FR-32)" }
+  - { name: export, description: "SRS §4.1 /export/gap — audit package and verification, compliance gaps (FR-13, FR-15)" }
+  - { name: farm, description: "Farms, zones, crops, conditions" }
+  - { name: sync, description: "Offline sync (IF-63)" }
+  - { name: privacy, description: "PDPA export / erasure (NFR-05)" }
+  - { name: admin, description: "Approved inputs, models, schemes, templates, rules, config" }
+  - { name: auth, description: "Login, refresh, devices" }
+  - { name: system, description: "Health, readiness, version" }
+
+paths:
+  # ---------------------------------------------------------------- SRS §4.1 — verbatim paths
+  /diagnose:
+    post:
+      tags: [diagnosis]
+      operationId: diagnose
+      summary: Upload 1–5 photos of an affected plant and get the candidates (SRS §4.1; FR-01…FR-06, AI-05, AI-06)
+      description: |
+        Multipart: `photos[]` (1–5 JPEG ≤ 1 MB each after client compression), `zone_id` or `gps`, `taken_at`, optional
+        `plants_affected` / `plants_inspected` and `client_observation_id` (offline-created UUIDv7). The server repeats the
+        quality gate; a failed gate returns `422 PHOTO_QUALITY` with specific guidance. The result is a `DiagnosisResult`
+        (deploy/schemas/diagnosis-result.schema.json): `proposed`, `needs_review` (queued for an agronomist) or `refused`
+        (out-of-distribution — no candidates, nothing recorded). Nothing is recorded until `/diagnoses/{id}/confirm`.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: { $ref: '#/components/schemas/DiagnoseRequest' }
+      responses:
+        '200': { description: Candidates (or a refusal), content: { application/json: { schema: { $ref: '#/components/schemas/DiagnosisResult' } } } }
+        '202': { description: "No model available — observation and photos stored, diagnosis queued (record-only mode, FR-08)", content: { application/json: { schema: { $ref: '#/components/schemas/DiagnosisQueued' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { description: "PHOTO_QUALITY — blur / lighting / distance with guidance_th; or too many photos", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /records/scouting:
+    post:
+      tags: [records]
+      operationId: createScoutingRecord
+      summary: Create a scouting record directly (SRS §4.1; FR-09, FR-14) — record-only mode or a routine inspection without a diagnosis
+      description: |
+        Confirmed diagnoses create their record through `/diagnoses/{id}/confirm`; this path is for routine scouting
+        ("healthy", 30 plants inspected) and for record-only mode (FR-08). A `diagnosis_id` may only cite a confirmed or
+        corrected diagnosis (`409 DIAGNOSIS_NOT_CONFIRMED`). The response carries the record number and its chain hash.
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ScoutingRecordCreate' } } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/RecordVersion' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: "DIAGNOSIS_NOT_CONFIRMED — the cited diagnosis is not confirmed or corrected", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /records/input-usage:
+    post:
+      tags: [records]
+      operationId: createInputUsage
+      summary: Log a treatment (SRS §4.1; FR-10, C-02)
+      description: |
+        Product (by code, must be approved at `ts` — `409 UNAPPROVED_PRODUCT`), dose, unit, method, applicator, weather at
+        application (temp_c, rh_pct, wind_ms mandatory — `422 WEATHER_REQUIRED`), PPE (non-empty — `422 PPE_REQUIRED`).
+        PHI and REI are snapshotted from the product; the response carries `phi_clear_at`. A `spray_conflict` warning is
+        included when forecast rain falls inside the product's rainfast window (FR-25) — a warning, not a refusal.
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/InputUsageCreate' } } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/InputUsageRecord' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: "UNAPPROVED_PRODUCT — not on the approved list at the application time (C-02)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /zones/{id}/phi-status:
+    get:
+      tags: [records]
+      operationId: getZonePhiStatus
+      summary: Harvest eligibility for a zone (SRS §4.1; FR-11)
+      parameters:
+        - { $ref: '#/components/parameters/ZoneIdPath' }
+        - { name: at, in: query, schema: { type: string, format: date-time }, description: "Default now" }
+      responses:
+        '200': { description: PHI status, content: { application/json: { schema: { $ref: '#/components/schemas/PhiStatus' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /tasks:
+    get:
+      tags: [tasks]
+      operationId: listTasks
+      summary: Task list (SRS §4.1; FR-17)
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/TaskStatus' } }
+        - { name: zone_id, in: query, schema: { type: string, format: uuid } }
+        - { name: owner, in: query, schema: { type: string, enum: [me, farm] }, description: "Default me" }
+        - { name: due_before, in: query, schema: { type: string, format: date-time } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200': { description: Tasks, content: { application/json: { schema: { $ref: '#/components/schemas/TaskPage' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /telemetry:
+    post:
+      tags: [telemetry]
+      operationId: ingestTelemetry
+      summary: Sensor ingest over HTTPS (SRS §4.1; FR-21) — the MQTT path is IF-12
+      description: |
+        Same payload as the MQTT topic `farm/{farm}/{zone}/{signal}`. `device` must be a registered sensor; `unit` must equal
+        the sensor kind's unit (`422 UNIT_MISMATCH`); values outside the physical range are stored with `quality =
+        out_of_range` and counted towards a fault (FR-22). Authenticated with the device's key, not a user token.
+      security: [ { deviceKey: [] } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/TelemetryBatch' } } } }
+      responses:
+        '202': { description: Accepted, content: { application/json: { schema: { $ref: '#/components/schemas/TelemetryAck' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { description: "UNIT_MISMATCH — unit differs from the sensor kind (FR-21); or unknown device", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /forecast/harvest:
+    get:
+      tags: [agent]
+      operationId: getHarvestForecast
+      summary: Harvest window and expected yield for a zone (SRS §4.1; FR-30, FR-31, AI-08, AC-09)
+      description: |
+        Two forecasts: `harvest_date` (GDD accumulated since planting against the crop's stage model; interval from the
+        variability of the last 14 days' daily GDD) and `yield` (the zone's history with a t prediction interval). Each carries
+        `factors`. A zone without enough history returns `status: insufficient_data` with a reason — never a number.
+      parameters:
+        - { name: zone, in: query, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, schema: { type: string, format: date } }
+      responses:
+        '200': { description: Forecasts, content: { application/json: { schema: { $ref: '#/components/schemas/HarvestForecast' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /ask:
+    post:
+      tags: [agent]
+      operationId: ask
+      summary: Farmer question in Thai (SRS §4.1; FR-27…FR-29, AI-07, AC-08)
+      description: |
+        The answer is composed from a facts object (zones and stages, recent records, PHI status, forecast, the approved
+        products for the crop, crop-library chunks) with citations. Product names outside the approved list cannot appear
+        (`products` lists approved codes only; the text is checked). `consult_agronomist` is set for severe, unfamiliar or
+        fast-spreading cases. Without the language model the scripted fallback answers (`fallback: true`).
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AskRequest' } } } }
+      responses:
+        '200': { description: Answer, content: { application/json: { schema: { $ref: '#/components/schemas/Answer' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /export/gap:
+    get:
+      tags: [export]
+      operationId: requestGapExport
+      summary: GAP audit package for a period and zone (SRS §4.1; FR-13, NFR-04, AC-05)
+      description: |
+        Builds the package asynchronously: PDF (scheme record templates), XLSX (one sheet per record kind, every version),
+        `manifest.json` (deploy/schemas/gap-export-manifest.schema.json) with the chain heads and a `verify_hash`. Compliance
+        gaps for the period are listed first (FR-15). Returns `202` with the export id; fetch with `/export/gap/{exportId}`.
+      parameters:
+        - { name: zone, in: query, schema: { type: string, format: uuid }, description: "Omit for the whole farm" }
+        - { name: from, in: query, required: true, schema: { type: string, format: date } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date } }
+        - { name: farm_id, in: query, schema: { type: string, format: uuid }, description: "Required when the caller belongs to several farms" }
+      responses:
+        '202': { description: Export requested, content: { application/json: { schema: { $ref: '#/components/schemas/ExportPackage' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ---------------------------------------------------------------- diagnosis flow
+  /observations:
+    post:
+      tags: [diagnosis]
+      operationId: createObservation
+      summary: Create an observation without diagnosing yet (record-only mode, follow-ups — FR-08, FR-19)
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ObservationCreate' } } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Observation' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /observations/{observationId}:
+    get:
+      tags: [diagnosis]
+      operationId: getObservation
+      summary: Observation with photos (signed URLs), diagnoses and follow-up comparison
+      parameters: [ { $ref: '#/components/parameters/ObservationId' } ]
+      responses:
+        '200': { description: Observation, content: { application/json: { schema: { $ref: '#/components/schemas/Observation' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /observations/{observationId}/photos:
+    post:
+      tags: [diagnosis]
+      operationId: uploadPhoto
+      summary: Upload (or resume) one photo for an observation (IF-63 resumable upload)
+      parameters:
+        - { $ref: '#/components/parameters/ObservationId' }
+        - { name: Content-Range, in: header, schema: { type: string }, description: "bytes start-end/total for resumed uploads" }
+      requestBody: { required: true, content: { image/jpeg: { schema: { type: string, format: binary } } } }
+      responses:
+        '201': { description: "Stored (EXIF stripped, gate evaluated)", content: { application/json: { schema: { $ref: '#/components/schemas/Photo' } } } }
+        '308': { description: Resume incomplete — Range header tells the client what was received }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { description: "PHOTO_QUALITY — blur / lighting / distance with guidance_th; or too many photos", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /diagnoses/{diagnosisId}:
+    get:
+      tags: [diagnosis]
+      operationId: getDiagnosis
+      summary: A diagnosis with its candidates, status, recommendations and what it produced (record, tasks)
+      parameters: [ { $ref: '#/components/parameters/DiagnosisId' } ]
+      responses:
+        '200': { description: Diagnosis, content: { application/json: { schema: { $ref: '#/components/schemas/Diagnosis' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /diagnoses/{diagnosisId}/confirm:
+    post:
+      tags: [diagnosis]
+      operationId: confirmDiagnosis
+      summary: Farmer confirms a candidate → scouting record + tasks + reminders in one transaction (FR-09, FR-16, AC-03)
+      description: |
+        `chosen` must be one of the candidates (`409 CHOSEN_NOT_CANDIDATE`); a refused or corrected diagnosis cannot be
+        confirmed (`409 DIAGNOSIS_STATE`). The response is exactly Appendix A: the record number, the generated tasks with due
+        dates, the reminders, the recommendations (approved products with PHI/REI and any spray conflict) and the
+        agronomist line when set.
+      parameters: [ { $ref: '#/components/parameters/DiagnosisId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [chosen], properties: { chosen: { type: string, description: condition code }, severity: { $ref: '#/components/schemas/SeverityLevel' } } } } } }
+      responses:
+        '200': { description: What the confirmation produced, content: { application/json: { schema: { $ref: '#/components/schemas/ConfirmationResult' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "CHOSEN_NOT_CANDIDATE or DIAGNOSIS_STATE", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /diagnoses/{diagnosisId}/recommendations:
+    get:
+      tags: [diagnosis]
+      operationId: listRecommendations
+      summary: Approved products for the confirmed condition with PHI, REI, cautions and the spray-conflict check (FR-25, FR-28)
+      parameters:
+        - { $ref: '#/components/parameters/DiagnosisId' }
+        - { name: planned_at, in: query, schema: { type: string, format: date-time }, description: "Planned application time for the rainfast check; default tomorrow 09:00" }
+      responses:
+        '200': { description: Recommendations, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Recommendation' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /review-queue:
+    get:
+      tags: [diagnosis]
+      operationId: listReviewQueue
+      summary: Agronomist queue — low-confidence and severe diagnoses (FR-05)
+      parameters:
+        - { name: resolved, in: query, schema: { type: boolean, default: false } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200': { description: Queue, content: { application/json: { schema: { $ref: '#/components/schemas/ReviewQueuePage' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /diagnoses/{diagnosisId}/correction:
+    post:
+      tags: [diagnosis]
+      operationId: correctDiagnosis
+      summary: Agronomist correction → label example with provenance, record version or new record (FR-07, AI-09, AC-06)
+      parameters: [ { $ref: '#/components/parameters/DiagnosisId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CorrectionCreate' } } } }
+      responses:
+        '201': { description: Correction applied, content: { application/json: { schema: { $ref: '#/components/schemas/CorrectionResult' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "REVIEWER_ROLE — only agronomists correct; or DIAGNOSIS_STATE (refused)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # ---------------------------------------------------------------- records
+  /records:
+    get:
+      tags: [records]
+      operationId: listRecords
+      summary: Current versions of records (all kinds) for a farm, zone and period
+      parameters:
+        - { name: farm_id, in: query, schema: { type: string, format: uuid } }
+        - { name: zone_id, in: query, schema: { type: string, format: uuid } }
+        - { name: kind, in: query, schema: { $ref: '#/components/schemas/RecordKind' } }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200': { description: Records, content: { application/json: { schema: { $ref: '#/components/schemas/RecordPage' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /records/{recordNo}:
+    get:
+      tags: [records]
+      operationId: getRecordVersions
+      summary: Every version of a record, oldest first — the original is always retrievable (AC-06)
+      parameters: [ { $ref: '#/components/parameters/RecordNo' } ]
+      responses:
+        '200': { description: Versions, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/RecordVersion' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /records/{recordNo}/versions:
+    post:
+      tags: [records]
+      operationId: createRecordVersion
+      summary: Correct a record — a new version with a reason; nothing is overwritten (C-03, FR-14, AC-06)
+      parameters: [ { $ref: '#/components/parameters/RecordNo' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecordCorrection' } } } }
+      responses:
+        '201': { description: New version, content: { application/json: { schema: { $ref: '#/components/schemas/RecordVersion' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "RECORD_IMMUTABLE / VERSION_CHAIN_BROKEN — the version chain is inconsistent", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /records/harvest:
+    post:
+      tags: [records]
+      operationId: createHarvest
+      summary: Record a harvest lot — refused while PHI has not elapsed (FR-11, FR-12, AC-04)
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/HarvestCreate' } } } }
+      responses:
+        '201': { description: Created with traceability, content: { application/json: { schema: { $ref: '#/components/schemas/HarvestRecord' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: "PHI_NOT_ELAPSED — the zone is clear at clear_at (FR-11)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /records/harvest/{lotCode}/traceability:
+    get:
+      tags: [records]
+      operationId: getTraceability
+      summary: Lot → zone → inputs applied → scouting events, with record hashes (FR-12)
+      parameters: [ { name: lotCode, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200': { description: Traceability, content: { application/json: { schema: { $ref: '#/components/schemas/Traceability' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /zones/{id}/chain/verify:
+    get:
+      tags: [records]
+      operationId: verifyZoneChain
+      summary: Recompute the zone's record hash chain (NFR-04)
+      parameters: [ { $ref: '#/components/parameters/ZoneIdPath' } ]
+      responses:
+        '200': { description: Chain status, content: { application/json: { schema: { $ref: '#/components/schemas/ChainStatus' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- tasks
+  /tasks/{taskId}:
+    get:
+      tags: [tasks]
+      operationId: getTask
+      summary: A task with its evidence, reminders and escalation
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      responses:
+        '200': { description: Task, content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /tasks/{taskId}/complete:
+    post:
+      tags: [tasks]
+      operationId: completeTask
+      summary: Mark a task done with optional evidence (FR-17); a harvest task is refused before PHI (FR-11)
+      parameters: [ { $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/TaskEvidence' } } } }
+      responses:
+        '200': { description: Task, content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "PHI_NOT_ELAPSED — the zone is clear at clear_at (FR-11)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /escalations:
+    get:
+      tags: [tasks]
+      operationId: listEscalations
+      summary: Overdue critical tasks escalated to the farm manager (FR-20)
+      parameters: [ { name: acknowledged, in: query, schema: { type: boolean, default: false } } ]
+      responses:
+        '200': { description: Escalations, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Escalation' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /me/channels:
+    put:
+      tags: [tasks]
+      operationId: setChannels
+      summary: Reminder channels — LINE, push, Discord, e-mail (FR-18, IF-67)
+      requestBody: { required: true, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Channel' } } } } }
+      responses:
+        '200': { description: Channels, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Channel' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ---------------------------------------------------------------- sensors, weather, advisories
+  /sensors:
+    get:
+      tags: [telemetry]
+      operationId: listSensors
+      summary: Sensors with health (last seen, faults) per zone (FR-22)
+      parameters: [ { name: farm_id, in: query, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Sensors, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Sensor' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [admin]
+      operationId: registerSensor
+      summary: Register a sensor (kind fixes unit and range; per-device MQTT credential issued — IF-12)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SensorCreate' } } } }
+      responses:
+        '201': { description: Sensor, content: { application/json: { schema: { $ref: '#/components/schemas/Sensor' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { description: "UNIT_MISMATCH — unit differs from the sensor kind (FR-21); or unknown device", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /zones/{id}/telemetry:
+    get:
+      tags: [telemetry]
+      operationId: getZoneTelemetry
+      summary: Readings and the soil-moisture trend for a zone (FR-26)
+      parameters:
+        - { $ref: '#/components/parameters/ZoneIdPath' }
+        - { name: kind, in: query, schema: { type: string } }
+        - { name: hours, in: query, schema: { type: integer, minimum: 1, maximum: 720, default: 24 } }
+      responses:
+        '200': { description: Telemetry, content: { application/json: { schema: { $ref: '#/components/schemas/ZoneTelemetry' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /farms/{farmId}/weather:
+    get:
+      tags: [telemetry]
+      operationId: getWeather
+      summary: "Cached forecast and daily aggregates (FR-23); `available: false` when the provider is down"
+      parameters: [ { $ref: '#/components/parameters/FarmId' } ]
+      responses:
+        '200': { description: Weather, content: { application/json: { schema: { $ref: '#/components/schemas/Weather' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /advisories:
+    get:
+      tags: [telemetry]
+      operationId: listAdvisories
+      summary: Active advisories — disease risk, spray conflict, irrigation, PHI, compliance gaps (FR-24…FR-26)
+      parameters:
+        - { name: farm_id, in: query, schema: { type: string, format: uuid } }
+        - { name: zone_id, in: query, schema: { type: string, format: uuid } }
+        - { name: kind, in: query, schema: { $ref: '#/components/schemas/AdvisoryKind' } }
+      responses:
+        '200': { description: Advisories, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Advisory' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /zones/{id}/spray-check:
+    get:
+      tags: [telemetry]
+      operationId: sprayCheck
+      summary: Would a planned application conflict with forecast rain inside the product's rainfast window? (FR-25)
+      parameters:
+        - { $ref: '#/components/parameters/ZoneIdPath' }
+        - { name: product, in: query, required: true, schema: { type: string }, description: product code }
+        - { name: planned_at, in: query, required: true, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Check, content: { application/json: { schema: { $ref: '#/components/schemas/SprayCheck' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- agent, prediction, summary
+  /conversations/{conversationId}:
+    get:
+      tags: [agent]
+      operationId: getConversation
+      summary: Questions and answers with their facts and citations
+      parameters: [ { name: conversationId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Conversation, content: { application/json: { schema: { $ref: '#/components/schemas/Conversation' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /farms/{farmId}/summary/weekly:
+    get:
+      tags: [agent]
+      operationId: getWeeklySummary
+      summary: Weekly farm summary — issues, treatments, upcoming tasks, harvest outlook (FR-32)
+      parameters: [ { $ref: '#/components/parameters/FarmId' }, { name: week_start, in: query, schema: { type: string, format: date } } ]
+      responses:
+        '200': { description: Summary, content: { application/json: { schema: { $ref: '#/components/schemas/WeeklySummary' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- export, compliance
+  /export/gap/{exportId}:
+    get:
+      tags: [export]
+      operationId: getGapExport
+      summary: Export package status, manifest and signed download URLs
+      parameters: [ { $ref: '#/components/parameters/ExportId' } ]
+      responses:
+        '200': { description: Package, content: { application/json: { schema: { $ref: '#/components/schemas/ExportPackage' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /export/gap/{exportId}/verify:
+    get:
+      tags: [export]
+      operationId: verifyGapExport
+      summary: Recompute the manifest hash and every record hash in the package (NFR-04, AC-05)
+      parameters: [ { $ref: '#/components/parameters/ExportId' } ]
+      responses:
+        '200': { description: Verification, content: { application/json: { schema: { $ref: '#/components/schemas/ExportVerification' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /farms/{farmId}/compliance-gaps:
+    get:
+      tags: [export]
+      operationId: listComplianceGaps
+      summary: Missing mandatory records per zone and scheme rule (FR-15)
+      parameters:
+        - { $ref: '#/components/parameters/FarmId' }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+      responses:
+        '200': { description: Gaps, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ComplianceGap' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- farm, zones, crops
+  /farms:
+    get:
+      tags: [farm]
+      operationId: listFarms
+      summary: Farms the caller belongs to
+      responses:
+        '200': { description: Farms, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Farm' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /farms/{farmId}/zones:
+    get:
+      tags: [farm]
+      operationId: listZones
+      summary: Zones with crop, stage (from GDD), PHI status and open tasks
+      parameters: [ { $ref: '#/components/parameters/FarmId' } ]
+      responses:
+        '200': { description: Zones, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Zone' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [farm]
+      operationId: createZone
+      summary: Create a zone (polygon, area, crop, planting date)
+      parameters: [ { $ref: '#/components/parameters/FarmId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ZoneCreate' } } } }
+      responses:
+        '201': { description: Zone, content: { application/json: { schema: { $ref: '#/components/schemas/Zone' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /crops:
+    get:
+      tags: [farm]
+      operationId: listCrops
+      summary: Crop library — crops, stage models and conditions (the classes the model may output)
+      responses:
+        '200': { description: Crops, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Crop' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ---------------------------------------------------------------- sync, auth, devices
+  /sync:
+    post:
+      tags: [sync]
+      operationId: syncBatch
+      summary: Apply an offline batch once — observations, task completions (IF-63, NFR-02, AC-07)
+      description: |
+        `idempotency_key` is generated by the device per batch; items carry client-generated UUIDv7 ids. A replayed batch
+        returns `200` with `replayed: true` and the stored result; items already present return `status: exists`. Photos are
+        uploaded separately (`/observations/{id}/photos`) before or after the batch.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SyncBatch' } } } }
+      responses:
+        '200': { description: Applied (or replayed), content: { application/json: { schema: { $ref: '#/components/schemas/SyncResult' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Username + password (or LINE login) → access + refresh tokens
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/LoginRequest' } } } }
+      responses:
+        '200': { description: Tokens, content: { application/json: { schema: { $ref: '#/components/schemas/TokenPair' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /auth/refresh:
+    post:
+      tags: [auth]
+      operationId: refresh
+      summary: Rotate the refresh token
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [refresh_token], properties: { refresh_token: { type: string } } } } } }
+      responses:
+        '200': { description: Tokens, content: { application/json: { schema: { $ref: '#/components/schemas/TokenPair' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /devices:
+    post:
+      tags: [auth]
+      operationId: registerDevice
+      summary: Register a phone (platform, app version, on-device model version, push token reference)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DeviceCreate' } } } }
+      responses:
+        '201': { description: Device, content: { application/json: { schema: { $ref: '#/components/schemas/Device' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ---------------------------------------------------------------- privacy
+  /privacy/requests:
+    post:
+      tags: [privacy]
+      operationId: createPrivacyRequest
+      summary: PDPA export or erasure request (NFR-05)
+      description: |
+        `export` produces a package of everything held about the person. `erasure` pseudonymises identity, contact, channels
+        and push tokens and removes their observation GPS; GAP record versions they authored are kept under the pseudonym
+        (C-03, NFR-04) — this is stated at consent time and in the response.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [kind], properties: { kind: { type: string, enum: [export, erasure] } } } } } }
+      responses:
+        '202': { description: Request opened, content: { application/json: { schema: { $ref: '#/components/schemas/PrivacyRequest' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /privacy/requests/{requestId}:
+    get:
+      tags: [privacy]
+      operationId: getPrivacyRequest
+      summary: Request status and (for export) the signed package URL
+      parameters: [ { name: requestId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Request, content: { application/json: { schema: { $ref: '#/components/schemas/PrivacyRequest' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- admin
+  /admin/products:
+    get:
+      tags: [admin]
+      operationId: listProducts
+      summary: The approved-input list (IF-65) — the only source of product names
+      parameters: [ { name: approved, in: query, schema: { type: boolean } }, { name: crop, in: query, schema: { type: string } } ]
+      responses:
+        '200': { description: Products, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Product' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [admin]
+      operationId: createProduct
+      summary: Add a product (unapproved until a second person approves it with the label)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProductCreate' } } } }
+      responses:
+        '201': { description: Product, content: { application/json: { schema: { $ref: '#/components/schemas/Product' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /admin/products/{code}/approval:
+    put:
+      tags: [admin]
+      operationId: setProductApproval
+      summary: Approve (label URI mandatory, approver ≠ author) or withdraw approval (reason mandatory)
+      parameters: [ { name: code, in: path, required: true, schema: { type: string } } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProductApproval' } } } }
+      responses:
+        '200': { description: Product, content: { application/json: { schema: { $ref: '#/components/schemas/Product' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "APPROVAL_SELF, LABEL_REQUIRED or REASON_REQUIRED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /admin/models:
+    get:
+      tags: [admin]
+      operationId: listModels
+      summary: Model registry with evaluations, calibration and release state (AI-01…AI-06)
+      responses:
+        '200': { description: Models, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Model' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [admin]
+      operationId: registerModel
+      summary: Register a model from its manifest (deploy/schemas/model-manifest.schema.json)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ModelManifest' } } } }
+      responses:
+        '201': { description: Model, content: { application/json: { schema: { $ref: '#/components/schemas/Model' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /admin/models/{modelId}/release:
+    post:
+      tags: [admin]
+      operationId: releaseModel
+      summary: Release — refused without a passed FIELD evaluation, an active calibration, or over 25 MB on device (AI-02…AI-05)
+      parameters: [ { name: modelId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Released, content: { application/json: { schema: { $ref: '#/components/schemas/Model' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "RELEASE_GATE_FAILED, CALIBRATION_REQUIRED or DEVICE_MODEL_TOO_LARGE", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /admin/schemes/{code}:
+    put:
+      tags: [admin]
+      operationId: putScheme
+      summary: Import a GAP scheme definition (deploy/schemas/gap-scheme.schema.json)
+      parameters: [ { name: code, in: path, required: true, schema: { type: string } } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/GapScheme' } } } }
+      responses:
+        '200': { description: Scheme, content: { application/json: { schema: { $ref: '#/components/schemas/GapScheme' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /admin/task-templates:
+    get:
+      tags: [admin]
+      operationId: listTaskTemplates
+      summary: What a confirmed diagnosis generates, per condition kind and severity (FR-16)
+      responses:
+        '200': { description: Templates, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/TaskTemplate' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [admin]
+      operationId: putTaskTemplates
+      summary: Replace the template set
+      requestBody: { required: true, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/TaskTemplate' } } } } }
+      responses:
+        '200': { description: Templates, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/TaskTemplate' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /admin/risk-rules:
+    get:
+      tags: [admin]
+      operationId: listRiskRules
+      summary: Environment-based disease-risk rules with sources (FR-24)
+      responses:
+        '200': { description: Rules, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/RiskRule' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [admin]
+      operationId: putRiskRules
+      summary: Replace the rule set
+      requestBody: { required: true, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/RiskRule' } } } } }
+      responses:
+        '200': { description: Rules, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/RiskRule' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /admin/config:
+    get:
+      tags: [admin]
+      operationId: getConfig
+      summary: Effective configuration (deploy/gapfarm.yaml validated against its schema; secrets never included)
+      responses:
+        '200': { description: Config, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ---------------------------------------------------------------- system
+  /healthz:
+    get:
+      tags: [system]
+      operationId: health
+      summary: Liveness
+      security: []
+      responses:
+        '200': { description: Alive, content: { application/json: { schema: { $ref: '#/components/schemas/Health' } } } }
+  /readyz:
+    get:
+      tags: [system]
+      operationId: ready
+      summary: "Readiness — database, object store, broker; the model and the weather provider are reported but never block readiness (P-2)"
+      security: []
+      responses:
+        '200': { description: Ready, content: { application/json: { schema: { $ref: '#/components/schemas/Health' } } } }
+        '503': { description: "Not ready (NOT_READY)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Short-lived access token (15 min) from `/auth/login`; refresh via `/auth/refresh`. Roles farmer / farm_manager / agronomist / auditor / admin (SEC-12 §5.7).
+    deviceKey:
+      type: apiKey
+      in: header
+      name: X-Device-Key
+      description: Per-sensor key for `/telemetry` over HTTPS (the MQTT path uses per-device broker credentials — IF-12).
+
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Opaque cursor from the previous page's `next_cursor`
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      schema: { type: string }
+      description: |
+        Client-generated key. Replaying a request with the same key returns the
+        original result instead of performing the operation twice.
+    ZoneIdPath:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    FarmId:
+      name: farmId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ObservationId:
+      name: observationId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    DiagnosisId:
+      name: diagnosisId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RecordNo:
+      name: recordNo
+      in: path
+      required: true
+      schema: { type: string, pattern: '^(SC|IU|HV)-[0-9]{4}-[0-9]{4,}$' }
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ExportId:
+      name: exportId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: |
+        Authenticated but not permitted. For line-scoped resources the rows are
+        never retrieved in the first place — this is not response filtering.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Resource does not exist
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ValidationFailed:
+      description: Request was well-formed but semantically invalid
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    BadRequest:
+      description: Malformed request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 7807 problem details with a stable machine-readable `code`.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          description: Stable error code — see API-Specification.md §7
+        correlation_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+
+    # ---- enums
+    SeverityLevel: { type: string, enum: [none, low, moderate, severe] }
+    DiagnosisStatus: { type: string, enum: [proposed, needs_review, refused, confirmed, corrected, superseded] }
+    RecordKind: { type: string, enum: [scouting, input_usage, harvest] }
+    TaskStatus: { type: string, enum: [open, done, cancelled] }
+    TaskKind: { type: string, enum: [inspect, treat, followup, harvest, sensor_maintenance, other] }
+    AdvisoryKind: { type: string, enum: [disease_risk, spray_conflict, irrigation, phi, compliance_gap] }
+    ConditionKind: { type: string, enum: [disease, pest, deficiency, healthy, unknown] }
+
+    # ---- diagnosis
+    DiagnoseRequest:
+      type: object
+      required: [photos, taken_at]
+      properties:
+        photos: { type: array, minItems: 1, maxItems: 5, items: { type: string, format: binary } }
+        zone_id: { type: string, format: uuid }
+        gps: { type: string, description: "lat,lng — used to find the zone when zone_id is absent (FR-04)" }
+        taken_at: { type: string, format: date-time }
+        plants_affected: { type: integer, minimum: 0 }
+        plants_inspected: { type: integer, minimum: 0 }
+        client_observation_id: { type: string, format: uuid, description: "UUIDv7 generated offline; makes the call idempotent" }
+        followup_of: { type: string, format: uuid, description: "Original observation for a re-inspection (FR-19)" }
+    Candidate:
+      type: object
+      required: [condition_code, name_th, kind, probability, distinguishing_features_th, how_to_confirm_th]
+      properties:
+        condition_code: { type: string }
+        name_th: { type: string }
+        name_en: { type: string }
+        kind: { $ref: '#/components/schemas/ConditionKind' }
+        probability: { type: number, minimum: 0, maximum: 1, description: "Calibrated (temperature scaling, AI-05)" }
+        distinguishing_features_th: { type: string }
+        how_to_confirm_th: { type: string }
+    Severity:
+      type: object
+      required: [level, area_pct_low, area_pct_high]
+      properties:
+        level: { $ref: '#/components/schemas/SeverityLevel' }
+        area_pct_low: { type: number }
+        area_pct_high: { type: number }
+        plants_affected: { type: integer }
+        plants_inspected: { type: integer }
+    Gate:
+      type: object
+      required: [pass]
+      properties:
+        pass: { type: boolean }
+        blur: { type: number }
+        exposure: { type: number }
+        distance: { type: string, enum: [ok, far, close] }
+        guidance_th: { type: [string, 'null'] }
+    DiagnosisResult:
+      type: object
+      description: deploy/schemas/diagnosis-result.schema.json plus ids and status
+      required: [diagnosis_id, observation_id, status, model_version, computed_on, ood, candidates, gate]
+      properties:
+        diagnosis_id: { type: string, format: uuid }
+        observation_id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/DiagnosisStatus' }
+        model_version: { type: string }
+        calibration_version: { type: string }
+        computed_on: { type: string, enum: [device, server] }
+        crop: { type: string }
+        affected_part: { type: string }
+        growth_stage: { type: string }
+        ood: { type: boolean }
+        ood_score: { type: number }
+        candidates: { type: array, maxItems: 3, items: { $ref: '#/components/schemas/Candidate' } }
+        severity: { $ref: '#/components/schemas/Severity' }
+        consult_agronomist: { type: boolean }
+        gate: { $ref: '#/components/schemas/Gate' }
+        review: { type: object, properties: { queued: { type: boolean }, reason: { type: string } } }
+        latency_ms: { type: integer }
+    DiagnosisQueued:
+      type: object
+      required: [observation_id, queued]
+      properties:
+        observation_id: { type: string, format: uuid }
+        queued: { type: boolean }
+        message_th: { type: string }
+    Diagnosis:
+      allOf:
+        - $ref: '#/components/schemas/DiagnosisResult'
+        - type: object
+          properties:
+            chosen: { type: string }
+            confirmed_at: { type: string, format: date-time }
+            produced: { $ref: '#/components/schemas/ConfirmationResult' }
+            recommendations: { type: array, items: { $ref: '#/components/schemas/Recommendation' } }
+    ConfirmationResult:
+      type: object
+      description: Appendix A — everything the confirmation created, nothing typed
+      required: [record_no, tasks, reminders]
+      properties:
+        record_no: { type: string, example: SC-2026-0412 }
+        record_hash: { type: string }
+        tasks: { type: array, items: { $ref: '#/components/schemas/Task' } }
+        reminders: { type: array, items: { $ref: '#/components/schemas/Reminder' } }
+        recommendations: { type: array, items: { $ref: '#/components/schemas/Recommendation' } }
+        advisories: { type: array, items: { $ref: '#/components/schemas/Advisory' } }
+        consult_agronomist: { type: boolean }
+        card_th: { type: string, description: "The rendered result card (Appendix A)" }
+    Recommendation:
+      type: object
+      required: [product_code, name, name_th, phi_days, rei_hours, spray_conflict]
+      properties:
+        product_code: { type: string }
+        name: { type: string }
+        name_th: { type: string }
+        active_ingredient: { type: string }
+        phi_days: { type: integer }
+        rei_hours: { type: integer }
+        rainfast_hours: { type: integer }
+        cautions_th: { type: string }
+        label_url: { type: string, format: uri, description: "Signed URL to the registered label" }
+        rationale_th: { type: string }
+        spray_conflict: { type: boolean }
+        spray_check: { $ref: '#/components/schemas/SprayCheck' }
+    ReviewQueueItem:
+      type: object
+      required: [id, reason, queued_at, diagnosis]
+      properties:
+        id: { type: string, format: uuid }
+        reason: { type: string, enum: [low_confidence, ood, farmer_request, severe] }
+        queued_at: { type: string, format: date-time }
+        assigned_to: { type: string, format: uuid }
+        resolved_at: { type: string, format: date-time }
+        resolution: { type: string }
+        diagnosis: { $ref: '#/components/schemas/DiagnosisResult' }
+        photos: { type: array, items: { $ref: '#/components/schemas/Photo' } }
+    ReviewQueuePage:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ReviewQueueItem' } }
+        next_cursor: { type: string }
+    CorrectionCreate:
+      type: object
+      required: [corrected_code]
+      properties:
+        corrected_code: { type: string }
+        severity: { $ref: '#/components/schemas/SeverityLevel' }
+        note_th: { type: string }
+    CorrectionResult:
+      type: object
+      required: [correction_id, label_example_id, record_no, record_version]
+      properties:
+        correction_id: { type: string, format: uuid }
+        label_example_id: { type: string, format: uuid }
+        record_no: { type: string }
+        record_version: { type: integer, description: "1 when the correction created the record, else the new version" }
+        tasks: { type: array, items: { $ref: '#/components/schemas/Task' } }
+
+    # ---- observations and photos
+    ObservationCreate:
+      type: object
+      required: [zone_id, ts]
+      properties:
+        id: { type: string, format: uuid, description: "Client-generated UUIDv7 (offline)" }
+        zone_id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        kind: { type: string, enum: [scouting, followup, harvest_check, sensor_maintenance] }
+        area_pct: { type: number, minimum: 0, maximum: 100 }
+        plants_affected: { type: integer }
+        plants_inspected: { type: integer }
+        gps: { type: string }
+        followup_of: { type: string, format: uuid }
+    Observation:
+      type: object
+      required: [id, zone_id, ts, kind]
+      properties:
+        id: { type: string, format: uuid }
+        zone_id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        kind: { type: string }
+        severity: { $ref: '#/components/schemas/SeverityLevel' }
+        area_pct: { type: number }
+        plants_affected: { type: integer }
+        plants_inspected: { type: integer }
+        growth_stage: { type: string }
+        reporter_ref: { type: string, description: "Pseudonym — identity is never returned here (NFR-05)" }
+        followup_of: { type: string, format: uuid }
+        followup_delta_pct: { type: number, description: "area_pct minus the original's (FR-19)" }
+        photos: { type: array, items: { $ref: '#/components/schemas/Photo' } }
+        diagnoses: { type: array, items: { $ref: '#/components/schemas/DiagnosisResult' } }
+    Photo:
+      type: object
+      required: [id, url, gate]
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string, format: uri, description: "Signed, 15 min (NFR-06)" }
+        thumb_url: { type: string, format: uri }
+        bytes: { type: integer }
+        gate: { $ref: '#/components/schemas/Gate' }
+        taken_at: { type: string, format: date-time }
+
+    # ---- records
+    ScoutingRecordCreate:
+      type: object
+      required: [zone_id, observed_at, severity]
+      properties:
+        zone_id: { type: string, format: uuid }
+        observed_at: { type: string, format: date-time }
+        observation_id: { type: string, format: uuid }
+        diagnosis_id: { type: string, format: uuid }
+        condition_code: { type: string }
+        severity: { $ref: '#/components/schemas/SeverityLevel' }
+        area_pct: { type: number }
+        plants_affected: { type: integer }
+        plants_inspected: { type: integer }
+        evidence_photo_ids: { type: array, items: { type: string, format: uuid } }
+        notes_th: { type: string }
+    RecordVersion:
+      type: object
+      required: [kind, record_no, record_version, zone_id, at, author_ref, hash]
+      properties:
+        kind: { $ref: '#/components/schemas/RecordKind' }
+        record_no: { type: string, example: SC-2026-0412 }
+        record_version: { type: integer }
+        supersedes: { type: string, format: uuid }
+        reason_th: { type: string }
+        zone_id: { type: string, format: uuid }
+        at: { type: string, format: date-time }
+        author_ref: { type: string }
+        prev_hash: { type: string }
+        hash: { type: string }
+        content: { type: object, additionalProperties: true, description: "Kind-specific fields — the canonical payload that was hashed" }
+        created_at: { type: string, format: date-time }
+    RecordPage:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/RecordVersion' } }
+        next_cursor: { type: string }
+    RecordCorrection:
+      type: object
+      required: [reason_th, changes]
+      properties:
+        reason_th: { type: string, minLength: 3 }
+        changes: { type: object, additionalProperties: true, description: "Fields to change; everything else is copied from the current version" }
+    InputUsageCreate:
+      type: object
+      required: [zone_id, product_code, ts, dose, unit, method, weather, ppe]
+      properties:
+        zone_id: { type: string, format: uuid }
+        product_code: { type: string }
+        ts: { type: string, format: date-time }
+        dose: { type: number, exclusiveMinimum: 0 }
+        unit: { type: string, example: g/20L }
+        method: { type: string, example: knapsack_spray }
+        applicator_id: { type: string, format: uuid, description: "Default the caller" }
+        weather: { type: object, required: [temp_c, rh_pct, wind_ms], properties: { temp_c: { type: number }, rh_pct: { type: number }, wind_ms: { type: number }, rain_next_12h_mm: { type: number }, source: { type: string } } }
+        ppe: { type: array, minItems: 1, items: { type: string } }
+        diagnosis_id: { type: string, format: uuid }
+    InputUsageRecord:
+      allOf:
+        - $ref: '#/components/schemas/RecordVersion'
+        - type: object
+          required: [phi_days, phi_clear_at]
+          properties:
+            phi_days: { type: integer }
+            rei_hours: { type: integer }
+            phi_clear_at: { type: string, format: date-time }
+            spray_conflict: { $ref: '#/components/schemas/SprayCheck' }
+    HarvestCreate:
+      type: object
+      required: [zone_id, lot_code, harvested_at, qty, unit]
+      properties:
+        zone_id: { type: string, format: uuid }
+        lot_code: { type: string }
+        harvested_at: { type: string, format: date-time }
+        qty: { type: number, exclusiveMinimum: 0 }
+        unit: { type: string, default: kg }
+        grade: { type: string }
+    HarvestRecord:
+      allOf:
+        - $ref: '#/components/schemas/RecordVersion'
+        - type: object
+          required: [lot_code, traceability]
+          properties:
+            lot_code: { type: string }
+            traceability: { $ref: '#/components/schemas/Traceability' }
+    Traceability:
+      type: object
+      required: [zone, crop, planted_at, phi_clear_at, inputs, scouting]
+      properties:
+        zone: { type: string }
+        crop: { type: string }
+        planted_at: { type: string, format: date }
+        season_no: { type: integer }
+        phi_clear_at: { type: [string, 'null'], format: date-time }
+        inputs: { type: array, items: { type: object, properties: { record_no: { type: string }, version: { type: integer }, product: { type: string }, active_ingredient: { type: string }, ts: { type: string, format: date-time }, phi_clear_at: { type: string, format: date-time }, hash: { type: string } } } }
+        scouting: { type: array, items: { type: object, properties: { record_no: { type: string }, version: { type: integer }, observed_at: { type: string, format: date-time }, condition: { type: string }, severity: { type: string }, hash: { type: string } } } }
+    PhiStatus:
+      type: object
+      required: [zone_id, clear, at]
+      properties:
+        zone_id: { type: string, format: uuid }
+        at: { type: string, format: date-time }
+        clear: { type: boolean }
+        clear_at: { type: string, format: date-time }
+        blocking_record_no: { type: string }
+        blocking_product: { type: string }
+        days_remaining: { type: number }
+        message_th: { type: string }
+    ChainStatus:
+      type: object
+      required: [zone_id, head_seq, head_hash, ok]
+      properties:
+        zone_id: { type: string, format: uuid }
+        head_seq: { type: integer }
+        head_hash: { type: string }
+        ok: { type: boolean }
+        broken_at_seq: { type: integer }
+
+    # ---- tasks
+    Task:
+      type: object
+      required: [id, zone_id, kind, description_th, due_at, status, priority]
+      properties:
+        id: { type: string, format: uuid }
+        zone_id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/TaskKind' }
+        description_th: { type: string }
+        description_en: { type: string }
+        due_at: { type: string, format: date-time }
+        owner_id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        priority: { type: string, enum: [normal, critical] }
+        evidence: { type: object, additionalProperties: true }
+        source_diagnosis_id: { type: string, format: uuid }
+        sensor_id: { type: string, format: uuid }
+        phi_clear: { type: boolean, description: "Harvest tasks only" }
+        completed_at: { type: string, format: date-time }
+        escalated_at: { type: string, format: date-time }
+    TaskPage:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Task' } }
+        next_cursor: { type: string }
+    TaskEvidence:
+      type: object
+      properties:
+        photo_ids: { type: array, items: { type: string, format: uuid } }
+        observation_id: { type: string, format: uuid }
+        record_no: { type: string }
+        note_th: { type: string }
+        completed_at: { type: string, format: date-time, description: "Device time when completed offline" }
+    Reminder:
+      type: object
+      required: [id, task_id, channel, scheduled_at, status]
+      properties:
+        id: { type: string, format: uuid }
+        task_id: { type: string, format: uuid }
+        channel: { type: string, enum: [line, discord, push, email] }
+        scheduled_at: { type: string, format: date-time, description: "Already shifted out of quiet hours (FR-18)" }
+        sent_at: { type: string, format: date-time }
+        status: { type: string, enum: [scheduled, sent, failed, cancelled] }
+        message_th: { type: string }
+    Escalation:
+      type: object
+      required: [id, task, to_user_id, reason, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        task: { $ref: '#/components/schemas/Task' }
+        to_user_id: { type: string, format: uuid }
+        reason: { type: string }
+        created_at: { type: string, format: date-time }
+        acknowledged_at: { type: string, format: date-time }
+    Channel:
+      type: object
+      required: [kind, enabled]
+      properties:
+        kind: { type: string, enum: [line, discord, push, email] }
+        enabled: { type: boolean }
+        address_ref: { type: string, description: "LINE userId / webhook reference — never a secret" }
+
+    # ---- sensors, weather, advisories
+    TelemetryBatch:
+      type: object
+      required: [device, readings]
+      properties:
+        device: { type: string, description: sensor device code }
+        readings: { type: array, minItems: 1, maxItems: 1000, items: { type: object, required: [ts, value, unit], properties: { ts: { type: string, format: date-time }, value: { type: number }, unit: { type: string } } } }
+    TelemetryAck:
+      type: object
+      required: [accepted, out_of_range]
+      properties:
+        accepted: { type: integer }
+        out_of_range: { type: integer }
+        duplicates: { type: integer }
+    SensorCreate:
+      type: object
+      required: [zone_id, kind, unit, device_code]
+      properties:
+        zone_id: { type: string, format: uuid }
+        kind: { type: string }
+        unit: { type: string }
+        device_code: { type: string }
+        installed_at: { type: string, format: date }
+    Sensor:
+      type: object
+      required: [id, zone_id, kind, unit, device_code, status]
+      properties:
+        id: { type: string, format: uuid }
+        zone_id: { type: string, format: uuid }
+        kind: { type: string }
+        unit: { type: string }
+        device_code: { type: string }
+        status: { type: string, enum: [ok, fault, offline, retired] }
+        last_seen_at: { type: string, format: date-time }
+        open_faults: { type: array, items: { type: object, properties: { kind: { type: string, enum: [stuck, out_of_range, offline] }, detected_at: { type: string, format: date-time }, task_id: { type: string, format: uuid } } } }
+        credential_ref: { type: string, description: "Reference to the issued MQTT credential — the secret itself is shown once at registration" }
+    ZoneTelemetry:
+      type: object
+      required: [zone_id, series]
+      properties:
+        zone_id: { type: string, format: uuid }
+        series: { type: array, items: { type: object, properties: { sensor_id: { type: string, format: uuid }, kind: { type: string }, unit: { type: string }, points: { type: array, items: { type: array, items: {}, minItems: 2, maxItems: 3 } } } } }
+        moisture_trend: { type: object, properties: { slope_per_hour: { type: number }, latest: { type: number }, n: { type: integer } } }
+    Weather:
+      type: object
+      required: [farm_id, available]
+      properties:
+        farm_id: { type: string, format: uuid }
+        available: { type: boolean, description: "false → forecast-dependent advisories are suppressed with a reason (IF-12)" }
+        fetched_at: { type: string, format: date-time }
+        forecast: { type: array, items: { type: object, properties: { valid_from: { type: string, format: date-time }, valid_to: { type: string, format: date-time }, rain_mm: { type: number }, rain_prob: { type: number }, temp_c: { type: number }, rh_pct: { type: number }, wind_ms: { type: number } } } }
+        daily: { type: array, items: { type: object, properties: { day: { type: string, format: date }, tmax_c: { type: number }, tmin_c: { type: number }, rh_mean_pct: { type: number }, rain_mm: { type: number }, gdd: { type: number } } } }
+    Advisory:
+      type: object
+      required: [id, kind, level, message_th, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        zone_id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/AdvisoryKind' }
+        level: { type: string, enum: [info, elevated, high] }
+        message_th: { type: string }
+        message_en: { type: string }
+        factors: { type: object, additionalProperties: true }
+        suppressed_reason: { type: string }
+        valid_until: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+    SprayCheck:
+      type: object
+      required: [conflict, reason]
+      properties:
+        conflict: { type: [boolean, 'null'], description: "null = no forecast covering the window (unknown, stated)" }
+        rainfast_hours: { type: integer }
+        rain_at: { type: string, format: date-time }
+        rain_mm: { type: number }
+        rain_prob: { type: number }
+        reason: { type: string }
+        message_th: { type: string }
+
+    # ---- agent, forecast, summary
+    AskRequest:
+      type: object
+      required: [text]
+      properties:
+        text: { type: string, maxLength: 2000 }
+        conversation_id: { type: string, format: uuid }
+        farm_id: { type: string, format: uuid }
+        zone_id: { type: string, format: uuid }
+        locale: { type: string, enum: [th, en], default: th }
+    Answer:
+      type: object
+      required: [answer_id, question_id, text_th, products, citations, consult_agronomist, fallback]
+      properties:
+        answer_id: { type: string, format: uuid }
+        question_id: { type: string, format: uuid }
+        conversation_id: { type: string, format: uuid }
+        text_th: { type: string }
+        products: { type: array, items: { $ref: '#/components/schemas/Recommendation' }, description: "Approved products named in the answer — never anything else (AC-08)" }
+        citations: { type: array, items: { type: object, required: [kind, ref], properties: { kind: { type: string, enum: [chunk, record] }, ref: { type: string }, title: { type: string } } } }
+        consult_agronomist: { type: boolean }
+        fallback: { type: boolean, description: "true = scripted answer, no language model (FR-08)" }
+        model: { type: string }
+    Conversation:
+      type: object
+      required: [id, turns]
+      properties:
+        id: { type: string, format: uuid }
+        farm_id: { type: string, format: uuid }
+        started_at: { type: string, format: date-time }
+        turns: { type: array, items: { type: object, properties: { question: { type: string }, asked_at: { type: string, format: date-time }, answer: { $ref: '#/components/schemas/Answer' } } } }
+    HarvestForecast:
+      type: object
+      required: [zone_id, as_of, harvest_date, yield]
+      properties:
+        zone_id: { type: string, format: uuid }
+        as_of: { type: string, format: date }
+        harvest_date: { $ref: '#/components/schemas/Forecast' }
+        yield: { $ref: '#/components/schemas/Forecast' }
+    Forecast:
+      type: object
+      required: [kind, status, factors]
+      properties:
+        kind: { type: string, enum: [harvest_date, yield] }
+        status: { type: string, enum: [ok, insufficient_data] }
+        value: { type: number }
+        low: { type: number }
+        high: { type: number }
+        value_date: { type: string, format: date }
+        low_date: { type: string, format: date }
+        high_date: { type: string, format: date }
+        unit: { type: string, example: kg/rai }
+        factors: { type: object, additionalProperties: true, description: "FR-31 — method, GDD, stage, seasons, interval basis, or the reason for insufficient_data" }
+        generated_at: { type: string, format: date-time }
+    WeeklySummary:
+      type: object
+      required: [farm_id, week_start, text_th, facts]
+      properties:
+        farm_id: { type: string, format: uuid }
+        week_start: { type: string, format: date }
+        text_th: { type: string }
+        facts: { type: object, additionalProperties: true }
+
+    # ---- export, compliance
+    ExportPackage:
+      type: object
+      required: [id, farm_id, scheme, period_from, period_to, status]
+      properties:
+        id: { type: string, format: uuid }
+        farm_id: { type: string, format: uuid }
+        zone_id: { type: string, format: uuid }
+        scheme: { type: string }
+        period_from: { type: string, format: date }
+        period_to: { type: string, format: date }
+        status: { type: string, enum: [queued, ready, failed] }
+        record_count: { type: integer }
+        gap_count: { type: integer }
+        chain_heads: { type: object, additionalProperties: { type: object, properties: { seq: { type: integer }, hash: { type: string } } } }
+        verify_hash: { type: string }
+        manifest: { type: object, additionalProperties: true, description: deploy/schemas/gap-export-manifest.schema.json }
+        pdf_url: { type: string, format: uri }
+        xlsx_url: { type: string, format: uri }
+        manifest_url: { type: string, format: uri }
+    ExportVerification:
+      type: object
+      required: [export_id, manifest_ok, records_checked, records_ok, chains_ok]
+      properties:
+        export_id: { type: string, format: uuid }
+        manifest_ok: { type: boolean, description: "sha256(manifest) equals verify_hash" }
+        records_checked: { type: integer }
+        records_ok: { type: integer }
+        chains_ok: { type: boolean }
+        mismatches: { type: array, items: { type: object, properties: { record_no: { type: string }, version: { type: integer }, expected: { type: string }, actual: { type: string } } } }
+    ComplianceGap:
+      type: object
+      required: [zone_code, rule_code, gap_from, gap_to, days]
+      properties:
+        zone_code: { type: string }
+        rule_code: { type: string }
+        gap_from: { type: string, format: date }
+        gap_to: { type: string, format: date }
+        days: { type: integer }
+        description_th: { type: string }
+
+    # ---- farm, zones, crops
+    Farm:
+      type: object
+      required: [id, code, name, gap_scheme]
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        name: { type: string }
+        gap_scheme: { type: string }
+        timezone: { type: string }
+        quiet_hours: { type: object, properties: { start: { type: string }, end: { type: string } } }
+        location: { type: string, description: "lat,lng — only for members with farm_manager/admin role (NFR-05)" }
+    ZoneCreate:
+      type: object
+      required: [code, name, area_rai]
+      properties:
+        code: { type: string }
+        name: { type: string }
+        boundary: { type: object, description: GeoJSON Polygon }
+        area_rai: { type: number, exclusiveMinimum: 0 }
+        crop_code: { type: string }
+        planted_at: { type: string, format: date }
+        season_no: { type: integer, minimum: 1 }
+    Zone:
+      type: object
+      required: [id, farm_id, code, name, area_rai]
+      properties:
+        id: { type: string, format: uuid }
+        farm_id: { type: string, format: uuid }
+        code: { type: string }
+        name: { type: string }
+        area_rai: { type: number }
+        crop_code: { type: string }
+        planted_at: { type: string, format: date }
+        season_no: { type: integer }
+        stage: { type: string, description: "From accumulated GDD" }
+        gdd_accumulated: { type: number }
+        phi: { $ref: '#/components/schemas/PhiStatus' }
+        open_tasks: { type: integer }
+        boundary: { type: object, description: GeoJSON Polygon }
+    Crop:
+      type: object
+      required: [code, name_th, name_en, gdd_base_c, stages, conditions]
+      properties:
+        code: { type: string }
+        name_th: { type: string }
+        name_en: { type: string }
+        variety: { type: string }
+        gdd_base_c: { type: number }
+        stages: { type: array, items: { type: object, properties: { stage: { type: string }, gdd_from: { type: number } } } }
+        conditions: { type: array, items: { type: object, properties: { code: { type: string }, kind: { $ref: '#/components/schemas/ConditionKind' }, name_th: { type: string }, name_en: { type: string }, fast_spreading: { type: boolean } } } }
+
+    # ---- sync, auth, devices
+    SyncBatch:
+      type: object
+      required: [device_id, idempotency_key, items]
+      properties:
+        device_id: { type: string, format: uuid }
+        idempotency_key: { type: string, maxLength: 128 }
+        items: { type: array, maxItems: 500, items: { type: object, required: [entity, client_id, data], properties: { entity: { type: string, enum: [observation, task_done] }, client_id: { type: string, format: uuid }, data: { type: object, additionalProperties: true } } } }
+    SyncResult:
+      type: object
+      required: [batch_id, replayed, applied, items]
+      properties:
+        batch_id: { type: string, format: uuid }
+        replayed: { type: boolean }
+        applied: { type: integer }
+        items: { type: array, items: { type: object, properties: { client_id: { type: string, format: uuid }, entity: { type: string }, status: { type: string, enum: [applied, exists, rejected] }, server_id: { type: string, format: uuid } } } }
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string, format: password }
+        line_id_token: { type: string, description: "Alternative: LINE Login id token" }
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, expires_in]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        expires_in: { type: integer }
+        role: { type: string }
+    DeviceCreate:
+      type: object
+      required: [platform]
+      properties:
+        platform: { type: string, enum: [pwa, android, ios] }
+        app_version: { type: string }
+        device_model_version: { type: string }
+        push_token: { type: string, description: "Stored in the secret store; only a reference is kept in the database" }
+    Device:
+      type: object
+      required: [id, platform]
+      properties:
+        id: { type: string, format: uuid }
+        platform: { type: string }
+        app_version: { type: string }
+        device_model_version: { type: string }
+        recommended_model: { type: object, properties: { version: { type: string }, size_mb: { type: number }, url: { type: string, format: uri }, sha256: { type: string } } }
+        last_sync_at: { type: string, format: date-time }
+
+    # ---- privacy
+    PrivacyRequest:
+      type: object
+      required: [id, kind, status, requested_at]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [export, erasure] }
+        status: { type: string, enum: [open, completed, rejected] }
+        requested_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+        package_url: { type: string, format: uri }
+        note_th: { type: string, description: "For erasure: what is kept (record versions under the pseudonym) and why" }
+
+    # ---- admin
+    Product:
+      type: object
+      required: [code, name, active_ingredient, type, phi_days, rei_hours, approved]
+      properties:
+        code: { type: string }
+        name: { type: string }
+        name_th: { type: string }
+        active_ingredient: { type: string }
+        type: { type: string, enum: [fungicide, insecticide, herbicide, fertilizer, biocontrol, other] }
+        phi_days: { type: integer }
+        rei_hours: { type: integer }
+        rainfast_hours: { type: integer }
+        approved: { type: boolean }
+        approved_by: { type: string }
+        approved_at: { type: string, format: date-time }
+        unapproved_reason: { type: string }
+        label_url: { type: string, format: uri }
+        mrl: { type: object, additionalProperties: true }
+        crops: { type: array, items: { type: string } }
+        target_conditions: { type: array, items: { type: string } }
+        cautions_th: { type: string }
+    ProductCreate:
+      type: object
+      required: [code, name, active_ingredient, type, phi_days, rei_hours]
+      properties:
+        code: { type: string }
+        name: { type: string }
+        name_th: { type: string }
+        active_ingredient: { type: string }
+        type: { type: string }
+        phi_days: { type: integer, minimum: 0 }
+        rei_hours: { type: integer, minimum: 0 }
+        rainfast_hours: { type: integer, minimum: 0 }
+        label_uri: { type: string }
+        mrl: { type: object, additionalProperties: true }
+        crops: { type: array, items: { type: string } }
+        target_conditions: { type: array, items: { type: string } }
+        cautions_th: { type: string }
+    ProductApproval:
+      type: object
+      required: [approved]
+      properties:
+        approved: { type: boolean }
+        label_uri: { type: string }
+        unapproved_reason: { type: string }
+    Model:
+      type: object
+      required: [id, name, version, kind, crop_family, size_mb, status]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        version: { type: string }
+        kind: { type: string, enum: [server, device] }
+        crop_family: { type: string }
+        size_mb: { type: number }
+        status: { type: string, enum: [draft, evaluated, released, retired] }
+        evaluations: { type: array, items: { type: object, properties: { set_kind: { type: string, enum: [field, lab] }, set_name: { type: string }, n_images: { type: integer }, top1: { type: number }, top3: { type: number }, ece: { type: number }, passed: { type: boolean } } } }
+        calibration: { type: object, properties: { version: { type: string }, temperature: { type: number }, ece: { type: number }, active: { type: boolean } } }
+        released_at: { type: string, format: date-time }
+    ModelManifest:
+      type: object
+      description: deploy/schemas/model-manifest.schema.json
+      additionalProperties: true
+      required: [name, version, kind, crop_family, size_mb, format, heads, classes, evaluations, calibration, ood]
+    GapScheme:
+      type: object
+      description: deploy/schemas/gap-scheme.schema.json
+      additionalProperties: true
+      required: [code, name, version, record_templates, rules]
+    TaskTemplate:
+      type: object
+      required: [ordinal, task_kind, description_th, description_en, due_offset_days, min_severity]
+      properties:
+        id: { type: string, format: uuid }
+        condition_kind: { $ref: '#/components/schemas/ConditionKind' }
+        min_severity: { $ref: '#/components/schemas/SeverityLevel' }
+        ordinal: { type: integer }
+        task_kind: { $ref: '#/components/schemas/TaskKind' }
+        description_th: { type: string }
+        description_en: { type: string }
+        due_offset_days: { type: integer, minimum: 0 }
+        priority: { type: string, enum: [normal, critical] }
+        n_plants: { type: integer }
+        active: { type: boolean }
+    RiskRule:
+      type: object
+      required: [crop_code, condition_code, rh_min_pct, temp_min_c, temp_max_c, hours_min, level, message_th, source]
+      properties:
+        id: { type: string, format: uuid }
+        crop_code: { type: string }
+        condition_code: { type: string }
+        rh_min_pct: { type: number }
+        temp_min_c: { type: number }
+        temp_max_c: { type: number }
+        hours_min: { type: number }
+        level: { type: string, enum: [info, elevated, high] }
+        message_th: { type: string }
+        source: { type: string }
+        active: { type: boolean }
+
+    # ---- system
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok, degraded, down] }
+        version: { type: string }
+        checks: { type: object, additionalProperties: { type: string } }

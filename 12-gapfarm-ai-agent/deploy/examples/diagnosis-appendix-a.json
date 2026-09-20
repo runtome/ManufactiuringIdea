@@ -1,0 +1,23 @@
+{
+  "observation_id": "00000000-0000-7000-8000-000000000701",
+  "model_version": "chili-v3",
+  "calibration_version": "chili-v3-cal1",
+  "computed_on": "server",
+  "crop": "chili",
+  "affected_part": "leaf",
+  "growth_stage": "flowering",
+  "ood": false,
+  "ood_score": 1.7,
+  "candidates": [
+    { "condition_code": "cercospora_leaf_spot", "name_th": "โรคใบจุด", "name_en": "Cercospora leaf spot", "kind": "disease", "probability": 0.82,
+      "distinguishing_features_th": "จุดกลมสีน้ำตาลขอบเข้ม กลางใบซีด กระจายที่ใบล่าง", "how_to_confirm_th": "ถ่ายภาพใต้ใบเพิ่ม และดูว่ามีวงซ้อนหรือไม่" },
+    { "condition_code": "anthracnose", "name_th": "โรคแอนแทรคโนส", "name_en": "Anthracnose", "kind": "disease", "probability": 0.09,
+      "distinguishing_features_th": "แผลยุบตัวบนผล", "how_to_confirm_th": "ดูผลที่แผลยุบ" },
+    { "condition_code": "mg_deficiency", "name_th": "ขาดธาตุแมกนีเซียม", "name_en": "Magnesium deficiency", "kind": "deficiency", "probability": 0.05,
+      "distinguishing_features_th": "ใบล่างเหลืองระหว่างเส้นใบ", "how_to_confirm_th": "ดูใบล่างหลายต้น" }
+  ],
+  "severity": { "level": "moderate", "area_pct_low": 8, "area_pct_high": 12, "plants_affected": 6, "plants_inspected": 30 },
+  "consult_agronomist": false,
+  "gate": { "pass": true, "blur": 0.74, "exposure": 0.55, "distance": "ok", "guidance_th": null },
+  "latency_ms": 4120
+}

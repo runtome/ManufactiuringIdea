@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gapfarm.local/schemas/gap-scheme.schema.json",
+  "title": "GAPFarm GAP scheme definition (SRS-12 section 10: scheme-configurable record templates)",
+  "description": "Import format for farm.gap_scheme and farm.gap_scheme_rule. record_templates fixes the field order of each record kind in the audit package (IF-66); rules define mandatory records and the maximum gap between consecutive records of a kind (FR-15).",
+  "type": "object",
+  "required": ["code", "name", "version", "record_templates", "rules"],
+  "additionalProperties": false,
+  "properties": {
+    "code": { "type": "string", "pattern": "^[a-z]+$" },
+    "name": { "type": "string" },
+    "version": { "type": "string" },
+    "record_templates": {
+      "type": "object", "required": ["scouting", "input_usage", "harvest"], "additionalProperties": false,
+      "properties": {
+        "scouting": { "type": "array", "minItems": 5, "items": { "type": "string" }, "contains": { "const": "record_no" } },
+        "input_usage": { "type": "array", "minItems": 8, "items": { "type": "string" }, "allOf": [ { "contains": { "const": "product" } }, { "contains": { "const": "ppe" } }, { "contains": { "const": "weather" } }, { "contains": { "const": "phi_clear_at" } } ] },
+        "harvest": { "type": "array", "minItems": 5, "items": { "type": "string" }, "allOf": [ { "contains": { "const": "lot_code" } }, { "contains": { "const": "inputs" } } ] }
+      }
+    },
+    "rules": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "required": ["rule_code", "record_kind", "mandatory", "description_th"], "additionalProperties": false,
+        "properties": {
+          "rule_code": { "type": "string", "pattern": "^[a-z_]+$" },
+          "record_kind": { "enum": ["scouting", "input_usage", "harvest"] },
+          "max_gap_days": { "type": ["integer", "null"], "minimum": 1, "maximum": 90 },
+          "mandatory": { "type": "boolean" },
+          "description_th": { "type": "string", "minLength": 5 },
+          "description_en": { "type": "string" }
+        }
+      },
+      "contains": { "type": "object", "properties": { "record_kind": { "const": "scouting" }, "max_gap_days": { "type": "integer" } }, "required": ["record_kind", "max_gap_days"] }
+    }
+  }
+}

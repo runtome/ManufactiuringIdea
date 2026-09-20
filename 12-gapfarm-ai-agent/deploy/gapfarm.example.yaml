@@ -1,0 +1,114 @@
+# GAPFarm AI — runtime policy configuration (deploy/schemas/gapfarm-config.schema.json; validated at start-up, TEST-12 TC-006).
+# Runtime knobs (ports, image tags, hosts) are in .env; secrets are FILES under ${SECRETS_DIR} (OPS-12 §4.2). Nothing secret lives here.
+# Constants that the SRS fixes are pinned by the schema: PHI enforcement, approved-list-only, OOD refusal, calibration,
+# the AI-02 gates, the 25 MB device model, the 24 h sensor buffer, LLM ≤ 9 B at temperature ≤ 0.3.
+version: 1
+locale:
+  primary: th                       # C-05
+  secondary: en
+
+diagnosis:                           # FR-01…FR-06, AI-05, AI-06
+  max_photos: 5
+  max_photo_bytes: 1048576           # NFR-06: client compresses; server refuses larger
+  quality_gate:
+    blur_min: 0.35                   # variance-of-Laplacian, normalised
+    exposure_min: 0.25
+    exposure_max: 0.85
+    distance_leaf_area_min_pct: 8    # subject too far below this
+  review_threshold: 0.60             # FR-05: below → agronomist queue
+  ood_refusal: true                  # AI-06 — constant
+  calibration_required: true         # AI-05 — constant
+  severity_bands_pct:                # FR-06
+    low_max: 5
+    moderate_max: 15
+  consult_on_fast_spreading: true    # FR-29
+  server_timeout_s: 8                # NFR-01
+  device_timeout_s: 2
+
+records:                             # C-03, FR-11, FR-14, NFR-04
+  append_only: true                  # constant
+  hash_chain: true                   # constant
+  phi_enforcement: block             # constant: harvest inside PHI is refused (AC-04)
+  input_usage_requires: [product, dose, unit, method, applicator, weather, ppe]
+  record_no_format: "{kind}-{yyyy}-{seq:04d}"
+
+inputs:                              # C-02, FR-28
+  approved_list_only: true           # constant
+  two_person_approval: true          # constant (loader rule L-1)
+  label_required_for_approval: true
+  dose_display: per_label            # never computed
+
+tasks:                               # FR-16…FR-20
+  followup_days: 7
+  due_time_local: "17:00"
+  reminder_time_local: "07:00"
+  quiet_hours:
+    start: "20:00"
+    end: "06:00"
+  escalation_hours: 24
+  channels_priority: [line, push, discord, email]
+
+sensors:                             # FR-21, FR-22, NFR-07
+  buffer_hours: 24                   # ≥ 24
+  offline_minutes: 60
+  stuck_readings: 12
+  fault_scan_interval_s: 900
+  late_skew_minutes: 10
+
+weather:                             # FR-23…FR-26, IF-12
+  provider: open-meteo               # open-meteo | tmd
+  refresh_minutes: 60
+  cache_min_minutes: 30
+  suppress_when_unavailable: true    # constant: never compute on stale data
+  irrigation:
+    slope_threshold_pct_per_h: -0.3
+    moisture_min_pct: 30
+    rain_next_24h_max_mm: 5
+    window_hours: 24
+
+prediction:                          # FR-30, FR-31, AI-08
+  method: gdd_history_v1
+  min_seasons: 3
+  gdd_window_days: 14
+  min_weather_days: 7
+  interval: t_95
+
+agent:                               # FR-27…FR-29, AI-07
+  enabled: true
+  model: qwen2.5:7b-instruct-q4_K_M  # ≤ 9 B
+  parameters_b: 7
+  temperature: 0.2                   # ≤ 0.3
+  timeout_s: 15
+  fallback: scripted                 # constant: rule-based fallback mandatory
+  max_chunks: 6
+  prompt_version: v1
+  adversarial_set: deploy/eval/adversarial.th.jsonl
+
+models:                              # AI-02…AI-04
+  gate_top1_min: 0.80                # ≥ 0.80
+  gate_top3_min: 0.93                # ≥ 0.93
+  ece_max: 0.05
+  device_max_mb: 25                  # ≤ 25
+  field_set_required: true           # AI-03 — constant
+
+compliance:                          # FR-13, FR-15
+  default_scheme: thaigap
+  export_formats: [pdf, xlsx]
+  gap_scan_interval_hours: 24
+  export_retention_years: 5
+
+privacy:                             # NFR-05, NFR-06
+  pdpa_consent_version: pdpa-2026.1
+  erasure_sla_days: 30
+  signed_url_ttl_s: 900
+  refused_photo_retention_days: 30
+  pass_photo_retention_days: 365
+  telemetry_retention_days: 730
+  forecast_retention_days: 365
+
+limits:                              # SEC-G29
+  login_per_min_ip: 5
+  diagnose_per_hour_user: 30
+  ask_per_hour_user: 60
+  sync_per_min_device: 10
+  telemetry_per_s_device: 1

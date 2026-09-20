@@ -1,0 +1,244 @@
+{
+  "manifest": {
+    "scheme": "thaigap",
+    "period_from": "2026-06-20",
+    "period_to": "2026-09-20",
+    "zone_id": null,
+    "record_count": 27,
+    "gap_count": 1,
+    "chain_heads": {
+      "A": {
+        "seq": 17,
+        "hash": "05ff22f2ff8d083f51967ab501957a2ee1980664259b4447aae7cbff42d0f104"
+      },
+      "B": {
+        "seq": 10,
+        "hash": "eed38475491471ddfdb2cccca9f5c4613934fba2c322a9eb4cefe082c49d808f"
+      },
+      "C": {
+        "seq": 1,
+        "hash": "d1b32c897c8493006133f776cd7ad21f854d743b993fd4efbb8b16f53655d800"
+      }
+    },
+    "records": [
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0391",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-06-22T08:00:00+07:00",
+        "hash": "d7a1ec0b05ccb614513d447268d40156e94ad76cea39f9cfb8e8c662c0be2ae0"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0392",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-06-29T08:00:00+07:00",
+        "hash": "2ee2811405bd714564064fee9c2177635b4b6ace89225ff3dae6c1d6a51ac4fd"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0393",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-07-06T08:00:00+07:00",
+        "hash": "8292926f5d23cc2adefe286d310c943356a1978b0eec8905315eafefad7c8d71"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0394",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-07-13T08:00:00+07:00",
+        "hash": "8ba8836eb8a9f76d25d374be43c7e474f2fe74e4aea91a03368ae43dac2119bb"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0395",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-07-20T08:00:00+07:00",
+        "hash": "9f4737558576d92a02b8ea89eb76d964d84e52c1100e09436c61d5385762d2ac"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0396",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-07-27T08:00:00+07:00",
+        "hash": "d98948a4b57201fc3b11295981d137e2bc208dedfb748c5cda6263a16765c440"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0397",
+        "version": 1,
+        "zone": "B",
+        "at": "2026-07-27T08:30:00+07:00",
+        "hash": "a0668876ec60c8ed14bbf61d2277d3a202e7afb5d0c021848bf8f7d1fcc48aca"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0398",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-08-03T08:00:00+07:00",
+        "hash": "00ac38d5f110aea5bced7bd89157d1008c40489e82e260966b25b52b7a8829c5"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0399",
+        "version": 1,
+        "zone": "B",
+        "at": "2026-08-03T08:30:00+07:00",
+        "hash": "58557b7a43e063119a3c005f6ddd57b319cc6fac05bd6e6dcb47eb0f4520c3a0"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0400",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-08-10T08:00:00+07:00",
+        "hash": "d1838d4dce5435796ef0310abe79b4abc3bd85b782d858ab447bba43636e08c8"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0401",
+        "version": 1,
+        "zone": "B",
+        "at": "2026-08-10T08:30:00+07:00",
+        "hash": "9bf3e35978211e8336f40f854cff89b7f70f591c103150126d0ea096d59a5fa7"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0402",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-08-17T08:00:00+07:00",
+        "hash": "dbc3a9a4093e743fbc4d0ad333f8834fd61d32dd8a27698db779f4abc6c298d2"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0403",
+        "version": 1,
+        "zone": "B",
+        "at": "2026-08-17T08:30:00+07:00",
+        "hash": "344986fa5aacc926fd22fcf66904d9a3268288bab21e711916cd90caa53a1e2c"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0404",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-08-24T08:00:00+07:00",
+        "hash": "11e7771ffe4644678bcc096690f7242af12670843533552e426fed5f395ec274"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0405",
+        "version": 1,
+        "zone": "B",
+        "at": "2026-08-24T08:30:00+07:00",
+        "hash": "2a46306670c4ff9c2b50b9b3f794e8adf79367c82d2fafb2b27bd8cf5bb83dca"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0406",
+        "version": 1,
+        "zone": "C",
+        "at": "2026-08-25T08:00:00+07:00",
+        "hash": "d1b32c897c8493006133f776cd7ad21f854d743b993fd4efbb8b16f53655d800"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0407",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-08-31T08:00:00+07:00",
+        "hash": "ce035310a641f49b5b8f3e2218946fe7afbfaffbac6fc676b2625ba15ffc3b20"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0408",
+        "version": 1,
+        "zone": "B",
+        "at": "2026-08-31T08:30:00+07:00",
+        "hash": "79b214504a175d694c4e9f01c00bec52f605cfb1faf054aaf402e2ea01e6a62b"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0409",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-09-05T08:00:00+07:00",
+        "hash": "48711fd4e1f26143637c4db3f610b1b294f102890d1fcc26f60fda2b2df3e28f"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0410",
+        "version": 1,
+        "zone": "B",
+        "at": "2026-09-05T08:30:00+07:00",
+        "hash": "ddde5dd6ac91ccc61ff23ab542525c3fbbb74d7ccacf701d63471da491f0dc84"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0411",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-09-08T08:00:00+07:00",
+        "hash": "e528a1ea4c805ef544db693a09df16dfd1dc736bc5baf119f5221d4a10eb982b"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0412",
+        "version": 2,
+        "zone": "B",
+        "at": "2026-09-09T10:15:00+07:00",
+        "hash": "eed38475491471ddfdb2cccca9f5c4613934fba2c322a9eb4cefe082c49d808f"
+      },
+      {
+        "kind": "input_usage",
+        "record_no": "IU-2026-0031",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-09-10T08:00:00+07:00",
+        "hash": "e3c696a80df0dfc2b1064e27d619f29ddfd87357f1e317bb915d27a53e321a4e"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0413",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-09-12T09:00:00+07:00",
+        "hash": "60e4ecf272d5ac4a3d1018cd3034a20c8dfbc69b6789cc318ab32f3ce638cec7"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0414",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-09-15T08:00:00+07:00",
+        "hash": "88a33081a08b125137616dd3057eba71f8a6700d0b784ce593b9107eee8a210e"
+      },
+      {
+        "kind": "scouting",
+        "record_no": "SC-2026-0415",
+        "version": 1,
+        "zone": "B",
+        "at": "2026-09-16T09:00:00+07:00",
+        "hash": "2e8eb584ed1f215bab312e0832575b215eed5ffd5384d8302cc5f88dafdcc5fa"
+      },
+      {
+        "kind": "harvest",
+        "record_no": "HV-2026-0007",
+        "version": 1,
+        "zone": "A",
+        "at": "2026-09-18T09:00:00+07:00",
+        "hash": "05ff22f2ff8d083f51967ab501957a2ee1980664259b4447aae7cbff42d0f104"
+      }
+    ]
+  },
+  "verify_hash": "727922173316cb4628ff26302f68ed790a761f5e206df2be72e1e275a9b94530",
+  "canonical_note": "verify_hash = sha256(jsonb canonical text of manifest) — keys ordered by length then bytes; ', ' and ': ' separators"
+}

@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gapfarm.local/schemas/gapfarm-config.schema.json",
+  "title": "GAPFarm AI runtime configuration (deploy/gapfarm.yaml)",
+  "description": "Validated at start-up by every service. Constants the SRS fixes are pinned (const / minimum / maximum) so a misconfiguration cannot weaken them: PHI enforcement (FR-11), approved-list-only (C-02), OOD refusal (AI-06), calibration (AI-05), the AI-02 gates, the 25 MB device model (AI-04), the 24 h sensor buffer (NFR-07), the LLM size and temperature (AI-07), suppression when weather is unavailable (IF-12).",
+  "type": "object",
+  "required": ["version", "locale", "diagnosis", "records", "inputs", "tasks", "sensors", "weather", "prediction", "agent", "models", "compliance", "privacy", "limits"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "locale": { "type": "object", "required": ["primary", "secondary"], "additionalProperties": false,
+      "properties": { "primary": { "const": "th" }, "secondary": { "enum": ["en"] } } },
+    "diagnosis": { "type": "object", "additionalProperties": false,
+      "required": ["max_photos", "max_photo_bytes", "quality_gate", "review_threshold", "ood_refusal", "calibration_required", "severity_bands_pct", "consult_on_fast_spreading", "server_timeout_s", "device_timeout_s"],
+      "properties": {
+        "max_photos": { "type": "integer", "minimum": 1, "maximum": 5 },
+        "max_photo_bytes": { "type": "integer", "minimum": 65536, "maximum": 1048576 },
+        "quality_gate": { "type": "object", "required": ["blur_min", "exposure_min", "exposure_max", "distance_leaf_area_min_pct"], "additionalProperties": false,
+          "properties": { "blur_min": { "type": "number", "minimum": 0.05, "maximum": 0.9 }, "exposure_min": { "type": "number", "minimum": 0, "maximum": 0.5 }, "exposure_max": { "type": "number", "minimum": 0.5, "maximum": 1 }, "distance_leaf_area_min_pct": { "type": "number", "minimum": 1, "maximum": 50 } } },
+        "review_threshold": { "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1, "minimum": 0.5 },
+        "ood_refusal": { "const": true },
+        "calibration_required": { "const": true },
+        "severity_bands_pct": { "type": "object", "required": ["low_max", "moderate_max"], "additionalProperties": false,
+          "properties": { "low_max": { "type": "number", "minimum": 1, "maximum": 10 }, "moderate_max": { "type": "number", "minimum": 10, "maximum": 40 } } },
+        "consult_on_fast_spreading": { "const": true },
+        "server_timeout_s": { "type": "number", "minimum": 1, "maximum": 8 },
+        "device_timeout_s": { "type": "number", "minimum": 0.5, "maximum": 2 }
+      } },
+    "records": { "type": "object", "additionalProperties": false,
+      "required": ["append_only", "hash_chain", "phi_enforcement", "input_usage_requires", "record_no_format"],
+      "properties": {
+        "append_only": { "const": true },
+        "hash_chain": { "const": true },
+        "phi_enforcement": { "const": "block" },
+        "input_usage_requires": { "type": "array", "allOf": [ { "contains": { "const": "product" } }, { "contains": { "const": "ppe" } }, { "contains": { "const": "weather" } }, { "contains": { "const": "applicator" } } ], "items": { "type": "string" } },
+        "record_no_format": { "type": "string", "pattern": "\\{kind\\}.*\\{yyyy\\}.*\\{seq" }
+      } },
+    "inputs": { "type": "object", "additionalProperties": false,
+      "required": ["approved_list_only", "two_person_approval", "label_required_for_approval", "dose_display"],
+      "properties": { "approved_list_only": { "const": true }, "two_person_approval": { "const": true }, "label_required_for_approval": { "const": true }, "dose_display": { "const": "per_label" } } },
+    "tasks": { "type": "object", "additionalProperties": false,
+      "required": ["followup_days", "due_time_local", "reminder_time_local", "quiet_hours", "escalation_hours", "channels_priority"],
+      "properties": {
+        "followup_days": { "type": "integer", "minimum": 1, "maximum": 30 },
+        "due_time_local": { "$ref": "#/$defs/hhmm" },
+        "reminder_time_local": { "$ref": "#/$defs/hhmm" },
+        "quiet_hours": { "type": "object", "required": ["start", "end"], "additionalProperties": false, "properties": { "start": { "$ref": "#/$defs/hhmm" }, "end": { "$ref": "#/$defs/hhmm" } } },
+        "escalation_hours": { "type": "integer", "minimum": 1, "maximum": 168 },
+        "channels_priority": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["line", "push", "discord", "email"] } }
+      } },
+    "sensors": { "type": "object", "additionalProperties": false,
+      "required": ["buffer_hours", "offline_minutes", "stuck_readings", "fault_scan_interval_s", "late_skew_minutes"],
+      "properties": {
+        "buffer_hours": { "type": "integer", "minimum": 24 },
+        "offline_minutes": { "type": "integer", "minimum": 60, "maximum": 60 },
+        "stuck_readings": { "type": "integer", "minimum": 3, "maximum": 96 },
+        "fault_scan_interval_s": { "type": "integer", "minimum": 60, "maximum": 3600 },
+        "late_skew_minutes": { "type": "integer", "minimum": 1, "maximum": 60 }
+      } },
+    "weather": { "type": "object", "additionalProperties": false,
+      "required": ["provider", "refresh_minutes", "cache_min_minutes", "suppress_when_unavailable", "irrigation"],
+      "properties": {
+        "provider": { "enum": ["open-meteo", "tmd"] },
+        "refresh_minutes": { "type": "integer", "minimum": 30, "maximum": 360 },
+        "cache_min_minutes": { "type": "integer", "minimum": 30 },
+        "suppress_when_unavailable": { "const": true },
+        "irrigation": { "type": "object", "required": ["slope_threshold_pct_per_h", "moisture_min_pct", "rain_next_24h_max_mm", "window_hours"], "additionalProperties": false,
+          "properties": { "slope_threshold_pct_per_h": { "type": "number", "maximum": 0, "minimum": -5 }, "moisture_min_pct": { "type": "number", "minimum": 5, "maximum": 60 }, "rain_next_24h_max_mm": { "type": "number", "minimum": 0, "maximum": 30 }, "window_hours": { "type": "integer", "minimum": 6, "maximum": 72 } } }
+      } },
+    "prediction": { "type": "object", "additionalProperties": false,
+      "required": ["method", "min_seasons", "gdd_window_days", "min_weather_days", "interval"],
+      "properties": {
+        "method": { "const": "gdd_history_v1" },
+        "min_seasons": { "type": "integer", "minimum": 2, "maximum": 10 },
+        "gdd_window_days": { "type": "integer", "minimum": 7, "maximum": 30 },
+        "min_weather_days": { "type": "integer", "minimum": 7 },
+        "interval": { "const": "t_95" }
+      } },
+    "agent": { "type": "object", "additionalProperties": false,
+      "required": ["enabled", "model", "parameters_b", "temperature", "timeout_s", "fallback", "max_chunks", "prompt_version", "adversarial_set"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "model": { "type": "string" },
+        "parameters_b": { "type": "number", "exclusiveMinimum": 0, "maximum": 9 },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 0.3 },
+        "timeout_s": { "type": "integer", "minimum": 3, "maximum": 30 },
+        "fallback": { "const": "scripted" },
+        "max_chunks": { "type": "integer", "minimum": 1, "maximum": 12 },
+        "prompt_version": { "type": "string", "pattern": "^v[0-9]+$" },
+        "adversarial_set": { "type": "string" }
+      } },
+    "models": { "type": "object", "additionalProperties": false,
+      "required": ["gate_top1_min", "gate_top3_min", "ece_max", "device_max_mb", "field_set_required"],
+      "properties": {
+        "gate_top1_min": { "type": "number", "minimum": 0.80, "maximum": 1 },
+        "gate_top3_min": { "type": "number", "minimum": 0.93, "maximum": 1 },
+        "ece_max": { "type": "number", "exclusiveMinimum": 0, "maximum": 0.05 },
+        "device_max_mb": { "type": "number", "exclusiveMinimum": 0, "maximum": 25 },
+        "field_set_required": { "const": true }
+      } },
+    "compliance": { "type": "object", "additionalProperties": false,
+      "required": ["default_scheme", "export_formats", "gap_scan_interval_hours", "export_retention_years"],
+      "properties": {
+        "default_scheme": { "type": "string", "pattern": "^[a-z]+$" },
+        "export_formats": { "type": "array", "allOf": [ { "contains": { "const": "pdf" } }, { "contains": { "const": "xlsx" } } ], "items": { "enum": ["pdf", "xlsx"] } },
+        "gap_scan_interval_hours": { "type": "integer", "minimum": 1, "maximum": 168 },
+        "export_retention_years": { "type": "integer", "minimum": 5 }
+      } },
+    "privacy": { "type": "object", "additionalProperties": false,
+      "required": ["pdpa_consent_version", "erasure_sla_days", "signed_url_ttl_s", "refused_photo_retention_days", "pass_photo_retention_days", "telemetry_retention_days", "forecast_retention_days"],
+      "properties": {
+        "pdpa_consent_version": { "type": "string" },
+        "erasure_sla_days": { "type": "integer", "minimum": 1, "maximum": 30 },
+        "signed_url_ttl_s": { "type": "integer", "minimum": 60, "maximum": 900 },
+        "refused_photo_retention_days": { "type": "integer", "minimum": 1, "maximum": 90 },
+        "pass_photo_retention_days": { "type": "integer", "minimum": 30, "maximum": 1095 },
+        "telemetry_retention_days": { "type": "integer", "minimum": 365 },
+        "forecast_retention_days": { "type": "integer", "minimum": 90 }
+      } },
+    "limits": { "type": "object", "additionalProperties": false,
+      "required": ["login_per_min_ip", "diagnose_per_hour_user", "ask_per_hour_user", "sync_per_min_device", "telemetry_per_s_device"],
+      "properties": {
+        "login_per_min_ip": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "diagnose_per_hour_user": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "ask_per_hour_user": { "type": "integer", "minimum": 1, "maximum": 300 },
+        "sync_per_min_device": { "type": "integer", "minimum": 1, "maximum": 60 },
+        "telemetry_per_s_device": { "type": "integer", "minimum": 1, "maximum": 10 }
+      } }
+  },
+  "$defs": { "hhmm": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$" } }
+}

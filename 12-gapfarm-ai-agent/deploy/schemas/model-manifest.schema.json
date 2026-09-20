@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gapfarm.local/schemas/model-manifest.schema.json",
+  "title": "GAPFarm diagnosis model manifest (IF-64)",
+  "description": "One manifest per model artefact (server or device). Release requires a FIELD evaluation above the AI-02 gates (lab-only sets never count - AI-03), a calibration with a reliability diagram (AI-05), an OOD threshold (AI-06) and, for device models, size <= 25 MB (AI-04). Mirrors trg_eval_gate / trg_model_release_gate / trg_calibration_required.",
+  "type": "object",
+  "required": ["name", "version", "kind", "crop_family", "size_mb", "format", "heads", "classes", "input", "evaluations", "calibration", "ood"],
+  "additionalProperties": false,
+  "properties": {
+    "name": { "type": "string" },
+    "version": { "type": "string" },
+    "kind": { "enum": ["server", "device"] },
+    "crop_family": { "type": "string" },
+    "size_mb": { "type": "number", "exclusiveMinimum": 0 },
+    "format": { "enum": ["onnx", "tflite", "torchscript"] },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "heads": { "type": "array", "minItems": 3, "items": { "enum": ["crop", "part", "condition"] }, "uniqueItems": true },
+    "classes": { "type": "array", "minItems": 2, "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]+$" } },
+    "input": { "type": "object", "required": ["size_px", "normalisation"], "properties": { "size_px": { "type": "integer", "enum": [224, 256, 320, 384] }, "normalisation": { "type": "string" } } },
+    "evaluations": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/evaluation" } },
+    "calibration": { "type": "object", "required": ["version", "temperature", "ece", "reliability_bins"], "additionalProperties": false,
+      "properties": { "version": { "type": "string" }, "temperature": { "type": "number", "exclusiveMinimum": 0 }, "ece": { "type": "number", "minimum": 0, "maximum": 0.05 },
+                      "reliability_bins": { "type": "array", "minItems": 4, "items": { "type": "object", "required": ["lo", "hi", "confidence", "accuracy", "n"] } } } },
+    "ood": { "type": "object", "required": ["method", "threshold", "auroc_field"], "properties": { "method": { "enum": ["energy", "max_softmax", "mahalanobis"] }, "threshold": { "type": "number" }, "auroc_field": { "type": "number", "minimum": 0.9, "maximum": 1 } } },
+    "released": { "type": "boolean" }
+  },
+  "allOf": [
+    { "if": { "properties": { "kind": { "const": "device" } }, "required": ["kind"] }, "then": { "properties": { "size_mb": { "maximum": 25 }, "format": { "const": "tflite" } } } },
+    { "if": { "properties": { "released": { "const": true } }, "required": ["released"] },
+      "then": { "properties": { "evaluations": { "contains": { "type": "object", "properties": { "set_kind": { "const": "field" }, "top1": { "minimum": 0.80 }, "top3": { "minimum": 0.93 } }, "required": ["set_kind", "top1", "top3"] } } } } }
+  ],
+  "$defs": {
+    "evaluation": { "type": "object", "required": ["set_kind", "set_name", "n_images", "top1", "top3"], "additionalProperties": false,
+      "properties": { "set_kind": { "enum": ["field", "lab"] }, "set_name": { "type": "string" }, "n_images": { "type": "integer", "minimum": 200 },
+                      "top1": { "type": "number", "minimum": 0, "maximum": 1 }, "top3": { "type": "number", "minimum": 0, "maximum": 1 }, "ece": { "type": "number" }, "run_at": { "type": "string", "format": "date-time" } } }
+  }
+}

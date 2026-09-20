@@ -1,0 +1,358 @@
+# GAPFarm AI — docker-compose.yml (single small VPS or on-farm mini-PC; OPS-12 §4; NFR-09)
+# Profiles:  gpu (worker-vision + ollama on CUDA) | cpu (everything on CPU — the pilot baseline) | mqtt (mosquitto + ingest for farms with sensors) | dev (mailpit, sensor-sim, weather-mock)
+#   docker compose --profile cpu --profile mqtt up -d                 pilot with sensors
+#   docker compose --profile cpu --profile mqtt --profile dev up -d   integration tests
+# Networks:  frontend (reverse proxy → api/web) · sensors (mosquitto ↔ ingest; field devices reach 8883 only) · internal (no egress: db, redis, minio, workers, ollama)
+#            · egress (api, scheduler → weather provider, LINE, Discord, push, SMTP — the only internet-facing services, SEC-12 O-6)
+# Secrets are FILES under ${SECRETS_DIR} (OPS-12 §4.2) — never in this file or in .env (TEST-12 TC-007).
+
+x-hardened: &hardened
+  user: "10001:10001"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp]
+  restart: unless-stopped
+  logging: { driver: json-file, options: { max-size: "20m", max-file: "5" } }
+
+x-app-env: &app-env
+  TZ: ${TZ}
+  DATABASE_URL_FILE: /run/secrets/database_url
+  REDIS_URL: redis://redis:6379/0
+  S3_ENDPOINT: http://minio:9000
+  S3_REGION: ${S3_REGION}
+  S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+  S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+  S3_BUCKET_PHOTOS: ${S3_BUCKET_PHOTOS}
+  S3_BUCKET_EXPORTS: ${S3_BUCKET_EXPORTS}
+  S3_BUCKET_LABELS: ${S3_BUCKET_LABELS}
+  S3_BUCKET_MODELS: ${S3_BUCKET_MODELS}
+  S3_BUCKET_PDPA: ${S3_BUCKET_PDPA}
+  CONFIG_DIR: /etc/gapfarm
+  DEFAULT_LOCALE: ${DEFAULT_LOCALE}
+  LOG_LEVEL: ${LOG_LEVEL}
+
+services:
+  # ------------------------------------------------------------------ edge
+  web:                                                    # PWA: camera + quality gate, local store, on-device model (IF-31), task list
+    <<: *hardened
+    image: ${GF_REGISTRY}/web:${GF_VERSION}
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL}
+      API_URL: http://api:8080
+      DEFAULT_LOCALE: ${DEFAULT_LOCALE}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY}
+      LINE_LOGIN_CHANNEL_ID: ${LINE_LOGIN_CHANNEL_ID}
+      DEVICE_MODEL_VERSION: ${DEVICE_MODEL_VERSION}
+    ports: ["${BIND_ADDR}:${WEB_PORT}:3000"]
+    depends_on: [api]
+    networks: [frontend]
+
+  api:
+    <<: *hardened
+    image: ${GF_REGISTRY}/api:${GF_VERSION}
+    environment:
+      <<: *app-env
+      PUBLIC_URL: ${PUBLIC_URL}
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      URL_SIGNING_KEY_FILE: /run/secrets/url_signing_key
+      LINE_CHANNEL_SECRET_FILE: /run/secrets/line_channel_secret       # webhook signature (IF-67)
+      LINE_LOGIN_CHANNEL_ID: ${LINE_LOGIN_CHANNEL_ID}
+      WEATHER_PROVIDER: ${WEATHER_PROVIDER}
+      WEATHER_API_KEY_FILE: /run/secrets/weather_api_key
+      SIGNED_URL_TTL_S: ${SIGNED_URL_TTL_S}
+      MAX_PHOTO_BYTES: ${MAX_PHOTO_BYTES}
+      AGENT_ENABLED: ${AGENT_ENABLED}
+      METRICS_ENABLED: "true"
+    secrets: [database_url, s3_access_key, s3_secret_key, jwt_secret, url_signing_key, line_channel_secret, weather_api_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/gapfarm:ro                     # gapfarm.yaml, schemas/, schemes/, inputs/, prompts/, glossary.csv
+    ports: ["${BIND_ADDR}:${API_PORT}:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+      minio-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/v1/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    networks: [frontend, internal, egress]
+
+  # ------------------------------------------------------------------ workers
+  worker-vision:                                          # quality gate, crop/part/condition heads, OOD, calibration (IF-64)
+    <<: *hardened
+    image: ${GF_REGISTRY}/worker-vision:${GF_VERSION}
+    profiles: [gpu]
+    environment:
+      <<: *app-env
+      DATABASE_URL_FILE: /run/secrets/vision_database_url
+      DEVICE: cuda
+      SERVER_MODEL_VERSION: ${SERVER_MODEL_VERSION}
+      INFERENCE_BUDGET_S: ${INFERENCE_BUDGET_S}
+    secrets: [vision_database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/gapfarm:ro
+      - models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT}
+              capabilities: [gpu]
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal]
+
+  worker-vision-cpu:
+    <<: *hardened
+    image: ${GF_REGISTRY}/worker-vision:${GF_VERSION}
+    profiles: [cpu]
+    environment:
+      <<: *app-env
+      DATABASE_URL_FILE: /run/secrets/vision_database_url
+      DEVICE: cpu
+      OMP_NUM_THREADS: ${CPU_THREADS}
+      SERVER_MODEL_VERSION: ${SERVER_MODEL_VERSION}
+      INFERENCE_BUDGET_S: ${INFERENCE_BUDGET_S}
+    secrets: [vision_database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/gapfarm:ro
+      - models:/models:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal]
+
+  worker-agent:                                           # facts → answer / weekly summary / prediction; agent_ro (SEC-12 §5.7); no egress
+    <<: *hardened
+    image: ${GF_REGISTRY}/worker-agent:${GF_VERSION}
+    environment:
+      <<: *app-env
+      DATABASE_URL_FILE: /run/secrets/agent_database_url
+      OLLAMA_URL: http://ollama:11434
+      AGENT_MODEL: ${AGENT_MODEL}
+      AGENT_TIMEOUT_S: ${AGENT_TIMEOUT_S}
+      AGENT_ENABLED: ${AGENT_ENABLED}
+    secrets: [agent_database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/gapfarm:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+    networks: [internal]
+
+  scheduler:                                              # reminders (LINE/push/Discord/mail), escalations, sensor faults, weather refresh, advisories, gaps, exports, retention, PDPA jobs
+    <<: *hardened
+    image: ${GF_REGISTRY}/scheduler:${GF_VERSION}
+    environment:
+      <<: *app-env
+      URL_SIGNING_KEY_FILE: /run/secrets/url_signing_key
+      LINE_CHANNEL_TOKEN_FILE: /run/secrets/line_channel_token
+      DISCORD_WEBHOOK_FILE: /run/secrets/discord_webhook
+      FCM_SERVER_KEY_FILE: /run/secrets/fcm_server_key
+      VAPID_PRIVATE_FILE: /run/secrets/vapid_private
+      SMTP_URL_FILE: /run/secrets/smtp_url
+      MAIL_FROM: ${MAIL_FROM}
+      WEATHER_PROVIDER: ${WEATHER_PROVIDER}
+      WEATHER_API_KEY_FILE: /run/secrets/weather_api_key
+      WEATHER_REFRESH_MINUTES: ${WEATHER_REFRESH_MINUTES}
+      FAULT_SCAN_INTERVAL_S: ${FAULT_SCAN_INTERVAL_S}
+      RETENTION_CRON: ${RETENTION_CRON}
+      PARTITION_CRON: ${PARTITION_CRON}
+      GAP_SCAN_CRON: ${GAP_SCAN_CRON}
+      WEEKLY_SUMMARY_CRON: ${WEEKLY_SUMMARY_CRON}
+    secrets: [database_url, s3_access_key, s3_secret_key, url_signing_key, line_channel_token, discord_webhook, fcm_server_key, vapid_private, smtp_url, weather_api_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/gapfarm:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+    networks: [internal, egress]
+
+  # ------------------------------------------------------------------ sensors (IF-12.1)
+  mosquitto:
+    image: eclipse-mosquitto:${MOSQUITTO_VERSION}
+    profiles: [mqtt]
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ${SECRETS_DIR}/mqtt_passwd:/mosquitto/config/passwd:ro
+      - ${SECRETS_DIR}/mqtt_acl:/mosquitto/config/acl:ro
+      - ${SECRETS_DIR}/mqtt_certs:/mosquitto/certs:ro
+      - mqttdata:/mosquitto/data
+    ports: ["${MQTT_BIND_ADDR}:8883:8883"]                 # field devices (TLS); 1883 stays inside the sensors network
+    restart: unless-stopped
+    networks: [sensors]
+
+  ingest-mqtt:                                            # farm/+/+/+ → unit/range validation → telemetry (ingest_rw); buffers ≥ 24 h on disk
+    <<: *hardened
+    image: ${GF_REGISTRY}/ingest-mqtt:${GF_VERSION}
+    profiles: [mqtt]
+    environment:
+      TZ: ${TZ}
+      DATABASE_URL_FILE: /run/secrets/ingest_database_url
+      MQTT_URL: mqtt://mosquitto:1883
+      MQTT_CREDENTIALS_FILE: /run/secrets/mqtt_ingest
+      BUFFER_HOURS: ${BUFFER_HOURS}
+      LATE_SKEW_MINUTES: ${LATE_SKEW_MINUTES}
+      LOG_LEVEL: ${LOG_LEVEL}
+    secrets: [ingest_database_url, mqtt_ingest]
+    volumes:
+      - ingestbuffer:/var/lib/gapfarm/buffer
+    depends_on:
+      mosquitto: { condition: service_started }
+      postgres: { condition: service_healthy }
+    networks: [sensors, internal]
+
+  sensor-sim:                                             # dev only: publishes the seed's five sensors (stuck / offline / out-of-range scenarios, TEST-12 TC-041)
+    image: ${GF_REGISTRY}/sensor-sim:${GF_VERSION}
+    profiles: [dev]
+    environment:
+      MQTT_URL: mqtt://mosquitto:1883
+      MQTT_CREDENTIALS_FILE: /run/secrets/mqtt_ingest
+      FARM_CODE: bannon
+    secrets: [mqtt_ingest]
+    depends_on: [mosquitto]
+    networks: [sensors]
+
+  # ------------------------------------------------------------------ data
+  postgres:
+    build: { context: ./postgres }                        # postgis/postgis:16-3.4 + postgresql-16-pgvector (no official combined image)
+    image: ${GF_REGISTRY}/postgres-postgis-pgvector:${POSTGRES_IMAGE_TAG}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+      TZ: ${TZ}
+    command: ["postgres", "-c", "shared_buffers=${PG_SHARED_BUFFERS}", "-c", "timezone=${TZ}", "-c", "log_min_duration_statement=500"]
+    secrets: [postgres_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks: [internal]
+
+  redis:
+    image: redis:${REDIS_VERSION}
+    command: ["redis-server", "--save", "60", "1000", "--maxmemory", "${REDIS_MAXMEMORY}", "--maxmemory-policy", "allkeys-lru"]
+    volumes: [redisdata:/data]
+    restart: unless-stopped
+    networks: [internal]
+
+  minio:
+    image: minio/minio:${MINIO_VERSION}
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/s3_access_key
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/s3_secret_key
+      MINIO_BROWSER: "off"
+    secrets: [s3_access_key, s3_secret_key]
+    volumes: [objects:/data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks: [internal]
+
+  minio-init:                                             # five PRIVATE buckets; photos versioned (immutable evidence, SEC-G10); exports locked 5 y; PDPA packages expire
+    image: minio/mc:${MINIO_MC_VERSION}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://minio:9000 "$(cat /run/secrets/s3_access_key)" "$(cat /run/secrets/s3_secret_key)" &&
+        for b in ${S3_BUCKET_PHOTOS} ${S3_BUCKET_LABELS} ${S3_BUCKET_MODELS} ${S3_BUCKET_PDPA}; do mc mb -p local/$$b; mc anonymous set none local/$$b; done &&
+        mc mb -p --with-lock local/${S3_BUCKET_EXPORTS} && mc anonymous set none local/${S3_BUCKET_EXPORTS} &&
+        mc retention set --default compliance ${EXPORT_RETENTION_DAYS}d local/${S3_BUCKET_EXPORTS} &&
+        mc version enable local/${S3_BUCKET_PHOTOS} &&
+        mc ilm rule add local/${S3_BUCKET_PHOTOS} --prefix refused/ --expire-days ${REFUSED_PHOTO_EXPIRE_DAYS} &&
+        mc ilm rule add local/${S3_BUCKET_PDPA} --expire-days 7 &&
+        echo buckets ready
+    secrets: [s3_access_key, s3_secret_key]
+    depends_on:
+      minio: { condition: service_healthy }
+    networks: [internal]
+
+  # ------------------------------------------------------------------ language model (IF-09) — explain and orchestrate only; optional
+  ollama:
+    image: ollama/ollama:${OLLAMA_VERSION}
+    profiles: [gpu]
+    environment:
+      OLLAMA_KEEP_ALIVE: 30m
+      OLLAMA_NUM_PARALLEL: 2
+    volumes: [ollama:/root/.ollama]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT}
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks: [internal]
+
+  ollama-cpu:
+    image: ollama/ollama:${OLLAMA_VERSION}
+    profiles: [cpu]
+    environment:
+      OLLAMA_KEEP_ALIVE: 30m
+      OLLAMA_NUM_PARALLEL: 1
+      OLLAMA_NUM_THREADS: ${CPU_THREADS}
+    volumes: [ollama:/root/.ollama]
+    restart: unless-stopped
+    networks:
+      internal: { aliases: [ollama] }
+
+  # ------------------------------------------------------------------ dev
+  mailpit:                                                # dev only: reminder mails, export-ready mails, PDPA package links
+    image: axllent/mailpit:${MAILPIT_VERSION}
+    profiles: [dev]
+    ports: ["${BIND_ADDR}:8025:8025"]
+    networks: [internal, frontend]
+
+  weather-mock:                                           # dev only: serves the seed's forecast snapshots; can be told to fail (TEST-12 TC-045)
+    image: ${GF_REGISTRY}/weather-mock:${GF_VERSION}
+    profiles: [dev]
+    networks:
+      egress: { aliases: [weather.mock] }
+
+secrets:
+  database_url:         { file: "${SECRETS_DIR}/database_url" }          # app_rw
+  vision_database_url:  { file: "${SECRETS_DIR}/vision_database_url" }   # app_rw pool for worker-vision (diagnosis writes)
+  agent_database_url:   { file: "${SECRETS_DIR}/agent_database_url" }    # agent_ro (+ answer/advisory/forecast inserts)
+  ingest_database_url:  { file: "${SECRETS_DIR}/ingest_database_url" }   # ingest_rw
+  postgres_password:    { file: "${SECRETS_DIR}/postgres_password" }
+  jwt_secret:           { file: "${SECRETS_DIR}/jwt_secret" }
+  url_signing_key:      { file: "${SECRETS_DIR}/url_signing_key" }
+  s3_access_key:        { file: "${SECRETS_DIR}/s3_access_key" }
+  s3_secret_key:        { file: "${SECRETS_DIR}/s3_secret_key" }
+  line_channel_token:   { file: "${SECRETS_DIR}/line_channel_token" }
+  line_channel_secret:  { file: "${SECRETS_DIR}/line_channel_secret" }
+  discord_webhook:      { file: "${SECRETS_DIR}/discord_webhook" }
+  fcm_server_key:       { file: "${SECRETS_DIR}/fcm_server_key" }
+  vapid_private:        { file: "${SECRETS_DIR}/vapid_private" }
+  smtp_url:             { file: "${SECRETS_DIR}/smtp_url" }
+  weather_api_key:      { file: "${SECRETS_DIR}/weather_api_key" }
+  mqtt_ingest:          { file: "${SECRETS_DIR}/mqtt_ingest" }           # ingest's broker credential; device credentials live in mqtt_passwd / mqtt_acl (mounted, not compose secrets)
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  objects: {}
+  models: {}                                              # server + device model artefacts pulled at install (OPS-12 §4.3); read-only in workers
+  ollama: {}
+  mqttdata: {}
+  ingestbuffer: {}                                        # ≥ 24 h of readings while the database is unavailable (NFR-07)
+
+networks:
+  frontend: {}
+  sensors: {}                                             # broker ↔ ingest (+ sim) only; not internal because 8883 must be published for field devices (the broker is the only member with a port)
+  internal: { internal: true }                            # no route out: db, redis, minio, workers, ollama
+  egress: {}                                              # weather provider, LINE, Discord, push, SMTP — api and scheduler only

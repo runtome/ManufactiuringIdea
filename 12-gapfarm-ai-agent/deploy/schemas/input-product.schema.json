@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gapfarm.local/schemas/input-product.schema.json",
+  "title": "GAPFarm approved-input list (IF-65)",
+  "description": "Import format for farm.input_product. The list is the ONLY source of product names the system may show or the agent may say (SRS-12 C-02, FR-28, AI-07). Every approved entry needs the registered label and a second-person approval; PHI/REI/rainfast/MRL come from the label, never from a model.",
+  "type": "object",
+  "required": [
+    "version",
+    "source",
+    "products"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]{4}\\.[0-9]+$"
+    },
+    "source": {
+      "type": "string",
+      "minLength": 3,
+      "description": "who maintains this list and from which regulatory reference"
+    },
+    "products": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/product"
+      }
+    }
+  },
+  "$defs": {
+    "product": {
+      "type": "object",
+      "required": [
+        "code",
+        "name",
+        "active_ingredient",
+        "type",
+        "phi_days",
+        "rei_hours",
+        "approved",
+        "author"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^P-[A-Z0-9]{2,12}$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 2
+        },
+        "name_th": {
+          "type": "string"
+        },
+        "active_ingredient": {
+          "type": "string",
+          "minLength": 2
+        },
+        "type": {
+          "enum": [
+            "fungicide",
+            "insecticide",
+            "herbicide",
+            "fertilizer",
+            "biocontrol",
+            "other"
+          ]
+        },
+        "phi_days": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 120
+        },
+        "rei_hours": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 168
+        },
+        "rainfast_hours": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 72
+        },
+        "approved": {
+          "type": "boolean"
+        },
+        "author": {
+          "type": "string"
+        },
+        "approved_by": {
+          "type": "string"
+        },
+        "approved_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "unapproved_reason": {
+          "type": "string",
+          "minLength": 5
+        },
+        "label_uri": {
+          "type": "string",
+          "pattern": "^(s3|https)://"
+        },
+        "mrl": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "mg_per_kg",
+              "source"
+            ],
+            "properties": {
+              "mg_per_kg": {
+                "type": "number",
+                "minimum": 0
+              },
+              "source": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "crops": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "target_conditions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z_]+$"
+          }
+        },
+        "cautions_th": {
+          "type": "string"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "approved": {
+                "const": true
+              }
+            },
+            "required": [
+              "approved"
+            ]
+          },
+          "then": {
+            "required": [
+              "label_uri",
+              "approved_by",
+              "approved_at",
+              "crops"
+            ],
+            "properties": {
+              "crops": {
+                "minItems": 1
+              }
+            }
+          },
+          "else": {
+            "required": [
+              "unapproved_reason"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "enum": [
+                  "fungicide",
+                  "insecticide",
+                  "herbicide"
+                ]
+              },
+              "approved": {
+                "const": true
+              }
+            },
+            "required": [
+              "type",
+              "approved"
+            ]
+          },
+          "then": {
+            "required": [
+              "rainfast_hours",
+              "mrl",
+              "cautions_th"
+            ]
+          }
+        }
+      ],
+      "$comment": "Loader rule L-1 (not expressible in JSON Schema): approved_by must differ from author (self-approval refused; DDS-12 DD-G03)."
+    }
+  }
+}

@@ -1,0 +1,102 @@
+# GAPFarm approved-input list — example (IF-65, deploy/schemas/input-product.schema.json)
+# PHI / REI / rainfast / MRL values are EXAMPLES. Before import, verify every value against the registered label
+# and the current MRL list; the loader refuses an approved entry whose author is also its approver (loader rule L-1).
+version: "2026.1"
+source: "Farm admin, from DOA registration labels and the Ministry of Public Health MRL notification (example references)"
+products:
+  - code: P-MANCO
+    name: Mancozeb 80% WP
+    name_th: แมนโคเซบ 80% WP
+    active_ingredient: mancozeb
+    type: fungicide
+    phi_days: 7
+    rei_hours: 24
+    rainfast_hours: 6
+    approved: true
+    author: admin
+    approved_by: admin2
+    approved_at: "2026-05-20T09:00:00+07:00"
+    label_uri: s3://labels/P-MANCO-2026.pdf
+    mrl:
+      chili: { mg_per_kg: 2.0, source: "example — verify against the current MRL list" }
+    crops: [chili]
+    target_conditions: [cercospora_leaf_spot, anthracnose]
+    cautions_th: "สวมถุงมือ หน้ากาก แว่นตา; ห้ามพ่นขณะลมแรง; งดเก็บเกี่ยว 7 วัน"
+  - code: P-AZOXY
+    name: Azoxystrobin 25% SC
+    name_th: อะซอกซีสโตรบิน 25% SC
+    active_ingredient: azoxystrobin
+    type: fungicide
+    phi_days: 3
+    rei_hours: 4
+    rainfast_hours: 2
+    approved: true
+    author: admin
+    approved_by: admin2
+    approved_at: "2026-05-20T09:05:00+07:00"
+    label_uri: s3://labels/P-AZOXY-2026.pdf
+    mrl:
+      chili: { mg_per_kg: 3.0, source: example }
+    crops: [chili]
+    target_conditions: [anthracnose, cercospora_leaf_spot]
+    cautions_th: "สลับกลุ่มสารเพื่อลดการดื้อยา; งดเก็บเกี่ยว 3 วัน"
+  - code: P-COPPER
+    name: Copper hydroxide 77% WP
+    name_th: คอปเปอร์ไฮดรอกไซด์ 77% WP
+    active_ingredient: copper hydroxide
+    type: fungicide
+    phi_days: 3
+    rei_hours: 24
+    rainfast_hours: 4
+    approved: true
+    author: admin
+    approved_by: admin2
+    approved_at: "2026-05-20T09:10:00+07:00"
+    label_uri: s3://labels/P-COPPER-2026.pdf
+    mrl:
+      chili: { mg_per_kg: 5.0, source: example }
+    crops: [chili]
+    target_conditions: [cercospora_leaf_spot, bacterial_wilt]
+    cautions_th: "ห้ามผสมสารที่มีฤทธิ์เป็นกรด; งดเก็บเกี่ยว 3 วัน"
+  - code: P-MGSO4
+    name: Magnesium sulphate
+    name_th: แมกนีเซียมซัลเฟต
+    active_ingredient: magnesium sulphate
+    type: fertilizer
+    phi_days: 0
+    rei_hours: 0
+    rainfast_hours: 1
+    approved: true
+    author: admin
+    approved_by: admin2
+    approved_at: "2026-05-20T09:15:00+07:00"
+    label_uri: s3://labels/P-MGSO4-2026.pdf
+    crops: [chili]
+    target_conditions: [mg_deficiency]
+    cautions_th: "พ่นทางใบช่วงเช้าหรือเย็น"
+  - code: P-BTK
+    name: Bacillus thuringiensis
+    name_th: บีที
+    active_ingredient: Bacillus thuringiensis kurstaki
+    type: biocontrol
+    phi_days: 0
+    rei_hours: 4
+    rainfast_hours: 2
+    approved: true
+    author: admin
+    approved_by: admin2
+    approved_at: "2026-05-20T09:20:00+07:00"
+    label_uri: s3://labels/P-BTK-2026.pdf
+    crops: [chili]
+    target_conditions: [fruit_borer]
+    cautions_th: "พ่นช่วงเย็น หลีกเลี่ยงแสงแดดจัด"
+  - code: P-PARAQ
+    name: Paraquat dichloride 27.6% SL
+    name_th: พาราควอต
+    active_ingredient: paraquat
+    type: herbicide
+    phi_days: 0
+    rei_hours: 24
+    approved: false
+    author: admin
+    unapproved_reason: "banned in Thailand (Hazardous Substances Committee, effective 2020-06-01)"

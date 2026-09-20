@@ -1,0 +1,95 @@
+{
+  "name": "chili",
+  "version": "v3",
+  "kind": "server",
+  "crop_family": "chili",
+  "size_mb": 182.4,
+  "format": "onnx",
+  "sha256": "3b7c2f1e9a8d4c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b",
+  "heads": [
+    "crop",
+    "part",
+    "condition"
+  ],
+  "classes": [
+    "cercospora_leaf_spot",
+    "anthracnose",
+    "mg_deficiency",
+    "bacterial_wilt",
+    "thrips",
+    "fruit_borer",
+    "healthy"
+  ],
+  "input": {
+    "size_px": 320,
+    "normalisation": "imagenet"
+  },
+  "evaluations": [
+    {
+      "set_kind": "field",
+      "set_name": "field-chili-2026Q2 (real phone photos, mixed lighting)",
+      "n_images": 640,
+      "top1": 0.83,
+      "top3": 0.94,
+      "ece": 0.031,
+      "run_at": "2026-08-20T10:00:00+07:00"
+    },
+    {
+      "set_kind": "lab",
+      "set_name": "PlantVillage-pepper",
+      "n_images": 2000,
+      "top1": 0.96,
+      "top3": 0.99,
+      "ece": 0.02,
+      "run_at": "2026-08-19T10:00:00+07:00"
+    }
+  ],
+  "calibration": {
+    "version": "chili-v3-cal1",
+    "temperature": 1.42,
+    "ece": 0.031,
+    "reliability_bins": [
+      {
+        "lo": 0.5,
+        "hi": 0.6,
+        "confidence": 0.55,
+        "accuracy": 0.52,
+        "n": 61
+      },
+      {
+        "lo": 0.6,
+        "hi": 0.7,
+        "confidence": 0.65,
+        "accuracy": 0.64,
+        "n": 88
+      },
+      {
+        "lo": 0.7,
+        "hi": 0.8,
+        "confidence": 0.75,
+        "accuracy": 0.73,
+        "n": 140
+      },
+      {
+        "lo": 0.8,
+        "hi": 0.9,
+        "confidence": 0.85,
+        "accuracy": 0.83,
+        "n": 201
+      },
+      {
+        "lo": 0.9,
+        "hi": 1.0,
+        "confidence": 0.94,
+        "accuracy": 0.92,
+        "n": 150
+      }
+    ]
+  },
+  "ood": {
+    "method": "energy",
+    "threshold": 6.5,
+    "auroc_field": 0.962
+  },
+  "released": true
+}

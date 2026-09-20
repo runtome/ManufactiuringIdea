@@ -1,0 +1,79 @@
+{
+  "name": "chili",
+  "version": "v3-lite",
+  "kind": "device",
+  "crop_family": "chili",
+  "size_mb": 21.5,
+  "format": "tflite",
+  "sha256": "9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b",
+  "heads": [
+    "crop",
+    "part",
+    "condition"
+  ],
+  "classes": [
+    "cercospora_leaf_spot",
+    "anthracnose",
+    "mg_deficiency",
+    "bacterial_wilt",
+    "thrips",
+    "fruit_borer",
+    "healthy"
+  ],
+  "input": {
+    "size_px": 256,
+    "normalisation": "imagenet"
+  },
+  "evaluations": [
+    {
+      "set_kind": "field",
+      "set_name": "field-chili-2026Q2",
+      "n_images": 640,
+      "top1": 0.81,
+      "top3": 0.931,
+      "ece": 0.038,
+      "run_at": "2026-08-20T11:00:00+07:00"
+    }
+  ],
+  "calibration": {
+    "version": "chili-v3-lite-cal1",
+    "temperature": 1.55,
+    "ece": 0.038,
+    "reliability_bins": [
+      {
+        "lo": 0.6,
+        "hi": 0.7,
+        "confidence": 0.65,
+        "accuracy": 0.62,
+        "n": 90
+      },
+      {
+        "lo": 0.7,
+        "hi": 0.8,
+        "confidence": 0.75,
+        "accuracy": 0.72,
+        "n": 150
+      },
+      {
+        "lo": 0.8,
+        "hi": 0.9,
+        "confidence": 0.85,
+        "accuracy": 0.81,
+        "n": 210
+      },
+      {
+        "lo": 0.9,
+        "hi": 1.0,
+        "confidence": 0.94,
+        "accuracy": 0.9,
+        "n": 150
+      }
+    ]
+  },
+  "ood": {
+    "method": "energy",
+    "threshold": 6.9,
+    "auroc_field": 0.951
+  },
+  "released": true
+}

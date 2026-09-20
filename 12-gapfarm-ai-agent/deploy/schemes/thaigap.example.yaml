@@ -1,0 +1,29 @@
+# GAPFarm — GAP scheme definition (deploy/schemas/gap-scheme.schema.json). ThaiGAP example; another scheme (e.g. GLOBALG.A.P.) is another file.
+# Templates fix the field order in the audit package (IF-66); rules define mandatory records and the maximum gap between records (FR-15).
+# The rule set is an EXAMPLE distilled for the pilot — map it to the scheme's current checklist before an audit (OPS-12 §5).
+code: thaigap
+name: "ThaiGAP (มกษ. 9001)"
+version: "2026.1"
+record_templates:
+  scouting:     [record_no, observed_at, zone, condition, severity, area_pct, plants_affected, plants_inspected, evidence, author]
+  input_usage:  [record_no, ts, zone, product, active_ingredient, dose, unit, method, applicator, weather, ppe, phi_days, phi_clear_at]
+  harvest:      [record_no, harvested_at, zone, lot_code, qty, unit, grade, phi_clear_at, inputs, scouting]
+rules:
+  - rule_code: scouting_interval
+    record_kind: scouting
+    max_gap_days: 7
+    mandatory: true
+    description_th: "ต้องมีบันทึกการสำรวจแปลงอย่างน้อยทุก 7 วัน"
+    description_en: "A scouting record at least every 7 days"
+  - rule_code: input_usage_complete
+    record_kind: input_usage
+    max_gap_days: null
+    mandatory: true
+    description_th: "บันทึกการใช้ปัจจัยการผลิตต้องครบ: ผลิตภัณฑ์ อัตรา วิธี ผู้พ่น สภาพอากาศ PPE"
+    description_en: "Input-usage records complete: product, dose, method, applicator, weather, PPE"
+  - rule_code: harvest_traceability
+    record_kind: harvest
+    max_gap_days: null
+    mandatory: true
+    description_th: "ทุกล็อตเก็บเกี่ยวต้องสืบย้อนถึงแปลงและปัจจัยการผลิตได้"
+    description_en: "Every harvest lot traceable to zone and inputs"
