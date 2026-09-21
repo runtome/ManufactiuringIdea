@@ -1,0 +1,99 @@
+# KaizenSwarm agent registry (IF-68 · SRS-13 FR-01 / FR-06) — equal to the seed's swarm.agent_registry rows.
+# Adding an agent = one entry here + a module implementing IF-68. The Manager iterates enabled specialists and names none.
+version: 1
+agents:
+  - name: quality
+    kind: specialist
+    display_name: Quality Agent
+    version: 1.2.0
+    description: SPC violations, defect-rate signals with significance, top defect classes, affected SKUs, open cases (FR-08) via QE-Agent tools
+    module: kaizenswarm.agents.quality
+    domains: [quality]
+    tools:
+      - { name: get_signals, kind: read, provider: qe_agent, timeout_ms: 10000 }
+      - { name: get_spc, kind: read, provider: qe_agent, timeout_ms: 10000 }
+      - { name: query_defects, kind: read, provider: shiftbrief, timeout_ms: 10000 }
+      - { name: get_case, kind: read, provider: qe_agent, timeout_ms: 10000 }
+      - { name: get_lot_quality_history, kind: read, provider: erp_adapter, timeout_ms: 10000 }
+    output_schema: finding.v1
+    budget: { tool_calls: 12, tokens: 6000, wall_ms: 60000 }
+    schedule_cron: "0 6,14 * * *"
+    prompt_version: specialist.v1
+    enabled: true
+  - name: maintenance
+    kind: specialist
+    display_name: Maintenance Agent
+    version: 1.1.0
+    description: Degrading health index, open alerts with severity and lead time, overdue PM (FR-09) via MachineSense tools
+    module: kaizenswarm.agents.maintenance
+    domains: [machine_health]
+    tools:
+      - { name: get_machine_health, kind: read, provider: machinesense, timeout_ms: 10000 }
+      - { name: get_alert_evidence, kind: read, provider: machinesense, timeout_ms: 10000 }
+      - { name: get_trend, kind: read, provider: machinesense, timeout_ms: 10000 }
+      - { name: get_machine_telemetry, kind: read, provider: platform, timeout_ms: 10000 }
+      - { name: get_pm_overdue, kind: read, provider: machinesense, timeout_ms: 10000 }
+    output_schema: finding.v1
+    budget: { tool_calls: 12, tokens: 6000, wall_ms: 60000 }
+    schedule_cron: "0 6,14 * * *"
+    prompt_version: specialist.v1
+    enabled: true
+  - name: production
+    kind: specialist
+    display_name: Production Agent
+    version: 1.1.0
+    description: Plan vs actual, OEE components, downtime Pareto, schedule risk (FR-10) via ShiftBrief tools
+    module: kaizenswarm.agents.production
+    domains: [production]
+    tools:
+      - { name: query_production, kind: read, provider: shiftbrief, timeout_ms: 10000 }
+      - { name: get_oee, kind: read, provider: shiftbrief, timeout_ms: 10000 }
+      - { name: get_downtime_pareto, kind: read, provider: shiftbrief, timeout_ms: 10000 }
+      - { name: get_schedule_risk, kind: read, provider: shiftbrief, timeout_ms: 10000 }
+    output_schema: finding.v1
+    budget: { tool_calls: 12, tokens: 6000, wall_ms: 60000 }
+    schedule_cron: "0 6,14 * * *"
+    prompt_version: specialist.v1
+    enabled: true
+  - name: material
+    kind: specialist
+    display_name: Material Agent
+    version: 1.0.0
+    description: Stock coverage, inbound delivery risk, lots with quality history, shortage risk (FR-11) via the IF-07 ERP read adapter
+    module: kaizenswarm.agents.material
+    domains: [material]
+    tools:
+      - { name: get_stock_coverage, kind: read, provider: erp_adapter, timeout_ms: 15000 }
+      - { name: get_inbound_deliveries, kind: read, provider: erp_adapter, timeout_ms: 15000 }
+      - { name: get_lot_quality_history, kind: read, provider: erp_adapter, timeout_ms: 10000 }
+      - { name: get_shortage_risk, kind: read, provider: erp_adapter, timeout_ms: 15000 }
+    output_schema: finding.v1
+    budget: { tool_calls: 12, tokens: 6000, wall_ms: 60000 }
+    schedule_cron: "0 6,14 * * *"
+    prompt_version: specialist.v1
+    enabled: true
+  - name: manager
+    kind: manager
+    display_name: Manager Agent
+    version: 1.2.0
+    description: Requests, deduplicates, relates, ranks, phrases (FR-15…FR-22); never a source of findings
+    module: kaizenswarm.manager
+    output_schema: briefing.v1
+    budget: { tool_calls: 1, tokens: 4000, wall_ms: 40000 }
+    schedule_cron: null
+    prompt_version: manager_explain.v1
+    enabled: true
+  - name: logistics
+    kind: specialist
+    display_name: Logistics Agent
+    version: 0.1.0
+    description: Configuration-only placeholder (FR-06 / NFR-04) — a fifth specialist added without Manager changes; disabled until its module ships
+    module: kaizenswarm.agents.logistics
+    domains: [logistics]
+    tools:
+      - { name: get_shortage_risk, kind: read, provider: erp_adapter, timeout_ms: 15000 }
+    output_schema: finding.v1
+    budget: { tool_calls: 8, tokens: 4000, wall_ms: 45000 }
+    schedule_cron: "0 6 * * *"
+    prompt_version: specialist.v1
+    enabled: false

@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.plant.local/schemas/kaizenswarm/agent-registry.v1.json",
+  "title": "KaizenSwarm agent registry (IF-68 · SRS-13 FR-01 / FR-06)",
+  "description": "The file form of swarm.agent_registry + agent_domain + agent_tool. Loaded by the admin API (POST /agents/import) or at bootstrap. A new agent is a new entry plus a module implementing the IF-68 contract — the Manager's code does not change (FR-06). Exactly one manager entry, enabled; every specialist tool must be a read tool (C-03).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "agents"],
+  "properties": {
+    "version": { "type": "integer", "const": 1 },
+    "agents": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "$ref": "#/$defs/agent" },
+      "allOf": [
+        { "contains": { "properties": { "name": { "const": "manager" }, "kind": { "const": "manager" }, "enabled": { "const": true } }, "required": ["name", "kind", "enabled"] }, "minContains": 1, "maxContains": 1 }
+      ]
+    }
+  },
+  "$defs": {
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind", "display_name", "version", "module", "output_schema", "budget", "enabled"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+        "kind": { "type": "string", "enum": ["specialist", "manager"] },
+        "display_name": { "type": "string", "minLength": 3, "maxLength": 60 },
+        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "description": { "type": "string", "maxLength": 400 },
+        "module": { "type": "string", "pattern": "^[a-z_][a-z0-9_]*(\\.[a-z_][a-z0-9_]*)+$", "description": "Python module implementing IF-68 (assess(scope, tools, budget) -> Finding[] | nothing_significant)" },
+        "domains": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,63}$" } },
+        "tools": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "required": ["name", "kind"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]{2,63}$" },
+              "kind": { "type": "string", "const": "read", "description": "C-03: write tools cannot be bound (swarm.trg_tool_read_only)" },
+              "provider": { "type": "string", "enum": ["qe_agent", "machinesense", "shiftbrief", "erp_adapter", "platform", "stub"] },
+              "timeout_ms": { "type": "integer", "minimum": 500, "maximum": 30000 }
+            }
+          }
+        },
+        "output_schema": { "type": "string", "enum": ["finding.v1", "briefing.v1"] },
+        "budget": {
+          "type": "object",
+          "required": ["tool_calls", "tokens", "wall_ms"],
+          "additionalProperties": false,
+          "properties": {
+            "tool_calls": { "type": "integer", "minimum": 1, "maximum": 50 },
+            "tokens": { "type": "integer", "minimum": 200, "maximum": 20000 },
+            "wall_ms": { "type": "integer", "minimum": 5000, "maximum": 180000, "description": "≤ run wall (NFR-01 180 s); default 60000 (NFR-02)" }
+          }
+        },
+        "schedule_cron": { "type": ["string", "null"], "pattern": "^([0-9*,/-]+\\s+){4}[0-9*,/-]+$" },
+        "prompt_version": { "type": "string", "pattern": "^[a-z_]+\\.v[0-9]+$" },
+        "enabled": { "type": "boolean" }
+      },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "specialist" } }, "required": ["kind"] }, "then": { "required": ["domains", "tools", "schedule_cron"], "properties": { "output_schema": { "const": "finding.v1" } } } },
+        { "if": { "properties": { "kind": { "const": "manager" } }, "required": ["kind"] }, "then": { "properties": { "name": { "const": "manager" }, "output_schema": { "const": "briefing.v1" } } } }
+      ]
+    }
+  }
+}

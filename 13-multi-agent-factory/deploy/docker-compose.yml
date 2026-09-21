@@ -1,0 +1,274 @@
+# KaizenSwarm — docker-compose.yml (standalone; OPS-13 §1–§4). Platform mode reuses the platform's postgres, nats, redis, ollama and notifier (SAD-13 §9).
+# Profiles:  gpu (ollama on CUDA) | cpu (ollama-cpu — the baseline is one 8 GB GPU, C-05) | discord (discord-bot) | dev (mailpit, sibling-stub)
+#   docker compose --profile gpu --profile discord up -d              plant
+#   docker compose --profile cpu --profile dev up -d                  integration tests (TEST-13 TS-1…TS-11)
+# Networks:  frontend (reverse proxy → web/api) · internal (no route out: postgres, nats, redis, ollama, orchestrator, agent-runner, scheduler)
+#            · sources (agent-runner → sibling APIs / ERP adapter, read-only credentials — the only path to production data, C-03)
+#            · egress (discord-bot only — the only internet-facing service, SEC-13 O-6)
+# Secrets are FILES under ${SECRETS_DIR} (OPS-13 §4) — never in this file or in .env (TEST-13 TC-004).
+
+x-hardened: &hardened
+  user: "10001:10001"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp]
+  restart: unless-stopped
+  logging: { driver: json-file, options: { max-size: "20m", max-file: "5" } }
+
+x-app-env: &app-env
+  TZ: ${TZ}
+  NATS_URL: nats://nats:4222
+  REDIS_URL: redis://redis:6379/0
+  CONFIG_DIR: /etc/kaizenswarm
+  LOG_LEVEL: ${LOG_LEVEL}
+  METRICS_ENABLED: "true"
+
+services:
+  # ------------------------------------------------------------------ front
+  web:                                                    # Next.js dashboard: briefing, blackboard, run trace, agent health, admin (FR-28, FR-30)
+    <<: *hardened
+    image: ${KS_REGISTRY}/web:${KS_VERSION}
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL}
+      API_URL: http://api:8080
+      DEFAULT_LOCALE: ${DEFAULT_LOCALE}
+    ports: ["${BIND_ADDR}:${WEB_PORT}:3000"]
+    depends_on: [api]
+    networks: [frontend]
+
+  api:                                                    # API-13; role app_rw; publishes orchestrator.run.* to trigger runs; never a tool caller
+    <<: *hardened
+    image: ${KS_REGISTRY}/api:${KS_VERSION}
+    environment:
+      <<: *app-env
+      PUBLIC_URL: ${PUBLIC_URL}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      NATS_CREDS_FILE: /run/secrets/nats_api_creds
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+      S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+      S3_BUCKET_EXPORTS: ${S3_BUCKET_EXPORTS}
+      RATE_LIMIT_RUNS_PER_HOUR: ${RATE_LIMIT_RUNS_PER_HOUR}
+    secrets: [database_url, jwt_secret, nats_api_creds, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/kaizenswarm:ro                 # kaizenswarm.yaml, agents.yaml, schemas/, scenarios/, prompts/
+    ports: ["${BIND_ADDR}:${API_PORT}:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      nats: { condition: service_healthy }
+      redis: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/v1/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    networks: [frontend, internal]
+
+  # ------------------------------------------------------------------ the swarm
+  orchestrator:                                           # runs, budgets, timeouts, circuit, GPU lease, blackboard writer, relator, ranker, briefer, deliverer (SAD-13 §4.3)
+    <<: *hardened
+    image: ${KS_REGISTRY}/orchestrator:${KS_VERSION}
+    environment:
+      <<: *app-env
+      DATABASE_URL_FILE: /run/secrets/orchestrator_database_url     # orchestrator_rw — the one writer (ADR-K08)
+      NATS_CREDS_FILE: /run/secrets/nats_orchestrator_creds
+      OLLAMA_URL: http://ollama:11434
+      LEASE_TOKEN_FILE: /run/secrets/lease_token                    # header checked by the ollama gateway (SEC-K16)
+      RUN_WALL_S: ${RUN_WALL_S}
+      AGENT_TIMEOUT_S: ${AGENT_TIMEOUT_S}
+      REPLICAS_HINT: ${ORCHESTRATOR_REPLICAS}
+    secrets: [orchestrator_database_url, nats_orchestrator_creds, lease_token]
+    volumes:
+      - ${CONFIG_DIR}:/etc/kaizenswarm:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      nats: { condition: service_healthy }
+      redis: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9100/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    networks: [internal]
+
+  agent-runner:                                           # hosts the specialist modules (IF-68): tools in parallel on `sources`, phrasing through the lease; NO database, NO egress (ADR-K08)
+    <<: *hardened
+    image: ${KS_REGISTRY}/agent-runner:${KS_VERSION}
+    environment:
+      <<: *app-env
+      NATS_CREDS_DIR: /run/secrets                                   # one credential file per agent: nats_agent_quality, …
+      OLLAMA_URL: http://ollama:11434
+      LEASE_TOKEN_FILE: /run/secrets/lease_token
+      QE_AGENT_TOKEN_FILE: /run/secrets/qe_agent_token               # read-only (NFR-06, SEC-K09)
+      MACHINESENSE_TOKEN_FILE: /run/secrets/machinesense_token
+      SHIFTBRIEF_TOKEN_FILE: /run/secrets/shiftbrief_token
+      ERP_ADAPTER_TOKEN_FILE: /run/secrets/erp_adapter_token
+      PLATFORM_TOKEN_FILE: /run/secrets/platform_token
+      TOOL_TIMEOUT_MS: ${TOOL_TIMEOUT_MS}
+      AGENT_MODULES_PACKAGE: kaizenswarm.agents                      # the only loadable package (SEC-K13)
+    secrets: [nats_agent_quality, nats_agent_maintenance, nats_agent_production, nats_agent_material, nats_agent_logistics, lease_token,
+              qe_agent_token, machinesense_token, shiftbrief_token, erp_adapter_token, platform_token]
+    volumes:
+      - ${CONFIG_DIR}:/etc/kaizenswarm:ro
+    depends_on:
+      nats: { condition: service_healthy }
+      redis: { condition: service_started }
+    deploy:
+      replicas: ${RUNNER_REPLICAS}
+    networks: [internal, sources]
+
+  scheduler:                                              # cron: shift-start runs (FR-03), expiry (FR-27), metric rollup, retention, suite runs
+    <<: *hardened
+    image: ${KS_REGISTRY}/scheduler:${KS_VERSION}
+    environment:
+      <<: *app-env
+      API_URL: http://api:8080
+      SCHEDULER_TOKEN_FILE: /run/secrets/scheduler_token
+      SHIFT_START_CRON: ${SHIFT_START_CRON}
+      RETENTION_DAYS: ${RETENTION_DAYS}
+    secrets: [scheduler_token]
+    depends_on: [api]
+    networks: [internal]
+
+  # ------------------------------------------------------------------ infrastructure
+  nats:                                                   # IF-17 JetStream; accounts per agent from nats.conf (OPS-13 §5)
+    image: nats:${NATS_VERSION}
+    command: ["-c", "/etc/nats/nats.conf", "--jetstream", "--store_dir", "/data"]
+    volumes:
+      - ${CONFIG_DIR}/nats/nats.conf:/etc/nats/nats.conf:ro
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks: [internal]
+
+  postgres:                                               # PostgreSQL 16 (+ pgvector for platform compatibility); schema.sql at first start
+    image: pgvector/pgvector:${POSTGRES_IMAGE_TAG}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      TZ: ${TZ}
+    secrets: [postgres_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks: [internal]
+
+  redis:                                                  # GPU lease (SET NX PX), tool-result cache per run
+    image: redis:${REDIS_VERSION}
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    restart: unless-stopped
+    networks: [internal]
+
+  ollama:                                                 # one shared model ≤ 9 B (AI-05); reached only with the lease token (SEC-K16)
+    image: ollama/ollama:${OLLAMA_VERSION}
+    profiles: [gpu]
+    environment:
+      OLLAMA_KEEP_ALIVE: 24h
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    volumes: [ollama:/root/.ollama]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT}
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks: [internal]
+
+  ollama-cpu:
+    image: ollama/ollama:${OLLAMA_VERSION}
+    profiles: [cpu]
+    environment:
+      OLLAMA_KEEP_ALIVE: 24h
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    volumes: [ollama:/root/.ollama]
+    restart: unless-stopped
+    networks:
+      internal:
+        aliases: [ollama]
+
+  # ------------------------------------------------------------------ delivery (egress)
+  discord-bot:                                            # posts stored briefings and immediate deliveries by id (IF-08, SEC-K28); the only egress
+    <<: *hardened
+    image: ${KS_REGISTRY}/discord-bot:${KS_VERSION}
+    profiles: [discord]
+    environment:
+      TZ: ${TZ}
+      API_URL: http://api:8080
+      DISCORD_TOKEN_FILE: /run/secrets/discord_token
+      DISCORD_CHANNEL_ID_FILE: /run/secrets/discord_channel_id
+      BOT_TOKEN_FILE: /run/secrets/bot_api_token
+      LOG_LEVEL: ${LOG_LEVEL}
+    secrets: [discord_token, discord_channel_id, bot_api_token]
+    depends_on: [api]
+    networks: [internal, egress]
+
+  # ------------------------------------------------------------------ dev
+  mailpit:
+    image: axllent/mailpit:${MAILPIT_VERSION}
+    profiles: [dev]
+    ports: ["${BIND_ADDR}:8025:8025"]
+    networks: [internal]
+
+  sibling-stub:                                           # stubs QE-Agent / MachineSense / ShiftBrief / ERP adapter tools with the seed's facts (TEST-13 TC-034)
+    <<: *hardened
+    image: ${KS_REGISTRY}/sibling-stub:${KS_VERSION}
+    profiles: [dev]
+    environment:
+      TZ: ${TZ}
+      SCENARIO: appendix_a
+    networks:
+      sources:
+        aliases: [qe.plant.local, machinesense.plant.local, shiftbrief.plant.local, erp-adapter.plant.local]
+
+secrets:
+  database_url:               { file: "${SECRETS_DIR}/database_url" }               # app_rw (api)
+  orchestrator_database_url:  { file: "${SECRETS_DIR}/orchestrator_database_url" }  # orchestrator_rw
+  postgres_password:          { file: "${SECRETS_DIR}/postgres_password" }
+  jwt_secret:                 { file: "${SECRETS_DIR}/jwt_secret" }
+  nats_api_creds:             { file: "${SECRETS_DIR}/nats_api_creds" }
+  nats_orchestrator_creds:    { file: "${SECRETS_DIR}/nats_orchestrator_creds" }
+  nats_agent_quality:         { file: "${SECRETS_DIR}/nats_agent_quality" }         # one NATS account per agent (SEC-K12)
+  nats_agent_maintenance:     { file: "${SECRETS_DIR}/nats_agent_maintenance" }
+  nats_agent_production:      { file: "${SECRETS_DIR}/nats_agent_production" }
+  nats_agent_material:        { file: "${SECRETS_DIR}/nats_agent_material" }
+  nats_agent_logistics:       { file: "${SECRETS_DIR}/nats_agent_logistics" }
+  lease_token:                { file: "${SECRETS_DIR}/lease_token" }
+  qe_agent_token:             { file: "${SECRETS_DIR}/qe_agent_token" }             # read-only sibling credentials (NFR-06)
+  machinesense_token:         { file: "${SECRETS_DIR}/machinesense_token" }
+  shiftbrief_token:           { file: "${SECRETS_DIR}/shiftbrief_token" }
+  erp_adapter_token:          { file: "${SECRETS_DIR}/erp_adapter_token" }
+  platform_token:             { file: "${SECRETS_DIR}/platform_token" }
+  scheduler_token:            { file: "${SECRETS_DIR}/scheduler_token" }
+  s3_access_key:              { file: "${SECRETS_DIR}/s3_access_key" }
+  s3_secret_key:              { file: "${SECRETS_DIR}/s3_secret_key" }
+  discord_token:              { file: "${SECRETS_DIR}/discord_token" }
+  discord_channel_id:         { file: "${SECRETS_DIR}/discord_channel_id" }
+  bot_api_token:              { file: "${SECRETS_DIR}/bot_api_token" }
+
+volumes:
+  pgdata: {}
+  natsdata: {}                                            # JetStream store: requests 24 h, findings/status/run 7 d (IF-17)
+  ollama: {}
+
+networks:
+  frontend: {}
+  internal: { internal: true }                            # no route out: postgres, nats, redis, ollama, orchestrator, runner, scheduler
+  sources: {}                                             # agent-runner → sibling APIs / ERP adapter only (read-only credentials)
+  egress: {}                                              # discord-bot only

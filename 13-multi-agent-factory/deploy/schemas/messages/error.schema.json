@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.plant.local/schemas/kaizenswarm/messages/error.v1.json",
+  "title": "Error (IF-17 message)",
+  "description": "Specialist → orchestrator, on agent.status.{agent}, after the last permitted attempt (AI-02: one retry on malformed output). The orchestrator records the assessment as invalid_output / failed; the briefing becomes partial (C-06).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["code", "detail", "attempt"],
+  "properties": {
+    "code": { "type": "string", "enum": ["invalid_output", "transport_error", "timeout", "tool_error", "internal"] },
+    "detail": { "type": "string", "minLength": 3, "maxLength": 1000 },
+    "attempt": { "type": "integer", "minimum": 1, "maximum": 2 },
+    "tool": { "type": "string", "description": "For tool_error: the tool that failed" }
+  }
+}

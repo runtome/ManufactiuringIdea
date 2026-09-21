@@ -1,0 +1,744 @@
+# KaizenSwarm scenario suite (IF-71) — generated from one source together with the seed; SC-15 is a deliberate engineer/table disagreement.
+suite: kaizenswarm-scenarios
+version: 1
+weights_version: v1
+gate:
+  top3_match_min: 0.8
+  fabricated_max: 0
+note: 'AI-06 / AC-01. Deterministic half (dedupe, compounds, scoring, ranking) runs in SQL via swarm.run_suite(); the LLM half (phrasing, claim check, zero fabricated) runs in CI (TEST-13 TC-070). Expected
+  top risks are identifiers: F<n> for a finding (the first id of a merged group), C:<ids joined by +> for a compound. Equal to db/seed_demo.sql (TEST-13 TC-006).'
+scenarios:
+- code: SC-01
+  title: Appendix A — quality + maintenance on line 3, material coverage, line 1 OEE
+  plant_state: Defect rate 5.82 % on line 3 with an open M-07 bearing alert; RAD-500-A coverage 1.4 d; line 1 performance loss
+  findings:
+  - id: F1
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 3
+      sku: RAD-500-A
+    title: Defect rate 5.82 % on line 3 (+141 % vs 7-day)
+    severity: HIGH
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.85
+    issue_code: quality.defect_rate
+  - id: F2
+    agent: maintenance
+    domain: machine_health
+    scope:
+      plant: 1
+      line: 3
+      machine: M-07
+    title: Bearing temperature trending up on M-07
+    severity: HIGH
+    likelihood_class: observed
+    horizon: within_3_days
+    confidence: 0.78
+    issue_code: machine.degradation
+  - id: F3
+    agent: material
+    domain: material
+    scope:
+      plant: 1
+      sku: RAD-500-A
+    title: Coverage risk for SKU RAD-500-A
+    severity: HIGH
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.89
+    issue_code: material.shortage
+  - id: F4
+    agent: production
+    domain: production
+    scope:
+      plant: 1
+      line: 1
+    title: OEE performance loss on Line 1
+    severity: MEDIUM
+    likelihood_class: observed
+    horizon: today
+    confidence: 0.96
+    issue_code: production.performance_loss
+  expected_top:
+  - C:F1+F2
+  - F3
+  - F4
+- code: SC-02
+  title: Quiet plant — two low-grade observations
+  plant_state: Nothing crosses a threshold; the briefing must still rank what little there is
+  findings:
+  - id: F1
+    agent: production
+    domain: production
+    scope:
+      plant: 1
+      line: 2
+    title: Changeover 4 min over standard on Line 2
+    severity: LOW
+    likelihood_class: possible
+    horizon: later
+    confidence: 0.5
+    issue_code: production.changeover
+  - id: F2
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 1
+    title: Minor scratch cluster on Line 1
+    severity: INFO
+    likelihood_class: observed
+    horizon: this_week
+    confidence: 0.9
+    issue_code: quality.defect_rate
+  expected_top:
+  - F2
+  - F1
+- code: SC-03
+  title: A CRITICAL machine outranks a compound
+  plant_state: M-12 imminent failure on line 2 next to the Appendix A compound
+  findings:
+  - id: F1
+    agent: maintenance
+    domain: machine_health
+    scope:
+      plant: 1
+      line: 2
+      machine: M-12
+    title: M-12 spindle vibration above alarm — imminent failure
+    severity: CRITICAL
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.9
+    issue_code: machine.failure_imminent
+  - id: F2
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 3
+      sku: RAD-500-A
+    title: Defect rate 5.82 % on line 3
+    severity: HIGH
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.85
+    issue_code: quality.defect_rate
+  - id: F3
+    agent: maintenance
+    domain: machine_health
+    scope:
+      plant: 1
+      line: 3
+      machine: M-07
+    title: Bearing temperature trending up on M-07
+    severity: HIGH
+    likelihood_class: observed
+    horizon: within_3_days
+    confidence: 0.78
+    issue_code: machine.degradation
+  - id: F4
+    agent: production
+    domain: production
+    scope:
+      plant: 1
+      line: 1
+    title: OEE performance loss on Line 1
+    severity: MEDIUM
+    likelihood_class: observed
+    horizon: today
+    confidence: 0.96
+    issue_code: production.performance_loss
+  expected_top:
+  - F1
+  - C:F2+F3
+  - F4
+- code: SC-04
+  title: Duplicate lot report from two agents
+  plant_state: Quality and Material both report the quality history of lot LOT-2609-114 — one finding, two evidence sets
+  findings:
+  - id: F1
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 3
+      sku: RAD-500-A
+      lot: LOT-2609-114
+    title: Lot LOT-2609-114 has quality history
+    severity: MEDIUM
+    likelihood_class: observed
+    horizon: this_week
+    confidence: 0.8
+    issue_code: lot.quality_history
+  - id: F2
+    agent: material
+    domain: material
+    scope:
+      plant: 1
+      sku: RAD-500-A
+      lot: LOT-2609-114
+    title: Lot LOT-2609-114 has quality history
+    severity: MEDIUM
+    likelihood_class: observed
+    horizon: this_week
+    confidence: 0.75
+    issue_code: lot.quality_history
+  - id: F3
+    agent: production
+    domain: production
+    scope:
+      plant: 1
+      line: 2
+    title: Plan vs actual −9 % on Line 2
+    severity: MEDIUM
+    likelihood_class: observed
+    horizon: today
+    confidence: 0.9
+    issue_code: production.plan_gap
+  expected_top:
+  - F3
+  - F1
+- code: SC-05
+  title: Three-way SKU compound
+  plant_state: Defect rate, shortage and lot history all on RAD-500-A; a machine issue elsewhere
+  findings:
+  - id: F1
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 3
+      sku: RAD-500-A
+    title: Defect rate 5.82 % on line 3
+    severity: HIGH
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.85
+    issue_code: quality.defect_rate
+  - id: F2
+    agent: material
+    domain: material
+    scope:
+      plant: 1
+      sku: RAD-500-A
+    title: Coverage risk for SKU RAD-500-A
+    severity: HIGH
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.89
+    issue_code: material.shortage
+  - id: F3
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 3
+      sku: RAD-500-A
+      lot: LOT-2609-114
+    title: Lot LOT-2609-114 has quality history
+    severity: MEDIUM
+    likelihood_class: observed
+    horizon: this_week
+    confidence: 0.75
+    issue_code: lot.quality_history
+  - id: F4
+    agent: maintenance
+    domain: machine_health
+    scope:
+      plant: 1
+      line: 2
+      machine: M-03
+    title: Health index declining on M-03
+    severity: HIGH
+    likelihood_class: trend
+    horizon: within_3_days
+    confidence: 0.7
+    issue_code: machine.degradation
+  expected_top:
+  - C:F2+F1+F3
+  - F4
+- code: SC-06
+  title: Two lines, two compounds
+  plant_state: Line 1 quality + maintenance; line 2 production + quality; a material forecast
+  findings:
+  - id: F1
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 1
+    title: Defect rate up on Line 1
+    severity: HIGH
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.8
+    issue_code: quality.defect_rate
+  - id: F2
+    agent: maintenance
+    domain: machine_health
+    scope:
+      plant: 1
+      line: 1
+      machine: M-01
+    title: M-01 alert open
+    severity: HIGH
+    likelihood_class: observed
+    horizon: today
+    confidence: 0.7
+    issue_code: machine.degradation
+  - id: F3
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 2
+    title: Scratch rate up on Line 2
+    severity: MEDIUM
+    likelihood_class: observed
+    horizon: today
+    confidence: 0.9
+    issue_code: quality.defect_rate
+  - id: F4
+    agent: production
+    domain: production
+    scope:
+      plant: 1
+      line: 2
+    title: Micro-stops up on Line 2
+    severity: MEDIUM
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.95
+    issue_code: production.performance_loss
+  - id: F5
+    agent: material
+    domain: material
+    scope:
+      plant: 1
+      sku: ZR-100
+    title: Coverage risk for SKU ZR-100 next week
+    severity: HIGH
+    likelihood_class: forecast
+    horizon: this_week
+    confidence: 0.6
+    issue_code: material.shortage
+  expected_top:
+  - C:F1+F2
+  - C:F4+F3
+  - F5
+- code: SC-07
+  title: Ties are broken by title
+  plant_state: Two identical scores; the order must be stable and explainable
+  findings:
+  - id: F1
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 1
+    title: Alpha — defect class cluster on Line 1
+    severity: LOW
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 1.0
+    issue_code: quality.defect_rate
+  - id: F2
+    agent: production
+    domain: production
+    scope:
+      plant: 1
+      line: 2
+    title: Beta — plan gap on Line 2
+    severity: LOW
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 1.0
+    issue_code: production.plan_gap
+  - id: F3
+    agent: material
+    domain: material
+    scope:
+      plant: 1
+      sku: ZR-100
+    title: Gamma — possible delay for ZR-100
+    severity: MEDIUM
+    likelihood_class: possible
+    horizon: later
+    confidence: 1.0
+    issue_code: material.shortage
+  expected_top:
+  - F1
+  - F2
+  - F3
+- code: SC-08
+  title: Stale material data discounts confidence
+  plant_state: Material data 8 h old — the agent reports a discounted confidence
+  findings:
+  - id: F1
+    agent: material
+    domain: material
+    scope:
+      plant: 1
+      sku: RAD-500-A
+    title: Coverage risk for SKU RAD-500-A (data 8 h old)
+    severity: HIGH
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.6
+    issue_code: material.shortage
+  - id: F2
+    agent: production
+    domain: production
+    scope:
+      plant: 1
+      line: 3
+    title: Schedule risk on Line 3 this shift
+    severity: MEDIUM
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.97
+    issue_code: production.schedule_risk
+  expected_top:
+  - F2
+  - F1
+- code: SC-09
+  title: Machine compound with production
+  plant_state: Maintenance alert on M-07 and the downtime Pareto on line 3 both point at M-07
+  findings:
+  - id: F1
+    agent: maintenance
+    domain: machine_health
+    scope:
+      plant: 1
+      line: 3
+      machine: M-07
+    title: Bearing temperature trending up on M-07
+    severity: HIGH
+    likelihood_class: observed
+    horizon: within_3_days
+    confidence: 0.78
+    issue_code: machine.degradation
+  - id: F2
+    agent: production
+    domain: production
+    scope:
+      plant: 1
+      line: 3
+      machine: M-07
+    title: 'Downtime Pareto: M-07 unplanned stops on Line 3'
+    severity: MEDIUM
+    likelihood_class: observed
+    horizon: today
+    confidence: 0.9
+    issue_code: production.downtime
+  - id: F3
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 1
+    title: Minor defect drift on Line 1
+    severity: LOW
+    likelihood_class: observed
+    horizon: today
+    confidence: 0.8
+    issue_code: quality.defect_rate
+  expected_top:
+  - C:F1+F2
+  - F3
+- code: SC-10
+  title: Nothing but INFO
+  plant_state: Two informational items; ranking still deterministic
+  findings:
+  - id: F1
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 1
+    title: SPC warning (rule 2) on Line 1
+    severity: INFO
+    likelihood_class: observed
+    horizon: today
+    confidence: 0.9
+    issue_code: quality.spc_warning
+  - id: F2
+    agent: maintenance
+    domain: machine_health
+    scope:
+      plant: 1
+      line: 2
+      machine: M-04
+    title: Health index slight decline on M-04
+    severity: INFO
+    likelihood_class: trend
+    horizon: today
+    confidence: 0.9
+    issue_code: machine.degradation
+  expected_top:
+  - F1
+  - F2
+- code: SC-11
+  title: Recurring detection merges into one item
+  plant_state: The same M-07 issue reported twice (earlier trend, later observed) merges with the strongest attributes
+  findings:
+  - id: F1
+    agent: maintenance
+    domain: machine_health
+    scope:
+      plant: 1
+      line: 3
+      machine: M-07
+    title: Bearing temperature trending up on M-07
+    severity: HIGH
+    likelihood_class: trend
+    horizon: within_3_days
+    confidence: 0.7
+    issue_code: machine.degradation
+  - id: F2
+    agent: maintenance
+    domain: machine_health
+    scope:
+      plant: 1
+      line: 3
+      machine: M-07
+    title: Bearing temperature trending up on M-07 (alert open)
+    severity: HIGH
+    likelihood_class: observed
+    horizon: within_3_days
+    confidence: 0.78
+    issue_code: machine.degradation
+  - id: F3
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 2
+    title: Scratch rate up on Line 2
+    severity: MEDIUM
+    likelihood_class: observed
+    horizon: today
+    confidence: 0.8
+    issue_code: quality.defect_rate
+  expected_top:
+  - F1
+  - F3
+- code: SC-12
+  title: Forecast versus observed
+  plant_state: A high-severity forecast ranks below observed lower-severity issues
+  findings:
+  - id: F1
+    agent: material
+    domain: material
+    scope:
+      plant: 1
+      sku: ZR-100
+    title: Coverage risk for ZR-100 next week
+    severity: HIGH
+    likelihood_class: forecast
+    horizon: this_week
+    confidence: 0.9
+    issue_code: material.shortage
+  - id: F2
+    agent: production
+    domain: production
+    scope:
+      plant: 1
+      line: 2
+    title: Plan gap on Line 2 this shift
+    severity: MEDIUM
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.6
+    issue_code: production.plan_gap
+  - id: F3
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 1
+    title: Defect class cluster on Line 1
+    severity: LOW
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.99
+    issue_code: quality.defect_rate
+  expected_top:
+  - F3
+  - F2
+  - F1
+- code: SC-13
+  title: Five findings, top-3 cut
+  plant_state: CRITICAL machine, a line 3 compound, and three singles
+  findings:
+  - id: F1
+    agent: maintenance
+    domain: machine_health
+    scope:
+      plant: 1
+      line: 2
+      machine: M-12
+    title: M-12 imminent failure
+    severity: CRITICAL
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.9
+    issue_code: machine.failure_imminent
+  - id: F2
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 3
+    title: Defect rate up on Line 3
+    severity: HIGH
+    likelihood_class: observed
+    horizon: today
+    confidence: 0.8
+    issue_code: quality.defect_rate
+  - id: F3
+    agent: production
+    domain: production
+    scope:
+      plant: 1
+      line: 3
+    title: Schedule risk on Line 3
+    severity: MEDIUM
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.9
+    issue_code: production.schedule_risk
+  - id: F4
+    agent: material
+    domain: material
+    scope:
+      plant: 1
+      sku: ZR-100
+    title: Coverage risk for ZR-100
+    severity: HIGH
+    likelihood_class: forecast
+    horizon: within_3_days
+    confidence: 0.7
+    issue_code: material.shortage
+  - id: F5
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 1
+    title: Minor defect drift on Line 1
+    severity: LOW
+    likelihood_class: observed
+    horizon: today
+    confidence: 0.9
+    issue_code: quality.defect_rate
+  expected_top:
+  - F1
+  - C:F2+F3
+  - F5
+- code: SC-14
+  title: SKU compound, not line
+  plant_state: Quality on line 1 and material on the same SKU compound; maintenance on line 2 stays single
+  findings:
+  - id: F1
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 1
+      sku: RAD-500-A
+    title: Defect rate up on Line 1 (RAD-500-A)
+    severity: HIGH
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.8
+    issue_code: quality.defect_rate
+  - id: F2
+    agent: material
+    domain: material
+    scope:
+      plant: 1
+      sku: RAD-500-A
+    title: Coverage risk for SKU RAD-500-A
+    severity: HIGH
+    likelihood_class: observed
+    horizon: today
+    confidence: 0.85
+    issue_code: material.shortage
+  - id: F3
+    agent: maintenance
+    domain: machine_health
+    scope:
+      plant: 1
+      line: 2
+      machine: M-05
+    title: M-05 alert open
+    severity: HIGH
+    likelihood_class: observed
+    horizon: today
+    confidence: 0.8
+    issue_code: machine.degradation
+  expected_top:
+  - C:F1+F2
+  - F3
+- code: SC-15
+  title: Engineer's judgement differs (known miss)
+  plant_state: The engineer expects the HIGH trend on M-09 and the HIGH forecast above a LOW observed item; the published tables rank otherwise. Kept in the suite deliberately — see TEST-13 TC-070.
+  findings:
+  - id: F1
+    agent: production
+    domain: production
+    scope:
+      plant: 1
+      line: 1
+    title: Plan gap on Line 1 this shift
+    severity: MEDIUM
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.95
+    issue_code: production.plan_gap
+  - id: F2
+    agent: material
+    domain: material
+    scope:
+      plant: 1
+      sku: ZR-100
+    title: Coverage risk for ZR-100 next week
+    severity: HIGH
+    likelihood_class: forecast
+    horizon: this_week
+    confidence: 0.7
+    issue_code: material.shortage
+  - id: F3
+    agent: quality
+    domain: quality
+    scope:
+      plant: 1
+      line: 2
+    title: Defect class cluster on Line 2
+    severity: LOW
+    likelihood_class: observed
+    horizon: this_shift
+    confidence: 0.9
+    issue_code: quality.defect_rate
+  - id: F4
+    agent: maintenance
+    domain: machine_health
+    scope:
+      plant: 1
+      line: 3
+      machine: M-09
+    title: Health index declining on M-09
+    severity: HIGH
+    likelihood_class: trend
+    horizon: today
+    confidence: 0.6
+    issue_code: machine.degradation
+  expected_top:
+  - F1
+  - F4
+  - F2

@@ -1,0 +1,96 @@
+# KaizenSwarm — runtime policy configuration (deploy/schemas/kaizenswarm-config.schema.json; validated at start-up, TEST-13 TC-007).
+# Runtime knobs (ports, image tags, hosts) are in .env; secrets are FILES under ${SECRETS_DIR} (OPS-13 §4). Nothing secret lives here.
+# Constants the SRS fixes are pinned by the schema and by CHECKs in swarm.setting: one inference at a time, two attempts,
+# model ≤ 9 B at temperature ≤ 0.3, scenario gate ≥ 0.80 with zero fabricated, retention ≥ 365 d, read-only tools.
+version: 1
+plant: { code: P1, timezone: Asia/Bangkok }
+locale: { primary: th, briefing_langs: [en, th, ja] }      # FR-31
+
+orchestrator:                          # NFR-01, NFR-02, C-04, C-06
+  run_wall_s: 180
+  agent_timeout_s: 60                  # active time: tools + phrasing (lease queue time excluded — ADR-K03)
+  default_budget: { tool_calls: 12, tokens: 6000, wall_ms: 60000 }   # per agent; overridden per registry entry
+  max_attempts: 2                      # AI-02 — constant
+  backoff: { base_ms: 2000, cap_ms: 30000 }
+  circuit: { threshold: 3, cooldown_min: 15 }
+  partial_on_failure: true             # C-06 — constant
+  schedule: { shift_start: ["0 6 * * *", "0 14 * * *"], daily_summary: "0 22 * * *" }
+
+bus:                                   # IF-17
+  transport: nats_jetstream            # nats_jetstream | redis_streams
+  streams: { request_retention_h: 24, finding_retention_d: 7, status_retention_d: 7, run_retention_d: 7 }
+  max_deliver: 3
+  ack_wait_s: 10
+  max_message_kib: 64
+
+llm:                                   # IF-09, AI-05, C-05
+  model: qwen2.5:7b-instruct-q4_K_M
+  max_params_b: 9
+  temperature: 0.3
+  semaphore_slots: 1                   # constant
+  lease_ttl_s: 60
+  prompts: { specialist: specialist.v1, manager_explain: manager_explain.v1, briefing: briefing.v1 }
+  max_output_tokens: { specialist: 1200, briefing: 900 }
+
+tools:                                 # IF-16, C-03
+  read_only: true                      # constant
+  default_timeout_ms: 10000
+  free_text_max_chars: 300             # SEC-K01
+  providers:
+    qe_agent:     { base_url: "https://qe.plant.local/api/v1",          credential_ref: qe_agent_token }
+    machinesense: { base_url: "https://machinesense.plant.local/api/v1", credential_ref: machinesense_token }
+    shiftbrief:   { base_url: "https://shiftbrief.plant.local/api/v1",   credential_ref: shiftbrief_token }
+    erp_adapter:  { base_url: "https://erp-adapter.plant.local/api/v1",  credential_ref: erp_adapter_token }
+    platform:     { base_url: "https://factorybrain.plant.local/api/v1", credential_ref: platform_token }
+
+blackboard:                            # IF-69
+  freshness_threshold_min: 60          # AI-07
+  expire_after_runs: 2                 # FR-27
+  snooze_max_days: 7
+  issue_families:                      # identity keys per issue-code family (IF-69 §3)
+    machine: [plant, machine]
+    lot: [plant, lot]
+    sku: [plant, sku]
+    material: [plant, sku]
+    default: [plant, line]
+
+scoring:                               # IF-70, FR-18, AI-03 — published tables; weights version v1
+  weights_version: v1
+  impact:     { INFO: 0.2, LOW: 0.4, MEDIUM: 0.6, HIGH: 0.8, CRITICAL: 1.0 }
+  likelihood: { observed: 1.0, trend: 0.8, forecast: 0.6, possible: 0.4 }
+  urgency:    { this_shift: 1.0, today: 0.9, within_3_days: 0.8, this_week: 0.6, later: 0.4 }
+  compound: noisy_or                   # 1 - prod(1 - s_i) — constant
+  top_n: 3                             # FR-19
+
+relation_rules:                        # IF-70, AI-04 — evaluated in code order; the first match absorbs
+  - { code: same_line,    match_keys: [line],    min_domains: 2, window_hours: 24, enabled: true }
+  - { code: same_lot,     match_keys: [lot],     min_domains: 2, window_hours: 72, enabled: true }
+  - { code: same_machine, match_keys: [machine], min_domains: 2, window_hours: 24, enabled: true }
+  - { code: same_sku,     match_keys: [sku],     min_domains: 2, window_hours: 48, enabled: true }
+
+briefing:                              # FR-19, FR-22, AC-07
+  claim_check: true                    # constant
+  phrasing_retries: 1
+  template_fallback: true              # constant
+  include_nothing_significant: true    # FR-13
+  freshness_warning: true
+
+delivery:                              # FR-28, FR-29, IF-08, IF-13
+  discord: { enabled: true, channel_ref: discord_channel_id, languages: [th, en] }
+  immediate_severity: CRITICAL
+  webhook_allowlist: ["https://ops.plant.local/hooks/kaizenswarm"]
+  email: { enabled: false }
+  dashboard: true
+
+scenarios:                             # AI-06, AC-01, IF-71
+  suite_file: scenarios/suite.example.yaml
+  gate: { top3_match_min: 0.80, fabricated_max: 0, min_scenarios: 15 }
+  run_before_activation: true          # ADR-K10 — constant
+
+audit:                                 # NFR-05
+  retention_days: 365
+  export_bucket: kaizenswarm-exports
+
+limits:                                # SEC-K32
+  runs_per_user_per_hour: 6
+  questions_per_user_per_hour: 20

@@ -1,0 +1,1991 @@
+openapi: 3.1.0
+info:
+  title: KaizenSwarm API
+  version: 1.0.0
+  summary: Specialist agents assess their domains with read-only tools; the Manager deduplicates, relates, ranks with a published scoring function and phrases a claim-checked shift briefing; a failed domain makes the briefing partial, never absent.
+  description: |
+    **Scope.** The KaizenSwarm API — standalone, and the `agent.finding*` module of FactoryBrain in platform mode.
+    SRS-13 §4.1's seven paths are kept verbatim under `/api/v1` (`/runs`, `/runs/{id}`, `/findings`, `/findings/{id}/ack`,
+    `/briefing`, `/manager/ask`, `/agents`). The platform's `/agent/findings` and `/agent/briefing` and their components
+    (`Finding`, `Briefing`, `Severity`, `Shift`, `Language`, `Problem`, the standard parameters and error responses) are
+    copied byte-for-byte from API-00 and diffed by TEST-13 TC-008; in platform mode they are served by the gateway.
+
+    **Five contracts (API-Specification.md §3–§7):**
+    - **Finding** — evidence or rejection; one active finding per issue key with occurrences per agent and run; lifecycle
+      changes only through actions with reasons (`409 ACTION_REQUIRED` otherwise).
+    - **Run** — scheduled, on-demand or question; per-agent budgets enforced by the orchestrator; every enabled specialist
+      ends with an assessment; `partial` names the failed domain; a run is never silently truncated.
+    - **Ranking** — `score = impact × likelihood × urgency × confidence` from a published weights version; compounds from
+      relation rules by noisy-OR; every factor is returned so the rank can be checked by hand.
+    - **Briefing** — top-N with finding ids, owners and evidence; the text is claim-checked against the cited findings
+      (`422 BRIEFING_UNGROUNDED` is a server-side refusal, never a warning); en / th / ja.
+    - **Trace & export** — every message, tool call, lease and attempt of a run; a hash over the message log.
+
+    Errors are RFC 7807 `application/problem+json` with a stable `code`.
+  contact: { name: Suphot N. }
+  license: { name: Proprietary }
+  x-document-id: API-13-KaizenSwarm
+
+servers:
+  - url: https://kaizenswarm.plant.local/api/v1
+    description: Standalone
+  - url: https://factorybrain.plant.local/api/v1
+    description: Platform mode (the platform's two paths are served by the gateway; the rest under /swarm/)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - { name: runs, description: "SRS §4.1 /runs — trigger, status, trace, assessments, ranking, export (FR-03, FR-07, AC-09)" }
+  - { name: findings, description: "SRS §4.1 /findings — the blackboard, occurrences, evidence, lifecycle actions (FR-23…FR-27)" }
+  - { name: compounds, description: "Cross-domain compounds with their components and factors (FR-17, AI-04)" }
+  - { name: briefing, description: "SRS §4.1 /briefing — briefings, claim check, deliveries (FR-19, FR-20, FR-28, FR-31)" }
+  - { name: manager, description: "SRS §4.1 /manager/ask — cross-domain questions (FR-21)" }
+  - { name: agents, description: "SRS §4.1 /agents — registry, health, circuit, tools, metrics, precision (FR-01, FR-06, FR-26, FR-30)" }
+  - { name: rules, description: "Relation rules and scoring weights — the inspectable ranking (FR-18, AI-03, AI-04)" }
+  - { name: scenarios, description: "The scenario suite and its gate (AI-06, AC-01)" }
+  - { name: exports, description: "Audit exports (NFR-05)" }
+  - { name: agent, description: "Platform paths (API-00, verbatim)" }
+  - { name: admin, description: "Configuration" }
+  - { name: system, description: "Health, readiness, metrics" }
+
+paths:
+  # ---------------------------------------------------------------- SRS-13 §4.1 — verbatim paths
+  /runs:
+    post:
+      tags: [runs]
+      operationId: triggerRun
+      summary: "Trigger an orchestration run (SRS §4.1; FR-03, FR-15)"
+      description: |
+        Creates `swarm.run` and publishes `RequestAssessment` to every enabled specialist (or the `agents` subset) with
+        the run's budgets. Returns `202` with the run; poll `GET /runs/{id}`. Budgets, timeouts and the GPU lease are
+        enforced by the orchestrator (C-04, C-05); a failed agent degrades the run to `partial` (C-06).
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunRequest'
+      responses:
+        '202':
+          description: Run accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      tags: [runs]
+      operationId: listRuns
+      summary: Runs, newest first
+      parameters:
+        - { name: status, in: query, description: "queued | running | completed | partial | failed | cancelled", schema: { type: string } }
+        - { name: trigger, in: query, description: "schedule | on_demand | question | scenario", schema: { type: string } }
+        - { name: date, in: query, description: "Plant-local date", schema: { type: string, format: date } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/RunSummary' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /runs/{id}:
+    get:
+      tags: [runs]
+      operationId: getRun
+      summary: "Run status and trace summary (SRS §4.1; FR-07)"
+      description: Status, partial reason, one assessment per enabled specialist with usage against budget, totals, and links to the full trace.
+      parameters:
+        - { name: id, in: path, required: true, description: "Run id (uuid) or run number", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /findings:
+    get:
+      tags: [findings]
+      operationId: queryFindings
+      summary: "Blackboard query (SRS §4.1; FR-23)"
+      description: Active and historical findings with issue key, factors, latest score, occurrences and reporting agents. The caller's line scope applies.
+      parameters:
+        - { name: status, in: query, description: "new | acknowledged | in_progress | resolved | expired | dismissed", schema: { type: string } }
+        - { name: severity, in: query, description: "INFO | LOW | MEDIUM | HIGH | CRITICAL", schema: { type: string } }
+        - { name: agent, in: query, description: "Reporting agent", schema: { type: string } }
+        - { name: line, in: query, description: "Scope line", schema: { type: integer } }
+        - { name: issue_code, in: query, description: "family.kind", schema: { type: string } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/FindingDetail' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /findings/{id}/ack:
+    post:
+      tags: [findings]
+      operationId: ackFinding
+      summary: "Acknowledge / assign / dismiss a finding (SRS §4.1; FR-25)"
+      description: |
+        One action row (`swarm.finding_action`) that performs the transition. `dismiss` needs `dismiss_reason` and `reason`
+        (feeds the precision report, FR-26); `assign` needs `assignee_id`. A status cannot be changed any other way
+        (`409 ACTION_REQUIRED` on direct updates).
+      parameters:
+        - { name: id, in: path, required: true, description: "Finding id", schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AckRequest'
+      responses:
+        '200':
+          description: The finding after the action
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FindingDetail'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "LIFECYCLE_TRANSITION — the transition is not allowed from the current status; REOPEN_ONLY_TERMINAL", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /briefing:
+    get:
+      tags: [briefing]
+      operationId: getShiftBriefing
+      summary: "The briefing for a date and shift (SRS §4.1; FR-19, FR-20, FR-31)"
+      description: |
+        Top-N risks with scores, severities, finding ids, owners, evidence and the phrased text in the requested language;
+        `partial` and `partial_reason` when a domain failed; data freshness per domain; the claim-check result.
+      parameters:
+        - { name: date, in: query, description: "Plant-local date (default today)", schema: { type: string, format: date } }
+        - { name: shift, in: query, description: "A | B | C | OT (default the current shift)", schema: { type: string } }
+        - { name: lang, in: query, description: "th | ja | en (default the caller language)", schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BriefingDetail'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /manager/ask:
+    post:
+      tags: [manager]
+      operationId: askManager
+      summary: "Ask a cross-domain question (SRS §4.1; FR-21)"
+      description: |
+        The Manager maps the question to a scope, requests targeted assessments from the enabled specialists (a run with
+        `trigger = question`), and answers with the ranked list for that scope. The answer text is claim-checked like a
+        briefing; the Manager never adds a claim (FR-22). Returns `202` with the question while the run is in progress.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AskRequest'
+      responses:
+        '202':
+          description: Question accepted; poll /manager/questions/{id}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Answer'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /agents:
+    get:
+      tags: [agents]
+      operationId: listAgents
+      summary: "Registry and health (SRS §4.1; FR-01, FR-30)"
+      description: Every registered agent with domains, tools, budget, schedule, circuit state, last outcome and averages.
+      responses:
+        '200':
+          description: Agents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AgentHealth' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  # ---------------------------------------------------------------- Platform paths (API-00, verbatim)
+  /agent/findings:
+    get:
+      tags: [agent]
+      summary: Cross-domain findings blackboard
+      operationId: listFindings
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [new, acknowledged, in_progress, resolved, expired, dismissed]
+        - name: severity
+          in: query
+          schema:
+            $ref: '#/components/schemas/Severity'
+        - name: domain
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Findings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Finding'
+  /agent/briefing:
+    get:
+      tags: [agent]
+      summary: Multi-agent shift briefing with ranked risks
+      description: |
+        `partial: true` means at least one specialist agent failed or timed
+        out; `partial_reason` names the domain. A briefing that silently omits
+        a failed domain would be worse than none.
+      operationId: getBriefing
+      parameters:
+        - name: date
+          in: query
+          schema: { type: string, format: date }
+        - name: shift
+          in: query
+          schema:
+            $ref: '#/components/schemas/Shift'
+        - name: lang
+          in: query
+          schema:
+            $ref: '#/components/schemas/Language'
+      responses:
+        '200':
+          description: Briefing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Briefing'
+  # ---------------------------------------------------------------- Runs
+  /runs/{id}/cancel:
+    post:
+      tags: [runs]
+      operationId: cancelRun
+      summary: Cancel a running run
+      description: Outstanding assessments become `failed` with reason `cancelled`; no briefing is produced.
+      parameters:
+        - { name: id, in: path, required: true, description: "Run id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "RUN_FINISHED — the run already ended", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /runs/{id}/trace:
+    get:
+      tags: [runs]
+      operationId: getRunTrace
+      summary: "Full trace — messages, LLM runs, tool calls, leases, attempts in time order (FR-07, AC-09)"
+      parameters:
+        - { name: id, in: path, required: true, description: "Run id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Events
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TraceEvent' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /runs/{id}/messages:
+    get:
+      tags: [runs]
+      operationId: listRunMessages
+      summary: The typed bus messages of a run (C-01, FR-02)
+      parameters:
+        - { name: id, in: path, required: true, description: "Run id", schema: { type: string, format: uuid } }
+        - { name: type, in: query, description: "RequestAssessment | Finding | Clarification | Error | StatusUpdate", schema: { type: string } }
+        - { name: agent, in: query, description: "From or to this agent", schema: { type: string } }
+      responses:
+        '200':
+          description: Messages in seq order
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Message' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /runs/{id}/assessments:
+    get:
+      tags: [runs]
+      operationId: listRunAssessments
+      summary: One assessment per enabled specialist, with usage against budget (C-04, FR-13, AC-05)
+      parameters:
+        - { name: id, in: path, required: true, description: "Run id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Assessments
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Assessment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /runs/{id}/ranking:
+    get:
+      tags: [runs]
+      operationId: getRunRanking
+      summary: The ordered list — compounds and findings with every factor (FR-18, AI-03)
+      parameters:
+        - { name: id, in: path, required: true, description: "Run id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Ranked items
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RankItem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /runs/{id}/export:
+    get:
+      tags: [runs, exports]
+      operationId: exportRun
+      summary: "Run trace export (IF-72; NFR-05, AC-09)"
+      description: The JSON shape of `deploy/schemas/run-export.schema.json`; the `message_log_sha256` equals the stored `swarm.export.sha256`.
+      parameters:
+        - { name: id, in: path, required: true, description: "Run id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunExport'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  # ---------------------------------------------------------------- Findings
+  /findings/{id}:
+    get:
+      tags: [findings]
+      operationId: getFinding
+      summary: A finding with its extension, latest factors, occurrences and actions
+      parameters:
+        - { name: id, in: path, required: true, description: "Finding id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FindingDetail'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /findings/{id}/occurrences:
+    get:
+      tags: [findings]
+      operationId: listOccurrences
+      summary: Every detection with its own evidence set (AC-03, AC-08)
+      parameters:
+        - { name: id, in: path, required: true, description: "Finding id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Occurrences
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Occurrence' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /findings/{id}/evidence:
+    get:
+      tags: [findings]
+      operationId: listEvidence
+      summary: The union of evidence items with the agent and run that supplied each (C-02)
+      parameters:
+        - { name: id, in: path, required: true, description: "Finding id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Evidence
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/EvidenceItem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /findings/{id}/scores:
+    get:
+      tags: [findings]
+      operationId: listFindingScores
+      summary: The finding's score in every run it occurred in, with factors and weights version
+      parameters:
+        - { name: id, in: path, required: true, description: "Finding id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Scores
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RiskScore' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /findings/{id}/actions:
+    get:
+      tags: [findings]
+      operationId: listFindingActions
+      summary: The action history (FR-25)
+      parameters:
+        - { name: id, in: path, required: true, description: "Finding id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Actions
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/FindingAction' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /findings/{id}/snooze:
+    post:
+      tags: [findings]
+      operationId: snoozeFinding
+      summary: Snooze until a time; status unchanged, no reminders until then (FR-25)
+      parameters:
+        - { name: id, in: path, required: true, description: "Finding id", schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SnoozeRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FindingDetail'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "SNOOZE_UNTIL — must be in the future", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /findings/{id}/dismiss:
+    post:
+      tags: [findings]
+      operationId: dismissFinding
+      summary: Dismiss with a reason code (FR-25, FR-26)
+      parameters:
+        - { name: id, in: path, required: true, description: "Finding id", schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DismissRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FindingDetail'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "LIFECYCLE_TRANSITION", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /findings/{id}/resolve:
+    post:
+      tags: [findings]
+      operationId: resolveFinding
+      summary: Resolve with what was done (FR-23)
+      parameters:
+        - { name: id, in: path, required: true, description: "Finding id", schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FindingDetail'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "LIFECYCLE_TRANSITION", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /findings/{id}/reopen:
+    post:
+      tags: [findings]
+      operationId: reopenFinding
+      summary: Reopen a resolved, expired or dismissed finding
+      parameters:
+        - { name: id, in: path, required: true, description: "Finding id", schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FindingDetail'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "REOPEN_ONLY_TERMINAL", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  # ---------------------------------------------------------------- Compounds
+  /compounds:
+    get:
+      tags: [compounds]
+      operationId: listCompounds
+      summary: Compounds of a run with rule, shared key, rationale and components (FR-17)
+      parameters:
+        - { name: run_id, in: query, description: "Run id", schema: { type: string, format: uuid } }
+        - { name: line, in: query, description: "Scope line", schema: { type: integer } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/CompoundRisk' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /compounds/{id}:
+    get:
+      tags: [compounds]
+      operationId: getCompound
+      summary: One compound with each component's four factors (v_compound_explain)
+      parameters:
+        - { name: id, in: path, required: true, description: "Compound id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompoundRisk'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  # ---------------------------------------------------------------- Briefings
+  /briefings:
+    get:
+      tags: [briefing]
+      operationId: listBriefings
+      summary: Briefings, newest first
+      parameters:
+        - { name: run_id, in: query, description: "Run id", schema: { type: string, format: uuid } }
+        - { name: lang, in: query, description: "th | ja | en", schema: { type: string } }
+        - { name: partial, in: query, description: "Only partial briefings", schema: { type: boolean } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/BriefingDetail' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /briefings/{id}:
+    get:
+      tags: [briefing]
+      operationId: getBriefingById
+      summary: A briefing with its run link, rank list and claim check
+      parameters:
+        - { name: id, in: path, required: true, description: "Briefing id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BriefingDetail'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /briefings/{id}/claim-check:
+    get:
+      tags: [briefing]
+      operationId: getClaimCheck
+      summary: The numeric tokens of the text and where each was matched (AC-07)
+      parameters:
+        - { name: id, in: path, required: true, description: "Briefing id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimCheck'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /briefings/{id}/deliver:
+    post:
+      tags: [briefing]
+      operationId: deliverBriefing
+      summary: Deliver (again) to a channel (FR-28)
+      parameters:
+        - { name: id, in: path, required: true, description: "Briefing id", schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeliverRequest'
+      responses:
+        '202':
+          description: Delivery queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Delivery'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /deliveries:
+    get:
+      tags: [briefing]
+      operationId: listDeliveries
+      summary: Briefing and immediate (CRITICAL) deliveries (FR-28, FR-29)
+      parameters:
+        - { name: kind, in: query, description: "briefing | immediate", schema: { type: string } }
+        - { name: status, in: query, description: "pending | sent | failed | skipped", schema: { type: string } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Delivery' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /manager/questions/{id}:
+    get:
+      tags: [manager]
+      operationId: getQuestion
+      summary: A question with its run and claim-checked answer (FR-21)
+      parameters:
+        - { name: id, in: path, required: true, description: "Question id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Answer'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  # ---------------------------------------------------------------- Agents (registry, health, tools, metrics)
+  /agents/{name}:
+    get:
+      tags: [agents]
+      operationId: getAgent
+      summary: Registry entry with domains, tools and circuit state
+      parameters:
+        - { name: name, in: path, required: true, description: "Agent name", schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentDetail'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [agents, admin]
+      operationId: patchAgent
+      summary: Enable / disable, budget, schedule, prompt version (FR-01) — audited
+      parameters:
+        - { name: name, in: path, required: true, description: "Agent name", schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentPatch'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentDetail'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "MANAGER_REQUIRED — the manager cannot be disabled; TOOL_NOT_READ_ONLY — a write tool cannot be bound", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /agents/import:
+    post:
+      tags: [agents, admin]
+      operationId: importAgents
+      summary: "Import the registry file (IF-68; FR-06)"
+      description: Validated against `deploy/schemas/agent-registry.schema.json`; upserts entries; new agents take part in the next run without a Manager change.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentRegistryFile'
+      responses:
+        '200':
+          description: Imported agents
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AgentDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /agents/{name}/health:
+    get:
+      tags: [agents]
+      operationId: getAgentHealth
+      summary: Circuit state, last outcomes, averages (FR-05, FR-30)
+      parameters:
+        - { name: name, in: path, required: true, description: "Agent name", schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentHealth'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /agents/{name}/circuit/reset:
+    post:
+      tags: [agents, admin]
+      operationId: resetCircuit
+      summary: Close an open circuit by hand (FR-05) — audited
+      parameters:
+        - { name: name, in: path, required: true, description: "Agent name", schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentHealth'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "CIRCUIT_TRANSITION — open→closed must pass through half_open; use /circuit/probe", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /agents/{name}/circuit/probe:
+    post:
+      tags: [agents, admin]
+      operationId: probeCircuit
+      summary: Move an open circuit to half_open after the cool-down; the next run is the probe
+      parameters:
+        - { name: name, in: path, required: true, description: "Agent name", schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentHealth'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "CIRCUIT_TRANSITION — cool-down not elapsed", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /agents/{name}/tools:
+    get:
+      tags: [agents]
+      operationId: listAgentTools
+      summary: The read tools bound to the agent, with providers and timeouts (C-03, IF-16)
+      parameters:
+        - { name: name, in: path, required: true, description: "Agent name", schema: { type: string } }
+      responses:
+        '200':
+          description: Tools
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ToolBinding' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /agents/{name}/metrics:
+    get:
+      tags: [agents]
+      operationId: getAgentMetrics
+      summary: Daily runs, failures, timeouts, budget stops, findings, dismissals, latency, tokens, tool calls (NFR-07)
+      parameters:
+        - { name: name, in: path, required: true, description: "Agent name", schema: { type: string } }
+        - { name: from, in: query, description: "From date", schema: { type: string, format: date } }
+        - { name: to, in: query, description: "To date", schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: Metrics
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AgentMetric' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /agents/{name}/precision:
+    get:
+      tags: [agents]
+      operationId: getAgentPrecision
+      summary: Findings, dismissed, false positives, precision over a period (FR-26)
+      parameters:
+        - { name: name, in: path, required: true, description: "Agent name", schema: { type: string } }
+        - { name: from, in: query, description: "From date", schema: { type: string, format: date } }
+        - { name: to, in: query, description: "To date", schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Precision'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  # ---------------------------------------------------------------- Rules and weights (the inspectable ranking)
+  /relation-rules:
+    get:
+      tags: [rules]
+      operationId: listRelationRules
+      summary: Relation rules (AI-04)
+      responses:
+        '200':
+          description: Rules in evaluation order (code)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RelationRule' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [rules, admin]
+      operationId: createRelationRule
+      summary: Add a rule — the scenario suite must pass before it is enabled (ADR-K10)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RelationRuleInput'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RelationRule'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /relation-rules/{id}:
+    patch:
+      tags: [rules, admin]
+      operationId: patchRelationRule
+      summary: Enable / disable, window, keys
+      parameters:
+        - { name: id, in: path, required: true, description: "Rule id", schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RelationRuleInput'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RelationRule'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /scoring-weights:
+    get:
+      tags: [rules]
+      operationId: listScoringWeights
+      summary: "Published weights versions — impact, likelihood and urgency tables (FR-18, AI-03, IF-70)"
+      responses:
+        '200':
+          description: Versions
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ScoringWeights' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [rules, admin]
+      operationId: publishScoringWeights
+      summary: Publish a new version (inactive until activated)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WeightsInput'
+      responses:
+        '201':
+          description: Published
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScoringWeights'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /scoring-weights/{version}/activate:
+    post:
+      tags: [rules, admin]
+      operationId: activateScoringWeights
+      summary: Activate a version — refused unless the latest scenario suite run with it passed (ADR-K10)
+      parameters:
+        - { name: version, in: path, required: true, description: "Weights version", schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScoringWeights'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "SCENARIO_GATE — no passing suite run for this version", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  # ---------------------------------------------------------------- Scenario suite
+  /scenarios:
+    get:
+      tags: [scenarios]
+      operationId: listScenarios
+      summary: The scenario suite (AI-06)
+      responses:
+        '200':
+          description: Scenarios
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Scenario' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /scenarios/import:
+    post:
+      tags: [scenarios, admin]
+      operationId: importScenarios
+      summary: "Import the suite file (IF-71)"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScenarioSuiteFile'
+      responses:
+        '200':
+          description: Imported
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Scenario' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /scenarios/run:
+    post:
+      tags: [scenarios]
+      operationId: runScenarioSuite
+      summary: "Run the suite — deterministic (SQL) or full (with the model) (AI-06, AC-01)"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SuiteRunRequest'
+      responses:
+        '202':
+          description: Suite run started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuiteRun'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /scenarios/runs/{id}:
+    get:
+      tags: [scenarios]
+      operationId: getSuiteRun
+      summary: A suite run with per-scenario results and mismatches
+      parameters:
+        - { name: id, in: path, required: true, description: "Suite run id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuiteRun'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /scenarios/gate:
+    get:
+      tags: [scenarios]
+      operationId: getScenarioGate
+      summary: The latest suite run per weights version and whether it passed the gate (≥ 0.80, 0 fabricated)
+      responses:
+        '200':
+          description: Latest runs
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SuiteRun' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  # ---------------------------------------------------------------- Exports, config, system
+  /exports:
+    get:
+      tags: [exports]
+      operationId: listExports
+      summary: Exports with their hashes (NFR-05)
+      parameters:
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Export' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [exports]
+      operationId: createExport
+      summary: Export findings, briefings or the audit log for a period
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportRequest'
+      responses:
+        '201':
+          description: Export created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Export'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /config:
+    get:
+      tags: [admin]
+      operationId: getConfig
+      summary: Effective configuration (budgets, timeouts, semaphore, freshness threshold, top-N, expiry, model, gate) — secrets never included
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Config'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /healthz:
+    get:
+      tags: [system]
+      operationId: healthz
+      summary: Liveness
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /readyz:
+    get:
+      tags: [system]
+      operationId: readyz
+      summary: "Readiness — database, bus, model, sibling tools; the mode the run controller is in"
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+        '503': { description: "NOT_READY — a dependency is down; scheduled runs are skipped and logged", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /metrics:
+    get:
+      tags: [system]
+      operationId: metrics
+      summary: Prometheus text (IF-14) — tokens, latency, tool calls, outcomes per agent per run (NFR-07)
+      security: []
+      responses:
+        '200':
+          description: Metrics
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Platform users and roles; viewer reads briefings, inspector (shift leader) acts on findings, engineer drills into evidence, manager triggers runs and asks, admin edits the registry, rules and weights (SEC-13 §5.7).
+
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Opaque cursor from the previous page's `next_cursor`
+
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      schema: { type: string }
+      description: |
+        Client-generated key. Replaying a request with the same key returns the
+        original result instead of performing the operation twice.
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    Forbidden:
+      description: |
+        Authenticated but not permitted. For line-scoped resources the rows are
+        never retrieved in the first place — this is not response filtering.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    NotFound:
+      description: Resource does not exist
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    ValidationFailed:
+      description: Request was well-formed but semantically invalid
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 7807 problem details with a stable machine-readable `code`.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          description: Stable error code — see API-Specification.md §7
+        correlation_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+
+    Language:
+      type: string
+      enum: [th, ja, en]
+      default: th
+
+    Shift:
+      type: string
+      enum: [A, B, C, OT]
+
+    Severity:
+      type: string
+      enum: [INFO, LOW, MEDIUM, HIGH, CRITICAL]
+
+    Finding:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        agent: { type: string }
+        domain: { type: string }
+        scope: { type: object, additionalProperties: true }
+        title: { type: string }
+        summary: { type: [string, 'null'] }
+        severity:
+          $ref: '#/components/schemas/Severity'
+        confidence: { type: [number, 'null'] }
+        evidence:
+          type: array
+          minItems: 1
+          description: A finding without evidence is rejected — enforced in the database
+          items: { type: object, additionalProperties: true }
+        recommended_action: { type: [string, 'null'] }
+        status: { type: string }
+        first_seen: { type: string, format: date-time }
+        last_seen: { type: string, format: date-time }
+        occurrences: { type: integer }
+
+    Briefing:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        generated_at: { type: string, format: date-time }
+        lang:
+          $ref: '#/components/schemas/Language'
+        partial:
+          type: boolean
+          description: True when a specialist agent failed or timed out
+        partial_reason: { type: [string, 'null'] }
+        data_freshness:
+          type: object
+          additionalProperties: true
+          description: Age of the data each domain reported on
+        top_risks:
+          type: array
+          items:
+            type: object
+            properties:
+              rank: { type: integer }
+              score: { type: number }
+              severity: { $ref: '#/components/schemas/Severity' }
+              title: { type: string }
+              summary: { type: string }
+              finding_ids:
+                type: array
+                items: { type: string, format: uuid }
+              recommended_action: { type: string }
+              owner: { type: [string, 'null'] }
+        text: { type: string }
+
+    RunRequest:
+      type: object
+      properties:
+        scope:
+          type: object
+          description: "{plant, line?, shift?, date?}"
+          additionalProperties: true
+        agents:
+          type: array
+          description: Subset of enabled specialists (default all)
+          items: { type: string }
+        trigger: { type: string, enum: [on_demand, schedule], default: on_demand }
+        lang: { $ref: '#/components/schemas/Language' }
+
+    RunSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        run_no: { type: integer }
+        trigger: { type: string, enum: [schedule, on_demand, question, scenario] }
+        scope: { type: object, additionalProperties: true }
+        status: { type: string, enum: [queued, running, completed, partial, failed, cancelled] }
+        partial_reason: { type: [string, 'null'] }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        wall_ms: { type: [integer, 'null'] }
+        agent_count: { type: integer }
+        tool_call_count: { type: integer }
+        token_count: { type: integer }
+        weights_version: { type: string }
+
+    Run:
+      allOf:
+        - { $ref: '#/components/schemas/RunSummary' }
+        - type: object
+          properties:
+            deadline_at: { type: string, format: date-time }
+            budgets: { type: object, additionalProperties: { $ref: '#/components/schemas/Budget' } }
+            assessments:
+              type: array
+              items: { $ref: '#/components/schemas/Assessment' }
+            compounds: { type: integer }
+            briefings: { type: integer }
+            links:
+              type: object
+              properties:
+                trace: { type: string }
+                ranking: { type: string }
+                export: { type: string }
+
+    Budget:
+      type: object
+      required: [tool_calls, tokens, wall_ms]
+      properties:
+        tool_calls: { type: integer }
+        tokens: { type: integer }
+        wall_ms: { type: integer }
+
+    Assessment:
+      type: object
+      description: One per enabled specialist per run — silence is impossible (FR-13); over budget ⇒ budget_exceeded + incomplete (AC-05)
+      properties:
+        agent: { type: string }
+        outcome: { type: string, enum: [findings, nothing_significant, timeout, budget_exceeded, invalid_output, failed, circuit_open] }
+        incomplete: { type: boolean }
+        finding_count: { type: integer }
+        confidence: { type: [number, 'null'] }
+        freshness_min: { type: [number, 'null'] }
+        freshness_flag: { type: boolean, description: "true when older than the threshold (60 min) — shown as ⚠" }
+        usage: { $ref: '#/components/schemas/Budget' }
+        budget: { $ref: '#/components/schemas/Budget' }
+        violation: { type: [string, 'null'], description: "e.g. tool_calls 13 > 12" }
+        attempt_count: { type: integer }
+        requested_at: { type: string, format: date-time }
+        responded_at: { type: [string, 'null'], format: date-time }
+        error: { type: [string, 'null'] }
+        agent_run_id: { type: [string, 'null'], format: uuid, description: The specialist's platform agent.run }
+
+    Message:
+      type: object
+      properties:
+        seq: { type: integer }
+        ts: { type: string, format: date-time }
+        type: { type: string, enum: [RequestAssessment, Finding, Clarification, Error, StatusUpdate] }
+        from: { type: string }
+        to: { type: string }
+        subject: { type: string, description: "IF-17 subject, e.g. agent.finding.quality" }
+        correlation_id: { type: string }
+        payload: { type: object, additionalProperties: true }
+
+    TraceEvent:
+      type: object
+      properties:
+        seq: { type: integer }
+        ts: { type: string, format: date-time }
+        kind: { type: string, enum: [message, llm_run, tool_call, lease, attempt] }
+        agent: { type: string }
+        detail: { type: object, additionalProperties: true }
+
+    RankItem:
+      type: object
+      properties:
+        rank: { type: integer }
+        kind: { type: string, enum: [finding, compound] }
+        id: { type: string, format: uuid }
+        score: { type: number }
+        title: { type: string }
+        finding_ids:
+          type: array
+          items: { type: string, format: uuid }
+        factors:
+          type: array
+          description: For a finding one entry; for a compound one per component
+          items: { $ref: '#/components/schemas/RiskScore' }
+
+    RiskScore:
+      type: object
+      description: "score = impact × likelihood × urgency × confidence (FR-18, AI-03); recomputed by the database"
+      properties:
+        run_id: { type: string, format: uuid }
+        run_no: { type: integer }
+        finding_id: { type: string, format: uuid }
+        weights_version: { type: string }
+        impact: { type: number }
+        likelihood: { type: number }
+        urgency: { type: number }
+        confidence: { type: number }
+        score: { type: number }
+        rank: { type: [integer, 'null'] }
+        absorbed_by: { type: [string, 'null'], format: uuid, description: The compound this finding is a component of }
+
+    CompoundRisk:
+      type: object
+      description: "≥ 2 findings from ≥ 2 domains sharing the rule's key; score = 1 − Π(1 − sᵢ) ≥ every component (FR-17, AC-04)"
+      properties:
+        id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        rule: { type: string }
+        shared_key: { type: object, additionalProperties: true }
+        rationale: { type: string }
+        score: { type: number }
+        rank: { type: [integer, 'null'] }
+        title: { type: string }
+        recommended_action: { type: [string, 'null'] }
+        owner_suggestion: { type: [string, 'null'] }
+        components:
+          type: array
+          items:
+            type: object
+            properties:
+              finding_id: { type: string, format: uuid }
+              agent: { type: string }
+              domain: { type: string }
+              title: { type: string }
+              score: { type: number }
+              factors: { $ref: '#/components/schemas/RiskScore' }
+
+    FindingDetail:
+      allOf:
+        - { $ref: '#/components/schemas/Finding' }
+        - type: object
+          properties:
+            issue_code: { type: string }
+            issue_key: { type: string }
+            likelihood_class: { type: string, enum: [observed, trend, forecast, possible] }
+            horizon: { type: string, enum: [this_shift, today, within_3_days, this_week, later] }
+            freshness_min: { type: [number, 'null'] }
+            stale: { type: boolean }
+            impact_estimate: { type: [object, 'null'], additionalProperties: true }
+            owner_suggestion: { type: [string, 'null'] }
+            owner: { type: [string, 'null'] }
+            snoozed_until: { type: [string, 'null'], format: date-time }
+            latest_score: { type: [number, 'null'] }
+            reporting_agents: { type: integer }
+            resolved_at: { type: [string, 'null'], format: date-time }
+            resolution: { type: [string, 'null'] }
+
+    Occurrence:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        run_no: { type: integer }
+        agent: { type: string }
+        confidence: { type: [number, 'null'] }
+        freshness_min: { type: [number, 'null'] }
+        summary: { type: [string, 'null'] }
+        evidence:
+          type: array
+          items: { $ref: '#/components/schemas/EvidenceItem' }
+        ts: { type: string, format: date-time }
+
+    EvidenceItem:
+      type: object
+      required: [kind, ref]
+      properties:
+        kind: { type: string, enum: [metric, alert, signal, case, oee, downtime, stock, po, lot, schedule, pm, health] }
+        ref: { type: string }
+        agent: { type: string }
+        run_no: { type: integer }
+
+    FindingAction:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [acknowledge, assign, start, snooze, dismiss, resolve, reopen] }
+        actor: { type: string }
+        reason: { type: [string, 'null'] }
+        dismiss_reason: { type: [string, 'null'], enum: [false_positive, duplicate, known, not_actionable, not_related, null] }
+        assignee: { type: [string, 'null'] }
+        snooze_until: { type: [string, 'null'], format: date-time }
+        from_status: { type: string }
+        to_status: { type: string }
+        ts: { type: string, format: date-time }
+
+    AckRequest:
+      type: object
+      required: [action]
+      properties:
+        action: { type: string, enum: [acknowledge, assign, start, dismiss] }
+        reason: { type: string }
+        dismiss_reason: { type: string, enum: [false_positive, duplicate, known, not_actionable, not_related] }
+        assignee_id: { type: string, format: uuid }
+
+    SnoozeRequest:
+      type: object
+      required: [until, reason]
+      properties:
+        until: { type: string, format: date-time }
+        reason: { type: string }
+
+    DismissRequest:
+      type: object
+      required: [dismiss_reason, reason]
+      properties:
+        dismiss_reason: { type: string, enum: [false_positive, duplicate, known, not_actionable, not_related] }
+        reason: { type: string }
+
+    ResolveRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: string, description: What was done }
+
+    ReasonRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: string }
+
+    BriefingDetail:
+      allOf:
+        - { $ref: '#/components/schemas/Briefing' }
+        - type: object
+          properties:
+            run_id: { type: string, format: uuid }
+            run_no: { type: integer }
+            scope: { type: object, additionalProperties: true }
+            top_n: { type: integer }
+            rank: { type: array, items: { $ref: '#/components/schemas/RankItem' } }
+            claim_check: { $ref: '#/components/schemas/ClaimCheck' }
+            template_fallback: { type: boolean, description: true when the phrased text failed the claim check twice and the deterministic template was used }
+            deliveries: { type: array, items: { $ref: '#/components/schemas/Delivery' } }
+            run_summary: { type: string, description: "Run 411 · 2 min 14 s · 4 agents · 23 tool calls" }
+
+    ClaimCheck:
+      type: object
+      description: "Every numeric token in the text must occur in the cited findings or the run's metadata (FR-22, AC-07)"
+      properties:
+        checked: { type: integer }
+        matched: { type: integer }
+        unmatched:
+          type: array
+          items: { type: string }
+
+    Delivery:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [briefing, immediate] }
+        briefing_id: { type: [string, 'null'], format: uuid }
+        finding_id: { type: [string, 'null'], format: uuid }
+        channel: { type: string, enum: [discord, webhook, email, dashboard] }
+        status: { type: string, enum: [pending, sent, failed, skipped] }
+        scheduled_at: { type: string, format: date-time }
+        delivered_at: { type: [string, 'null'], format: date-time }
+        message_ref: { type: [string, 'null'] }
+        error: { type: [string, 'null'] }
+
+    DeliverRequest:
+      type: object
+      required: [channel]
+      properties:
+        channel: { type: string, enum: [discord, webhook, email, dashboard] }
+
+    AskRequest:
+      type: object
+      required: [question]
+      properties:
+        question: { type: string, maxLength: 500 }
+        lang: { $ref: '#/components/schemas/Language' }
+        scope: { type: object, additionalProperties: true, description: "Optional; otherwise derived from the question" }
+
+    Answer:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        run_id: { type: [string, 'null'], format: uuid }
+        question: { type: string }
+        scope: { type: object, additionalProperties: true }
+        status: { type: string, enum: [running, answered, partial, failed] }
+        items: { type: array, items: { $ref: '#/components/schemas/RankItem' } }
+        answer_text: { type: [string, 'null'] }
+        claim_check: { $ref: '#/components/schemas/ClaimCheck' }
+        asked_at: { type: string, format: date-time }
+        answered_at: { type: [string, 'null'], format: date-time }
+
+    AgentSummary:
+      type: object
+      properties:
+        name: { type: string }
+        kind: { type: string, enum: [specialist, manager] }
+        display_name: { type: string }
+        version: { type: string }
+        enabled: { type: boolean }
+        domains: { type: array, items: { type: string } }
+        budget: { $ref: '#/components/schemas/Budget' }
+        schedule_cron: { type: [string, 'null'] }
+        prompt_version: { type: [string, 'null'] }
+
+    AgentDetail:
+      allOf:
+        - { $ref: '#/components/schemas/AgentSummary' }
+        - type: object
+          properties:
+            description: { type: [string, 'null'] }
+            module: { type: string }
+            output_schema: { type: string }
+            tools: { type: array, items: { $ref: '#/components/schemas/ToolBinding' } }
+            circuit: { $ref: '#/components/schemas/CircuitState' }
+            updated_at: { type: string, format: date-time }
+
+    AgentPatch:
+      type: object
+      properties:
+        enabled: { type: boolean }
+        budget: { $ref: '#/components/schemas/Budget' }
+        schedule_cron: { type: [string, 'null'] }
+        prompt_version: { type: string }
+        tools: { type: array, items: { type: string }, description: Tool names to bind — read tools only }
+        reason: { type: string }
+
+    AgentRegistryFile:
+      type: object
+      description: "deploy/agents.example.yaml as JSON (IF-68)"
+      required: [version, agents]
+      properties:
+        version: { type: integer }
+        agents: { type: array, items: { type: object, additionalProperties: true } }
+
+    CircuitState:
+      type: object
+      properties:
+        state: { type: string, enum: [closed, open, half_open] }
+        consecutive_failures: { type: integer }
+        opened_at: { type: [string, 'null'], format: date-time }
+        last_outcome: { type: [string, 'null'] }
+        last_change_at: { type: string, format: date-time }
+
+    AgentHealth:
+      allOf:
+        - { $ref: '#/components/schemas/AgentSummary' }
+        - type: object
+          properties:
+            circuit: { $ref: '#/components/schemas/CircuitState' }
+            tools: { type: integer }
+            last_outcome: { type: [string, 'null'] }
+            avg_wall_ms: { type: [number, 'null'] }
+            avg_tokens: { type: [number, 'null'] }
+            avg_tool_calls: { type: [number, 'null'] }
+            failures: { type: integer }
+
+    ToolBinding:
+      type: object
+      properties:
+        name: { type: string }
+        kind: { type: string, enum: [read] }
+        provider: { type: string }
+        min_role: { type: string }
+        timeout_ms: { type: integer }
+        ordinal: { type: integer }
+
+    AgentMetric:
+      type: object
+      properties:
+        agent: { type: string }
+        date: { type: string, format: date }
+        runs: { type: integer }
+        failures: { type: integer }
+        timeouts: { type: integer }
+        budget_exceeded: { type: integer }
+        findings: { type: integer }
+        dismissed: { type: integer }
+        false_positives: { type: integer }
+        avg_latency_ms: { type: [integer, 'null'] }
+        tokens: { type: integer }
+        tool_calls: { type: integer }
+
+    Precision:
+      type: object
+      properties:
+        agent: { type: string }
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        findings: { type: integer }
+        dismissed: { type: integer }
+        false_positives: { type: integer }
+        precision_rate: { type: [number, 'null'] }
+
+    RelationRule:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        match_keys: { type: array, items: { type: string, enum: [plant, line, machine, sku, lot, shift] } }
+        min_domains: { type: integer, minimum: 2 }
+        window_hours: { type: integer }
+        enabled: { type: boolean }
+        description: { type: [string, 'null'] }
+
+    RelationRuleInput:
+      type: object
+      properties:
+        code: { type: string, pattern: "^[a-z][a-z0-9_]{1,31}$" }
+        match_keys: { type: array, minItems: 1, items: { type: string, enum: [plant, line, machine, sku, lot, shift] } }
+        min_domains: { type: integer, minimum: 2 }
+        window_hours: { type: integer, minimum: 1 }
+        enabled: { type: boolean }
+        description: { type: string }
+
+    ScoringWeights:
+      type: object
+      description: "IF-70 — impact by severity, likelihood by class, urgency by horizon; monotone; ≤ 1"
+      properties:
+        version: { type: string }
+        impact: { type: object, additionalProperties: { type: number } }
+        likelihood: { type: object, additionalProperties: { type: number } }
+        urgency: { type: object, additionalProperties: { type: number } }
+        active: { type: boolean }
+        published_at: { type: string, format: date-time }
+        published_by: { type: [string, 'null'] }
+        note: { type: [string, 'null'] }
+
+    WeightsInput:
+      type: object
+      required: [version, impact, likelihood, urgency]
+      properties:
+        version: { type: string, pattern: "^v[0-9]+$" }
+        impact: { type: object, required: [INFO, LOW, MEDIUM, HIGH, CRITICAL], additionalProperties: { type: number, minimum: 0, maximum: 1 } }
+        likelihood: { type: object, required: [observed, trend, forecast, possible], additionalProperties: { type: number, minimum: 0, maximum: 1 } }
+        urgency: { type: object, required: [this_shift, today, within_3_days, this_week, later], additionalProperties: { type: number, minimum: 0, maximum: 1 } }
+        note: { type: string }
+
+    Scenario:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        title: { type: string }
+        plant_state: { type: object, additionalProperties: true }
+        findings: { type: array, items: { type: object, additionalProperties: true } }
+        expected_top: { type: array, items: { type: string } }
+        notes: { type: [string, 'null'] }
+
+    ScenarioSuiteFile:
+      type: object
+      description: "deploy/scenarios/suite.example.yaml as JSON (IF-71)"
+      required: [suite, version, weights_version, gate, scenarios]
+      properties:
+        suite: { type: string }
+        version: { type: integer }
+        weights_version: { type: string }
+        gate: { type: object, additionalProperties: true }
+        scenarios: { type: array, minItems: 15, items: { type: object, additionalProperties: true } }
+
+    SuiteRunRequest:
+      type: object
+      properties:
+        weights_version: { type: string, description: Default the active version }
+        mode: { type: string, enum: [deterministic, full], default: deterministic }
+
+    SuiteRun:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        weights_version: { type: string }
+        mode: { type: string, enum: [deterministic, full] }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        scenarios: { type: integer }
+        matches: { type: integer }
+        match_rate: { type: [number, 'null'] }
+        fabricated: { type: integer }
+        passed: { type: [boolean, 'null'] }
+        gate_top3: { type: number }
+        mismatches: { type: array, items: { type: string } }
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string }
+              computed_top: { type: array, items: { type: string } }
+              expected_top: { type: array, items: { type: string } }
+              top3_match: { type: boolean }
+              fabricated_count: { type: integer }
+
+    Export:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [run, findings, briefing, audit] }
+        run_id: { type: [string, 'null'], format: uuid }
+        from_ts: { type: [string, 'null'], format: date-time }
+        to_ts: { type: [string, 'null'], format: date-time }
+        row_count: { type: integer }
+        sha256: { type: string }
+        uri: { type: string }
+        created_at: { type: string, format: date-time }
+
+    ExportRequest:
+      type: object
+      required: [kind]
+      properties:
+        kind: { type: string, enum: [findings, briefing, audit] }
+        from_ts: { type: string, format: date-time }
+        to_ts: { type: string, format: date-time }
+
+    RunExport:
+      type: object
+      description: "deploy/schemas/run-export.schema.json (IF-72)"
+      required: [run, assessments, messages, tool_calls, leases, attempts, ranking, message_log_sha256]
+      properties:
+        run: { $ref: '#/components/schemas/RunSummary' }
+        assessments: { type: array, items: { $ref: '#/components/schemas/Assessment' } }
+        messages: { type: array, items: { $ref: '#/components/schemas/Message' } }
+        tool_calls: { type: array, items: { type: object, additionalProperties: true } }
+        leases: { type: array, items: { type: object, additionalProperties: true } }
+        attempts: { type: array, items: { type: object, additionalProperties: true } }
+        ranking: { type: array, items: { $ref: '#/components/schemas/RankItem' } }
+        message_log_sha256: { type: string }
+
+    Config:
+      type: object
+      properties:
+        agent_timeout_s: { type: integer }
+        run_wall_s: { type: integer }
+        max_attempts: { type: integer }
+        backoff_base_ms: { type: integer }
+        backoff_cap_ms: { type: integer }
+        circuit_threshold: { type: integer }
+        circuit_cooldown_min: { type: integer }
+        freshness_threshold_min: { type: integer }
+        top_n: { type: integer }
+        expire_after_runs: { type: integer }
+        semaphore_slots: { type: integer, enum: [1] }
+        llm: { type: object, properties: { model: { type: string }, max_params_b: { type: number }, temperature: { type: number } } }
+        scenario_gate: { type: object, properties: { top3_match_min: { type: number }, fabricated_max: { type: integer } } }
+        retention_days: { type: integer }
+        briefing_langs: { type: array, items: { $ref: '#/components/schemas/Language' } }
+        active_weights: { type: string }
+
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok] }
+        version: { type: string }
+
+    Readiness:
+      type: object
+      properties:
+        status: { type: string, enum: [ready, degraded, not_ready] }
+        mode: { type: string, enum: [normal, no_model, no_bus, no_db] }
+        checks:
+          type: object
+          additionalProperties: { type: string }

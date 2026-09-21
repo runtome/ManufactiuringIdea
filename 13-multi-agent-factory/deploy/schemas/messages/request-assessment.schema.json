@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.plant.local/schemas/kaizenswarm/messages/request-assessment.v1.json",
+  "title": "RequestAssessment (IF-17 message)",
+  "description": "Orchestrator/Manager → one specialist, on agent.request.{agent}. Carries the run, the scope, the deadline and the budget the orchestrator will enforce (C-04 / AI-08 — the agent's cooperation is not required).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_no", "agent", "scope", "deadline_at", "budget"],
+  "properties": {
+    "run_no": { "type": "integer", "minimum": 1 },
+    "agent": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+    "scope": {
+      "type": "object",
+      "required": ["plant"],
+      "properties": {
+        "plant": { "type": ["integer", "string"] },
+        "line": { "type": ["integer", "string"] },
+        "shift": { "type": "string", "enum": ["A", "B", "C", "OT"] },
+        "date": { "type": "string", "format": "date" }
+      },
+      "additionalProperties": false
+    },
+    "deadline_at": { "type": "string", "format": "date-time", "description": "requested_at + agent_timeout (NFR-02, 60 s default); active time — lease queue time is excluded (ADR-K03)" },
+    "budget": {
+      "type": "object",
+      "required": ["tool_calls", "tokens", "wall_ms"],
+      "additionalProperties": false,
+      "properties": {
+        "tool_calls": { "type": "integer", "minimum": 1 },
+        "tokens": { "type": "integer", "minimum": 1 },
+        "wall_ms": { "type": "integer", "minimum": 1000 }
+      }
+    },
+    "question": { "type": "string", "maxLength": 500, "description": "Present for FR-21 targeted assessments" },
+    "prompt_version": { "type": "string" }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.plant.local/schemas/kaizenswarm/messages/clarification.v1.json",
+  "title": "Clarification (IF-17 message)",
+  "description": "Orchestrator/Manager → one specialist, on agent.request.{agent}. The only message the orchestrator sends after a request: a budget stop (C-04), a scope correction, or a refused deadline extension. There is no free-form agent chat (C-01).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "detail"],
+  "properties": {
+    "kind": { "type": "string", "enum": ["budget_stop", "scope", "deadline"] },
+    "detail": { "type": "string", "minLength": 3, "maxLength": 500 },
+    "scope": { "type": "object", "additionalProperties": true, "description": "For kind = scope: the corrected scope" }
+  }
+}

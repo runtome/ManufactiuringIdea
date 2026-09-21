@@ -1,0 +1,856 @@
+{
+  "run": {
+    "run_no": 411,
+    "trigger": "schedule",
+    "scope": {
+      "plant": 1,
+      "shift": "A",
+      "date": "2026-09-10"
+    },
+    "started_at": "2026-09-10T06:00:00+07:00",
+    "finished_at": "2026-09-10T06:02:14+07:00",
+    "wall_ms": 134000,
+    "status": "completed",
+    "partial_reason": null,
+    "agent_count": 4,
+    "tool_call_count": 23,
+    "token_count": 5680,
+    "weights_version": "v1"
+  },
+  "assessments": [
+    {
+      "agent": "quality",
+      "outcome": "findings",
+      "incomplete": false,
+      "finding_count": 1,
+      "tool_calls_used": 7,
+      "tokens_used": 1730,
+      "wall_ms": 52000,
+      "budget": {
+        "tool_calls": 12,
+        "tokens": 6000,
+        "wall_ms": 60000
+      },
+      "freshness_min": 5,
+      "attempt_count": 1,
+      "error": null,
+      "agent_run_id": "a2000000-0000-4000-8000-000000411001"
+    },
+    {
+      "agent": "maintenance",
+      "outcome": "findings",
+      "incomplete": false,
+      "finding_count": 1,
+      "tool_calls_used": 6,
+      "tokens_used": 1440,
+      "wall_ms": 47000,
+      "budget": {
+        "tool_calls": 12,
+        "tokens": 6000,
+        "wall_ms": 60000
+      },
+      "freshness_min": 2,
+      "attempt_count": 1,
+      "error": null,
+      "agent_run_id": "a2000000-0000-4000-8000-000000411002"
+    },
+    {
+      "agent": "production",
+      "outcome": "findings",
+      "incomplete": false,
+      "finding_count": 1,
+      "tool_calls_used": 5,
+      "tokens_used": 1290,
+      "wall_ms": 43000,
+      "budget": {
+        "tool_calls": 12,
+        "tokens": 6000,
+        "wall_ms": 60000
+      },
+      "freshness_min": 1,
+      "attempt_count": 1,
+      "error": null,
+      "agent_run_id": "a2000000-0000-4000-8000-000000411003"
+    },
+    {
+      "agent": "material",
+      "outcome": "findings",
+      "incomplete": false,
+      "finding_count": 1,
+      "tool_calls_used": 5,
+      "tokens_used": 1220,
+      "wall_ms": 42000,
+      "budget": {
+        "tool_calls": 12,
+        "tokens": 6000,
+        "wall_ms": 60000
+      },
+      "freshness_min": 360,
+      "attempt_count": 1,
+      "error": null,
+      "agent_run_id": "a2000000-0000-4000-8000-000000411004"
+    }
+  ],
+  "messages": [
+    {
+      "seq": 1,
+      "ts": "2026-09-10T06:00:01+07:00",
+      "type": "RequestAssessment",
+      "from": "orchestrator",
+      "to": "quality",
+      "subject": "agent.request.quality",
+      "payload": {
+        "run_no": 411,
+        "agent": "quality",
+        "scope": {
+          "plant": 1,
+          "shift": "A",
+          "date": "2026-09-10"
+        },
+        "deadline_at": "2026-09-10T06:01:01+07:00",
+        "budget": {
+          "tool_calls": 12,
+          "tokens": 6000,
+          "wall_ms": 60000
+        }
+      }
+    },
+    {
+      "seq": 2,
+      "ts": "2026-09-10T06:00:02+07:00",
+      "type": "StatusUpdate",
+      "from": "quality",
+      "to": "orchestrator",
+      "subject": "agent.status.quality",
+      "payload": {
+        "status": "started"
+      }
+    },
+    {
+      "seq": 3,
+      "ts": "2026-09-10T06:00:31+07:00",
+      "type": "StatusUpdate",
+      "from": "quality",
+      "to": "orchestrator",
+      "subject": "agent.status.quality",
+      "payload": {
+        "status": "tools_done",
+        "usage": {
+          "tool_calls": 7,
+          "tokens": 0,
+          "wall_ms": 28000
+        }
+      }
+    },
+    {
+      "seq": 4,
+      "ts": "2026-09-10T06:01:03+07:00",
+      "type": "Finding",
+      "from": "quality",
+      "to": "orchestrator",
+      "subject": "agent.finding.quality",
+      "payload": {
+        "agent": "quality",
+        "domain": "quality",
+        "scope": {
+          "plant": 1,
+          "line": 3,
+          "sku": "RAD-500-A",
+          "shift": "A"
+        },
+        "issue_code": "quality.defect_rate",
+        "title": "Defect rate 5.82 % on line 3 (+141 % vs 7-day)",
+        "summary": "Defect rate 5.82 % (+141 % vs 7-day baseline 2.41 %, p<0.001) on line 3, shift A; top class missing parts; signal S-241 open; affected SKU RAD-500-A, lot LOT-2609-114",
+        "severity": "HIGH",
+        "confidence": 0.85,
+        "likelihood_class": "observed",
+        "horizon": "this_shift",
+        "freshness_min": 5,
+        "evidence": [
+          {
+            "kind": "signal",
+            "ref": "signal:S-241"
+          },
+          {
+            "kind": "metric",
+            "ref": "defect_rate:line3:2026-09-10:A"
+          }
+        ],
+        "recommended_action": "Hold RAD-500-A lot LOT-2609-114 pending QE review; verify the missing-parts station on line 3",
+        "owner_suggestion": "QE",
+        "impact_estimate": {
+          "scrap_risk_pct": 5.82,
+          "affected_lines": [
+            3
+          ]
+        }
+      }
+    },
+    {
+      "seq": 5,
+      "ts": "2026-09-10T06:01:03+07:00",
+      "type": "StatusUpdate",
+      "from": "quality",
+      "to": "orchestrator",
+      "subject": "agent.status.quality",
+      "payload": {
+        "status": "done",
+        "usage": {
+          "tool_calls": 7,
+          "tokens": 1730,
+          "wall_ms": 52000
+        },
+        "freshness_min": 5
+      }
+    },
+    {
+      "seq": 6,
+      "ts": "2026-09-10T06:00:01+07:00",
+      "type": "RequestAssessment",
+      "from": "orchestrator",
+      "to": "maintenance",
+      "subject": "agent.request.maintenance",
+      "payload": {
+        "run_no": 411,
+        "agent": "maintenance",
+        "scope": {
+          "plant": 1,
+          "shift": "A",
+          "date": "2026-09-10"
+        },
+        "deadline_at": "2026-09-10T06:01:01+07:00",
+        "budget": {
+          "tool_calls": 12,
+          "tokens": 6000,
+          "wall_ms": 60000
+        }
+      }
+    },
+    {
+      "seq": 7,
+      "ts": "2026-09-10T06:00:02+07:00",
+      "type": "StatusUpdate",
+      "from": "maintenance",
+      "to": "orchestrator",
+      "subject": "agent.status.maintenance",
+      "payload": {
+        "status": "started"
+      }
+    },
+    {
+      "seq": 8,
+      "ts": "2026-09-10T06:00:29+07:00",
+      "type": "StatusUpdate",
+      "from": "maintenance",
+      "to": "orchestrator",
+      "subject": "agent.status.maintenance",
+      "payload": {
+        "status": "tools_done",
+        "usage": {
+          "tool_calls": 6,
+          "tokens": 0,
+          "wall_ms": 26000
+        }
+      }
+    },
+    {
+      "seq": 9,
+      "ts": "2026-09-10T06:01:22+07:00",
+      "type": "Finding",
+      "from": "maintenance",
+      "to": "orchestrator",
+      "subject": "agent.finding.maintenance",
+      "payload": {
+        "agent": "maintenance",
+        "domain": "machine_health",
+        "scope": {
+          "plant": 1,
+          "line": 3,
+          "machine": "M-07"
+        },
+        "issue_code": "machine.degradation",
+        "title": "Bearing temperature trending up on M-07",
+        "summary": "Press M-07 drive-side bearing temperature +13.8 % over 5 days (2026-09-05..10); alert 1184 open; health index 71",
+        "severity": "HIGH",
+        "confidence": 0.78,
+        "likelihood_class": "observed",
+        "horizon": "within_3_days",
+        "freshness_min": 2,
+        "evidence": [
+          {
+            "kind": "metric",
+            "ref": "telemetry:M-07:bearing_temp:2026-09-03..10"
+          },
+          {
+            "kind": "alert",
+            "ref": "alert:1184"
+          }
+        ],
+        "recommended_action": "Inspect M-07 drive-side bearing within 3 days",
+        "owner_suggestion": "Maintenance",
+        "impact_estimate": {
+          "downtime_risk_h": 6,
+          "affected_lines": [
+            3
+          ]
+        }
+      }
+    },
+    {
+      "seq": 10,
+      "ts": "2026-09-10T06:01:22+07:00",
+      "type": "StatusUpdate",
+      "from": "maintenance",
+      "to": "orchestrator",
+      "subject": "agent.status.maintenance",
+      "payload": {
+        "status": "done",
+        "usage": {
+          "tool_calls": 6,
+          "tokens": 1440,
+          "wall_ms": 47000
+        },
+        "freshness_min": 2
+      }
+    },
+    {
+      "seq": 11,
+      "ts": "2026-09-10T06:00:01+07:00",
+      "type": "RequestAssessment",
+      "from": "orchestrator",
+      "to": "production",
+      "subject": "agent.request.production",
+      "payload": {
+        "run_no": 411,
+        "agent": "production",
+        "scope": {
+          "plant": 1,
+          "shift": "A",
+          "date": "2026-09-10"
+        },
+        "deadline_at": "2026-09-10T06:01:01+07:00",
+        "budget": {
+          "tool_calls": 12,
+          "tokens": 6000,
+          "wall_ms": 60000
+        }
+      }
+    },
+    {
+      "seq": 12,
+      "ts": "2026-09-10T06:00:02+07:00",
+      "type": "StatusUpdate",
+      "from": "production",
+      "to": "orchestrator",
+      "subject": "agent.status.production",
+      "payload": {
+        "status": "started"
+      }
+    },
+    {
+      "seq": 13,
+      "ts": "2026-09-10T06:00:26+07:00",
+      "type": "StatusUpdate",
+      "from": "production",
+      "to": "orchestrator",
+      "subject": "agent.status.production",
+      "payload": {
+        "status": "tools_done",
+        "usage": {
+          "tool_calls": 5,
+          "tokens": 0,
+          "wall_ms": 23000
+        }
+      }
+    },
+    {
+      "seq": 14,
+      "ts": "2026-09-10T06:01:40+07:00",
+      "type": "Finding",
+      "from": "production",
+      "to": "orchestrator",
+      "subject": "agent.finding.production",
+      "payload": {
+        "agent": "production",
+        "domain": "production",
+        "scope": {
+          "plant": 1,
+          "line": 1
+        },
+        "issue_code": "production.performance_loss",
+        "title": "OEE performance loss on Line 1",
+        "summary": "Performance 78 % vs 91 % baseline; micro-stops up 3× since 09-08 (changeover and unload station)",
+        "severity": "MEDIUM",
+        "confidence": 0.96,
+        "likelihood_class": "observed",
+        "horizon": "today",
+        "freshness_min": 1,
+        "evidence": [
+          {
+            "kind": "oee",
+            "ref": "oee:line1:2026-09-08..10"
+          },
+          {
+            "kind": "downtime",
+            "ref": "downtime:line1:2026-09-08..10"
+          }
+        ],
+        "recommended_action": "Observe changeover and unload station on Line 1",
+        "owner_suggestion": "Production",
+        "impact_estimate": {
+          "output_loss_pct": 13,
+          "affected_lines": [
+            1
+          ]
+        }
+      }
+    },
+    {
+      "seq": 15,
+      "ts": "2026-09-10T06:01:40+07:00",
+      "type": "StatusUpdate",
+      "from": "production",
+      "to": "orchestrator",
+      "subject": "agent.status.production",
+      "payload": {
+        "status": "done",
+        "usage": {
+          "tool_calls": 5,
+          "tokens": 1290,
+          "wall_ms": 43000
+        },
+        "freshness_min": 1
+      }
+    },
+    {
+      "seq": 16,
+      "ts": "2026-09-10T06:00:01+07:00",
+      "type": "RequestAssessment",
+      "from": "orchestrator",
+      "to": "material",
+      "subject": "agent.request.material",
+      "payload": {
+        "run_no": 411,
+        "agent": "material",
+        "scope": {
+          "plant": 1,
+          "shift": "A",
+          "date": "2026-09-10"
+        },
+        "deadline_at": "2026-09-10T06:01:01+07:00",
+        "budget": {
+          "tool_calls": 12,
+          "tokens": 6000,
+          "wall_ms": 60000
+        }
+      }
+    },
+    {
+      "seq": 17,
+      "ts": "2026-09-10T06:00:02+07:00",
+      "type": "StatusUpdate",
+      "from": "material",
+      "to": "orchestrator",
+      "subject": "agent.status.material",
+      "payload": {
+        "status": "started"
+      }
+    },
+    {
+      "seq": 18,
+      "ts": "2026-09-10T06:00:25+07:00",
+      "type": "StatusUpdate",
+      "from": "material",
+      "to": "orchestrator",
+      "subject": "agent.status.material",
+      "payload": {
+        "status": "tools_done",
+        "usage": {
+          "tool_calls": 5,
+          "tokens": 0,
+          "wall_ms": 22000
+        }
+      }
+    },
+    {
+      "seq": 19,
+      "ts": "2026-09-10T06:01:58+07:00",
+      "type": "Finding",
+      "from": "material",
+      "to": "orchestrator",
+      "subject": "agent.finding.material",
+      "payload": {
+        "agent": "material",
+        "domain": "material",
+        "scope": {
+          "plant": 1,
+          "sku": "RAD-500-A"
+        },
+        "issue_code": "material.shortage",
+        "title": "Coverage risk for SKU RAD-500-A",
+        "summary": "Stock coverage 1.4 days against the 3-day schedule; incoming delivery PO-2026-004821 confirmed only for 2026-09-14",
+        "severity": "HIGH",
+        "confidence": 0.89,
+        "likelihood_class": "observed",
+        "horizon": "this_shift",
+        "freshness_min": 360,
+        "evidence": [
+          {
+            "kind": "stock",
+            "ref": "stock:RAD-500-A"
+          },
+          {
+            "kind": "po",
+            "ref": "po:PO-2026-004821"
+          }
+        ],
+        "recommended_action": "Confirm supplier ETA today or re-sequence the schedule",
+        "owner_suggestion": "Purchasing",
+        "impact_estimate": {
+          "schedule_risk_days": 1.6,
+          "affected_lines": [
+            3
+          ]
+        }
+      }
+    },
+    {
+      "seq": 20,
+      "ts": "2026-09-10T06:01:58+07:00",
+      "type": "StatusUpdate",
+      "from": "material",
+      "to": "orchestrator",
+      "subject": "agent.status.material",
+      "payload": {
+        "status": "done",
+        "usage": {
+          "tool_calls": 5,
+          "tokens": 1220,
+          "wall_ms": 42000
+        },
+        "freshness_min": 360
+      }
+    }
+  ],
+  "tool_calls": [
+    {
+      "agent": "quality",
+      "ordinal": 1,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 5,
+      "duration_ms": 690,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "quality",
+      "ordinal": 2,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 10,
+      "duration_ms": 780,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "quality",
+      "ordinal": 3,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 15,
+      "duration_ms": 870,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "quality",
+      "ordinal": 4,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 20,
+      "duration_ms": 960,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "quality",
+      "ordinal": 5,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 25,
+      "duration_ms": 1050,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "quality",
+      "ordinal": 6,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 30,
+      "duration_ms": 1140,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "quality",
+      "ordinal": 7,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 35,
+      "duration_ms": 1230,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "maintenance",
+      "ordinal": 1,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 5,
+      "duration_ms": 690,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "maintenance",
+      "ordinal": 2,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 10,
+      "duration_ms": 780,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "maintenance",
+      "ordinal": 3,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 15,
+      "duration_ms": 870,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "maintenance",
+      "ordinal": 4,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 20,
+      "duration_ms": 960,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "maintenance",
+      "ordinal": 5,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 25,
+      "duration_ms": 1050,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "maintenance",
+      "ordinal": 6,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 30,
+      "duration_ms": 1140,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "production",
+      "ordinal": 1,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 5,
+      "duration_ms": 690,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "production",
+      "ordinal": 2,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 10,
+      "duration_ms": 780,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "production",
+      "ordinal": 3,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 15,
+      "duration_ms": 870,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "production",
+      "ordinal": 4,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 20,
+      "duration_ms": 960,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "production",
+      "ordinal": 5,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 25,
+      "duration_ms": 1050,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "material",
+      "ordinal": 1,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 5,
+      "duration_ms": 690,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "material",
+      "ordinal": 2,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 10,
+      "duration_ms": 780,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "material",
+      "ordinal": 3,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 15,
+      "duration_ms": 870,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "material",
+      "ordinal": 4,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 20,
+      "duration_ms": 960,
+      "ok": true,
+      "error": null
+    },
+    {
+      "agent": "material",
+      "ordinal": 5,
+      "tool": "(see agent.tool_call)",
+      "args": {},
+      "result_digest": null,
+      "row_count": 25,
+      "duration_ms": 1050,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "leases": [
+    {
+      "agent": "quality",
+      "model": "qwen2.5:7b-instruct-q4_K_M",
+      "acquired_at": "2026-09-10T06:00:41+07:00",
+      "released_at": "2026-09-10T06:01:03+07:00",
+      "tokens_in": null,
+      "tokens_out": null
+    },
+    {
+      "agent": "maintenance",
+      "model": "qwen2.5:7b-instruct-q4_K_M",
+      "acquired_at": "2026-09-10T06:01:03+07:00",
+      "released_at": "2026-09-10T06:01:22+07:00",
+      "tokens_in": null,
+      "tokens_out": null
+    },
+    {
+      "agent": "production",
+      "model": "qwen2.5:7b-instruct-q4_K_M",
+      "acquired_at": "2026-09-10T06:01:22+07:00",
+      "released_at": "2026-09-10T06:01:40+07:00",
+      "tokens_in": null,
+      "tokens_out": null
+    },
+    {
+      "agent": "material",
+      "model": "qwen2.5:7b-instruct-q4_K_M",
+      "acquired_at": "2026-09-10T06:01:40+07:00",
+      "released_at": "2026-09-10T06:01:58+07:00",
+      "tokens_in": null,
+      "tokens_out": null
+    }
+  ],
+  "attempts": [],
+  "ranking": [
+    {
+      "rank": 1,
+      "kind": "compound",
+      "score": 0.8397,
+      "title": "Line 3 — compound risk: quality + maintenance",
+      "finding_ids": [
+        "quality.defect_rate|line=3,plant=1",
+        "machine.degradation|machine=M-07,plant=1"
+      ]
+    },
+    {
+      "rank": 2,
+      "kind": "finding",
+      "score": 0.712,
+      "title": "Coverage risk for SKU RAD-500-A",
+      "finding_ids": [
+        "material.shortage|plant=1,sku=RAD-500-A"
+      ]
+    },
+    {
+      "rank": 3,
+      "kind": "finding",
+      "score": 0.5184,
+      "title": "OEE performance loss on Line 1",
+      "finding_ids": [
+        "production.performance_loss|line=1,plant=1"
+      ]
+    }
+  ],
+  "message_log_sha256": "9153967a44cc65efe99852663c4ecf92e6b6c050362c472d3530a0c0a639d636"
+}

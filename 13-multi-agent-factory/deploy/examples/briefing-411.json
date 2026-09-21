@@ -1,0 +1,65 @@
+{
+  "id": "a3000000-0000-4000-8000-000000411001",
+  "generated_at": "2026-09-10T06:02:15+07:00",
+  "lang": "en",
+  "partial": false,
+  "partial_reason": null,
+  "data_freshness": {
+    "quality": "5 min",
+    "maintenance": "2 min",
+    "production": "1 min",
+    "material": "6 h ⚠"
+  },
+  "top_risks": [
+    {
+      "rank": 1,
+      "score": 0.84,
+      "severity": "HIGH",
+      "title": "Line 3 — compound risk: quality + maintenance",
+      "summary": "Defect rate 5.82 % (+141 % vs 7-day, p<0.001) AND press M-07 bearing temperature +13.8 % over 5 days. Both concentrated on the same line/shift.",
+      "finding_ids": [
+        "<uuid quality S-241>",
+        "<uuid maintenance M-07>"
+      ],
+      "recommended_action": "Inspect M-07 drive-side bearing today; hold RAD-500-A lot LOT-2609-114.",
+      "owner": "Maintenance + QE",
+      "evidence": "signal:S-241 · alert:1184"
+    },
+    {
+      "rank": 2,
+      "score": 0.71,
+      "severity": "HIGH",
+      "title": "Coverage risk for SKU RAD-500-A",
+      "summary": "Stock coverage 1.4 days against the 3-day schedule; incoming delivery confirmed only for 2026-09-14.",
+      "finding_ids": [
+        "<uuid material RAD-500-A>"
+      ],
+      "recommended_action": "Confirm supplier ETA today or re-sequence the schedule.",
+      "owner": "Purchasing",
+      "evidence": "stock:RAD-500-A · po:PO-2026-004821"
+    },
+    {
+      "rank": 3,
+      "score": 0.52,
+      "severity": "MEDIUM",
+      "title": "OEE performance loss on Line 1",
+      "summary": "Performance 78 % vs 91 % baseline; micro-stops up 3× since 09-08.",
+      "finding_ids": [
+        "<uuid production line 1>"
+      ],
+      "recommended_action": "Observe changeover and unload station on Line 1.",
+      "owner": "Production",
+      "evidence": "oee:line1:2026-09-08..10"
+    }
+  ],
+  "text": "🏭 Shift briefing — 2026-09-10 · Shift A · Plant 1\nData freshness: quality 5 min · maintenance 2 min · production 1 min · material 6 h ⚠\n\nTOP 3 RISKS\n\n1. [HIGH 0.84] Line 3 — compound risk: quality + maintenance\n   Defect rate 5.82 % (+141 % vs 7-day, p<0.001) AND press M-07 bearing\n   temperature +13.8 % over 5 days. Both concentrated on the same line/shift.\n   → Inspect M-07 drive-side bearing today; hold RAD-500-A lot LOT-2609-114.\n   Evidence: signal S-241 · alert 1184        Owner: Maintenance + QE\n\n2. [HIGH 0.71] Material — coverage risk for SKU RAD-500-A\n   Stock coverage 1.4 days against the 3-day schedule; incoming delivery\n   confirmed only for 2026-09-14.\n   → Confirm supplier ETA today or re-sequence the schedule.\n   Evidence: stock:RAD-500-A · po:PO-2026-004821       Owner: Purchasing\n\n3. [MEDIUM 0.52] Production — OEE performance loss on Line 1\n   Performance 78 % vs 91 % baseline; micro-stops up 3× since 09-08.\n   → Observe changeover and unload station on Line 1.\n   Evidence: oee:line1:2026-09-08..10                  Owner: Production\n\nNothing significant reported by: (none — all domains reported)\nPartial: no. Run 411 · 2 min 14 s · 4 agents · 23 tool calls.",
+  "claim_check": {
+    "checked": 31,
+    "matched": 31,
+    "unmatched": []
+  },
+  "run_no": 411,
+  "wall": "2 min 14 s",
+  "agents": 4,
+  "tool_calls": 23
+}

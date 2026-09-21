@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.plant.local/schemas/kaizenswarm/messages/finding.v1.json",
+  "title": "Finding (IF-17 message · IF-69 blackboard contract · SRS-13 §5 shared schema)",
+  "description": "A specialist's evidence-backed observation. Published on agent.finding.{agent}; persisted by the orchestrator through swarm.upsert_finding(). Every number in title/summary must come from a tool result (AI-01); the database refuses a Finding without evidence (C-02), from a non-specialist (FR-22) or outside the agent's domain (FR-14).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["agent", "domain", "scope", "title", "severity", "confidence", "evidence", "recommended_action", "issue_code", "likelihood_class", "horizon", "freshness_min"],
+  "properties": {
+    "agent": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$", "not": { "const": "manager" }, "description": "The registered specialist that produced it (FR-22: never the manager)" },
+    "domain": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,63}$", "description": "One of the agent's registered domains (FR-14)" },
+    "scope": {
+      "type": "object",
+      "description": "Where the issue is. plant is mandatory; line/machine/sku/lot identify the issue family (IF-69 §3); shift is informational and never enters the issue key",
+      "required": ["plant"],
+      "properties": {
+        "plant": { "type": ["integer", "string"] },
+        "line": { "type": ["integer", "string"] },
+        "machine": { "type": "string", "pattern": "^[A-Z]-[0-9]{2,4}$" },
+        "sku": { "type": "string", "minLength": 2 },
+        "lot": { "type": "string", "minLength": 2 },
+        "shift": { "type": "string", "enum": ["A", "B", "C", "OT"] }
+      },
+      "additionalProperties": false
+    },
+    "issue_code": { "type": "string", "pattern": "^[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*$", "description": "family.kind — machine.degradation, quality.defect_rate, material.shortage, lot.quality_history, production.performance_loss … (IF-69 §3)" },
+    "title": { "type": "string", "minLength": 8, "maxLength": 160 },
+    "summary": { "type": "string", "maxLength": 1000, "description": "Facts from tool results, with their numbers; the briefing may quote only what is here or in evidence (AC-07)" },
+    "severity": { "type": "string", "enum": ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"] },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "The agent's own confidence, already discounted for stale data (AI-07)" },
+    "likelihood_class": { "type": "string", "enum": ["observed", "trend", "forecast", "possible"], "description": "Scoring factor (IF-70): observed = the condition exists now" },
+    "horizon": { "type": "string", "enum": ["this_shift", "today", "within_3_days", "this_week", "later"], "description": "Scoring factor (IF-70): when the impact lands" },
+    "freshness_min": { "type": "number", "minimum": 0, "description": "Age of the newest data the finding relies on, in minutes (AI-07); > 60 is flagged in the briefing" },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["kind", "ref"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "type": "string", "enum": ["metric", "alert", "signal", "case", "oee", "downtime", "stock", "po", "lot", "schedule", "pm", "health"] },
+          "ref": { "type": "string", "minLength": 3, "maxLength": 200, "description": "A resolvable reference: telemetry:M-07:bearing_temp:2026-09-03..10, alert:1184, signal:S-241, oee:line1:2026-09-08..10, stock:RAD-500-A, po:PO-2026-004821" }
+        }
+      }
+    },
+    "recommended_action": { "type": "string", "minLength": 5, "maxLength": 300, "description": "A recommendation for a human — agents never act (C-03)" },
+    "owner_suggestion": { "type": "string", "maxLength": 60 },
+    "impact_estimate": { "type": "object", "additionalProperties": true, "description": "e.g. {downtime_risk_h, affected_lines[]} — numbers here may be quoted in the briefing" }
+  }
+}

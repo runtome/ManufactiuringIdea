@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.plant.local/schemas/kaizenswarm/messages/status-update.v1.json",
+  "title": "StatusUpdate (IF-17 message)",
+  "description": "Specialist → orchestrator, on agent.status.{agent}. Progress and usage; nothing_significant is the explicit 'nothing in my domain' outcome (FR-13) and must say what was checked.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status"],
+  "properties": {
+    "status": { "type": "string", "enum": ["started", "tools_done", "phrasing", "done", "nothing_significant"] },
+    "usage": {
+      "type": "object",
+      "required": ["tool_calls", "tokens", "wall_ms"],
+      "additionalProperties": false,
+      "properties": {
+        "tool_calls": { "type": "integer", "minimum": 0 },
+        "tokens": { "type": "integer", "minimum": 0 },
+        "wall_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "freshness_min": { "type": "number", "minimum": 0 },
+    "checked": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 3 }, "description": "What the agent looked at before concluding nothing_significant" }
+  },
+  "allOf": [
+    { "if": { "properties": { "status": { "enum": ["done", "nothing_significant"] } }, "required": ["status"] }, "then": { "required": ["usage"] } },
+    { "if": { "properties": { "status": { "const": "nothing_significant" } }, "required": ["status"] }, "then": { "required": ["checked"] } }
+  ]
+}
