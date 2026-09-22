@@ -1545,10 +1545,10 @@ BEGIN
                                         'finding_ids', to_jsonb(finding_ids)) ORDER BY rank)
       INTO v_out FROM ranked;
     UPDATE swarm.compound_risk c SET rank = x.rank
-      FROM (SELECT (e ->> 'id')::uuid AS id, (e ->> 'rank')::smallint AS rank FROM jsonb_array_elements(v_out) e WHERE e ->> 'kind' = 'compound') x
+      FROM (SELECT (e.value ->> 'id')::uuid AS id, (e.value ->> 'rank')::smallint AS rank FROM jsonb_array_elements(v_out) e WHERE e.value ->> 'kind' = 'compound') x
      WHERE c.id = x.id AND c.run_id = p_run_id;
     UPDATE swarm.risk_score rs SET rank = x.rank
-      FROM (SELECT (e ->> 'id')::uuid AS id, (e ->> 'rank')::smallint AS rank FROM jsonb_array_elements(v_out) e WHERE e ->> 'kind' = 'finding') x
+      FROM (SELECT (e.value ->> 'id')::uuid AS id, (e.value ->> 'rank')::smallint AS rank FROM jsonb_array_elements(v_out) e WHERE e.value ->> 'kind' = 'finding') x
      WHERE rs.finding_id = x.id AND rs.run_id = p_run_id;
     RETURN COALESCE(v_out, '[]'::jsonb);
 END;
@@ -1641,9 +1641,9 @@ BEGIN
     SELECT * INTO sc FROM swarm.scenario WHERE id = p_scenario_id;
     SELECT * INTO sr FROM swarm.suite_run WHERE id = p_suite_run_id;
     ranking := swarm.rank_findings(sc.findings_json, sr.weights_version);
-    SELECT COALESCE(array_agg(e ->> 'id' ORDER BY (e ->> 'rank')::int), '{}') INTO computed
-      FROM jsonb_array_elements(ranking) e WHERE (e ->> 'rank')::int <= top_n;
-    SELECT COALESCE(array_agg(e #>> '{}'), '{}') INTO expected FROM jsonb_array_elements(sc.expected_top_json) e;
+    SELECT COALESCE(array_agg(e.value ->> 'id' ORDER BY (e.value ->> 'rank')::int), '{}') INTO computed
+      FROM jsonb_array_elements(ranking) e WHERE (e.value ->> 'rank')::int <= top_n;
+    SELECT COALESCE(array_agg(e.value #>> '{}'), '{}') INTO expected FROM jsonb_array_elements(sc.expected_top_json) e;
     matched := (SELECT COALESCE(array_agg(x ORDER BY x), '{}') FROM unnest(computed) x)
              = (SELECT COALESCE(array_agg(x ORDER BY x), '{}') FROM unnest(expected) x);
     INSERT INTO swarm.scenario_result (suite_run_id, scenario_id, computed_top_json, ranking_json, top3_match, fabricated_count)
@@ -1815,12 +1815,12 @@ LANGUAGE sql STABLE AS $$
     WITH items AS (
         SELECT c.rank, c.score, 'compound' AS kind, c.id, c.title, c.recommended_action, c.owner_suggestion,
                c.finding_ids, (SELECT f.severity FROM agent.finding f WHERE f.id = ANY (c.finding_ids) ORDER BY f.severity DESC LIMIT 1) AS severity,
-               (SELECT string_agg(e ->> 'ref', ' · ' ORDER BY e ->> 'ref') FROM agent.finding f, jsonb_array_elements(f.evidence_json) e
+               (SELECT string_agg(e.value ->> 'ref', ' · ' ORDER BY e.value ->> 'ref') FROM agent.finding f, jsonb_array_elements(f.evidence_json) e
                  WHERE f.id = ANY (c.finding_ids)) AS evidence
           FROM swarm.compound_risk c WHERE c.run_id = p_run_id
         UNION ALL
         SELECT rs.rank, rs.score, 'finding', f.id, f.title, f.recommended_action, fe.owner_suggestion, ARRAY[f.id], f.severity,
-               (SELECT string_agg(e ->> 'ref', ' · ' ORDER BY e ->> 'ref') FROM jsonb_array_elements(f.evidence_json) e)
+               (SELECT string_agg(e.value ->> 'ref', ' · ' ORDER BY e.value ->> 'ref') FROM jsonb_array_elements(f.evidence_json) e)
           FROM swarm.risk_score rs JOIN agent.finding f ON f.id = rs.finding_id JOIN swarm.finding_ext fe ON fe.finding_id = f.id
          WHERE rs.run_id = p_run_id AND rs.absorbed_by IS NULL)
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
@@ -2241,8 +2241,8 @@ BEGIN
     SELECT * INTO r FROM swarm.run WHERE id = NEW.run_id;
     IF r.status NOT IN ('completed', 'partial') THEN RAISE EXCEPTION 'BRIEFING_RUN_STATUS: run % is %', r.run_no, r.status; END IF;
     -- every finding the briefing cites must belong to this run
-    SELECT COALESCE(array_agg(DISTINCT (x #>> '{}')::uuid), '{}') INTO ids
-      FROM jsonb_array_elements(b.top_risks_json) t, jsonb_array_elements(t -> 'finding_ids') x;
+    SELECT COALESCE(array_agg(DISTINCT (x.value #>> '{}')::uuid), '{}') INTO ids
+      FROM jsonb_array_elements(b.top_risks_json) t, jsonb_array_elements(t.value -> 'finding_ids') x;
     IF EXISTS (SELECT 1 FROM unnest(ids) i WHERE NOT EXISTS (SELECT 1 FROM swarm.risk_score rs WHERE rs.run_id = NEW.run_id AND rs.finding_id = i)) THEN
         RAISE EXCEPTION 'BRIEFING_FOREIGN_FINDING: a cited finding was not scored in run %', r.run_no;
     END IF;

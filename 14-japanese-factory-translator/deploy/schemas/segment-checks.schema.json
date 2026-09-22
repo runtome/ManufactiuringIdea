@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.plant.local/schemas/genbago/segment-checks.v1.json",
+  "title": "Segment check object (IF-74 · SRS-14 FR-28, AI-04, C-01, C-02, C-04)",
+  "description": "The checks_json stored on every segment by genba.run_checks(). blocking.numbers refuses approval (C-02); the flags need resolution or a reviewer note (C-01, C-04). Produced by the database; the API returns it verbatim.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["blocking", "flags", "blocked", "flagged", "clean"],
+  "properties": {
+    "blocking": {
+      "type": "object",
+      "required": ["numbers"],
+      "additionalProperties": false,
+      "properties": {
+        "numbers": {
+          "type": "object",
+          "required": ["ok", "source", "missing", "extra"],
+          "additionalProperties": false,
+          "properties": {
+            "ok": { "type": "boolean" },
+            "source": { "type": "array", "items": { "type": "string" }, "description": "canonical tokens of the source: numbers with sign/tolerance/unit, codes, lots, dates" },
+            "missing": { "type": "array", "items": { "type": "string" } },
+            "extra": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    },
+    "flags": {
+      "type": "object",
+      "required": ["glossary", "forbidden", "length_ratio", "untranslated", "omission"],
+      "additionalProperties": false,
+      "properties": {
+        "glossary": { "type": "object", "required": ["ok", "missing", "applied"], "additionalProperties": false,
+                      "properties": { "ok": { "type": "boolean" }, "missing": { "type": "array", "items": { "type": "string" } }, "applied": { "type": "array", "items": { "type": "string" } } } },
+        "forbidden": { "type": "object", "required": ["ok", "hits"], "additionalProperties": false,
+                       "properties": { "ok": { "type": "boolean" }, "hits": { "type": "array", "items": { "type": "object", "required": ["term", "rendering", "mandated"], "additionalProperties": false,
+                                       "properties": { "term": { "type": "string" }, "rendering": { "type": "string" }, "mandated": { "type": "string" } } } } } },
+        "length_ratio": { "type": "object", "required": ["ok", "ratio"], "additionalProperties": false,
+                          "properties": { "ok": { "type": "boolean" }, "ratio": { "type": ["number", "null"] }, "min": { "type": ["number", "null"] }, "max": { "type": ["number", "null"] } } },
+        "untranslated": { "type": "object", "required": ["ok"], "additionalProperties": false, "properties": { "ok": { "type": "boolean" } } },
+        "omission": { "type": "object", "required": ["ok", "src_sentences", "tgt_sentences"], "additionalProperties": false,
+                      "properties": { "ok": { "type": "boolean" }, "src_sentences": { "type": "integer", "minimum": 1 }, "tgt_sentences": { "type": "integer", "minimum": 1 } } }
+      }
+    },
+    "blocked": { "type": "boolean" },
+    "flagged": { "type": "boolean" },
+    "clean": { "type": "boolean" }
+  },
+  "allOf": [
+    { "if": { "properties": { "blocked": { "const": true } } }, "then": { "properties": { "clean": { "const": false }, "blocking": { "properties": { "numbers": { "properties": { "ok": { "const": false } } } } } } } },
+    { "if": { "properties": { "clean": { "const": true } } }, "then": { "properties": { "blocked": { "const": false }, "flagged": { "const": false } } } }
+  ]
+}

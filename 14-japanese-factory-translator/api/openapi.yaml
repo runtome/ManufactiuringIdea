@@ -1,0 +1,1930 @@
+openapi: 3.1.0
+info:
+  title: GenbaGo API
+  version: 1.0.0
+  summary: Japanese ⇄ Thai ⇄ English translation for the shop floor — memory first, glossary enforced, numbers preserved or blocked, and a separate, labelled interpretation of what the sentence is about.
+  description: |
+    **Scope.** The GenbaGo API — standalone, and the `knowledge.tm_*` module of FactoryBrain in platform mode.
+    SRS-14 §4.1's eight paths are kept verbatim under `/api/v1` (`/translate`, `/translate/document`, `/jobs/{id}`, `/ocr`,
+    `/glossary`, `/tm/search`, `/segments/{id}/approve`). The platform's `/knowledge/translate` and its components
+    (`TranslationResult`, `Language`, `Problem`, the standard parameters and error responses) are copied byte-for-byte from
+    API-00 and diffed by TEST-14 TC-008; in platform mode it is served by the gateway.
+
+    **Six contracts (API-Specification.md §3–§8):**
+    - **Translation** — memory first (an exact match is reused verbatim), glossary applied and verified, checks computed by
+      the database, and a two-part response: the translation and, separately, an `interpretation` that is always labelled
+      `inferred: true`.
+    - **Checks** — `blocking.numbers` (numbers, units, tolerances, codes, lots, dates must be identical) refuses approval;
+      glossary, forbidden renderings, length ratio, untranslated script and omissions are flags that need a resolution or a
+      reviewer note.
+    - **Interpretation** — process, message type, entities, curated items to check, documents that exist in the index;
+      below the ambiguity threshold the response lists readings instead of asserting.
+    - **Review & memory** — translators edit (every edit carries its distance), reviewers approve, approval writes the
+      memory; the glossary changes only through admins, with versions.
+    - **Documents, OCR, batch** — layout-preserving jobs, Japanese vertical OCR with a handwriting flag, resumable batches.
+    - **Glossary & memory management** — versions, aliases, mined candidates, usage, consistency, TBX/TMX/CSV exchange.
+
+    Errors are RFC 7807 `application/problem+json` with a stable `code`. Confidential is the default: a job never leaves
+    the LAN unless it is explicitly marked otherwise.
+  contact: { name: Suphot N. }
+  license: { name: Proprietary }
+  x-document-id: API-14-GenbaGo
+
+servers:
+  - url: https://genbago.plant.local/api/v1
+    description: Standalone
+  - url: https://factorybrain.plant.local/api/v1
+    description: Platform mode (the platform's /knowledge/translate is served by the gateway; the rest under /genba/)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - { name: translate, description: "SRS §4.1 /translate, /translate/document, /ocr — text, document, image and batch jobs (FR-01…FR-08, FR-16…FR-20)" }
+  - { name: jobs, description: "SRS §4.1 /jobs/{id} — status, segments, results, resume (FR-20, NFR-07)" }
+  - { name: segments, description: "Segment review — checks, edits, readiness, interpretation, readings, matches, render (FR-27…FR-29)" }
+  - { name: review, description: "SRS §4.1 /segments/{id}/approve and the review queue (FR-24, FR-30)" }
+  - { name: glossary, description: "SRS §4.1 /glossary — terms, versions, aliases, candidates, usage, consistency, exchange (FR-21…FR-26, NFR-08)" }
+  - { name: tm, description: "SRS §4.1 /tm/search — memory lookup, import/export, stats (FR-03, FR-24, FR-25, NFR-03)" }
+  - { name: tools, description: "IF-16 as provider — glossary_lookup, term_check for 10 Copilot and 09 QE-Agent" }
+  - { name: evaluation, description: "Test sets and evaluation runs — the release gate (AI-02, AI-03, AI-05, AI-08)" }
+  - { name: knowledge, description: "Platform path (API-00, verbatim)" }
+  - { name: admin, description: "Roles, configuration, dashboard" }
+  - { name: system, description: "Health, readiness, metrics" }
+
+paths:
+  # ---------------------------------------------------------------- SRS-14 §4.1 — verbatim paths
+  /translate:
+    post:
+      tags: [translate]
+      operationId: translateText
+      summary: "Text translation + interpretation (SRS §4.1; FR-01…FR-08, FR-09…FR-15)"
+      description: |
+        Segments the text, looks the memory up (an exact match is reused verbatim, no model call), translates under
+        glossary constraints, runs the checks, and — unless `interpret: false` — builds the interpretation. Synchronous for
+        ≤ 2,000 characters (NFR-01); longer texts return `202` with a job. The response keeps the translation and the
+        interpretation apart (C-05).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TranslateRequest'
+      responses:
+        '200':
+          description: Translation with checks and a separate interpretation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TranslateResponse'
+        '202':
+          description: Long text — accepted as a job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /translate/document:
+    post:
+      tags: [translate]
+      operationId: translateDocument
+      summary: "Document translation job — DOCX / XLSX / PPTX / PDF, layout preserved (SRS §4.1; FR-16, FR-17)"
+      description: "The file must already be in the local object store (s3://…, IF-10). Confidential by default; a confidential job cannot use a non-local provider (C-03)."
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobRequest'
+      responses:
+        '202':
+          description: Job accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '409': { description: "CONFIDENTIAL_LOCAL — a confidential job cannot use a non-local provider or the Discord channel", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /jobs/{id}:
+    get:
+      tags: [jobs]
+      operationId: getJob
+      summary: "Job status / result (SRS §4.1; FR-20, NFR-07)"
+      parameters:
+        - { name: id, in: path, required: true, description: "Job id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /ocr:
+    post:
+      tags: [translate]
+      operationId: ocrImage
+      summary: "Image → text, Japanese-aware (SRS §4.1; FR-18, FR-19, AI-06)"
+      description: "Vertical and horizontal regions, character confidence, handwriting flagged low-confidence (IF-76). With translate = true the regions become segments of an OCR job."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OcrRequest'
+      responses:
+        '200':
+          description: OCR result (IF-76)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OcrResult'
+        '202':
+          description: OCR + translation job accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /glossary:
+    get:
+      tags: [glossary]
+      operationId: searchGlossary
+      summary: "Glossary lookup (SRS §4.1; FR-21, FR-22)"
+      description: Matches the term in any language, its reading and its aliases; returns the current version with forbidden renderings.
+      parameters:
+        - { name: q, in: query, description: "Term, reading, alias or substring", schema: { type: string } }
+        - { name: lang, in: query, description: "ja | th | en — restrict the field searched", schema: { type: string } }
+        - { name: domain, in: query, description: "parameter | metric | defect | document | process | action | material | general", schema: { type: string } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/GlossaryTerm' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [glossary, admin]
+      operationId: upsertGlossaryTerm
+      summary: "Add or update a term — admin only, versioned (SRS §4.1; FR-21, FR-30, NFR-08)"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GlossaryTermInput'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GlossaryTerm'
+        '200':
+          description: Updated (new version)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GlossaryTerm'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: "FORBIDDEN_IS_MANDATED — a forbidden rendering equals the mandated one; GLOSSARY_APPROVER — approver is not an admin", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /tm/search:
+    post:
+      tags: [tm]
+      operationId: searchTm
+      summary: "Fuzzy TM search (SRS §4.1; FR-03, AI-07, NFR-03)"
+      description: Exact match first (by normalised hash) and alone; otherwise candidates ≥ 0.85 by trigram (reference score) and by vector cosine, each with a diff against the query.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TmSearchRequest'
+      responses:
+        '200':
+          description: Candidates, best first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TmMatch' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /segments/{id}/approve:
+    post:
+      tags: [review]
+      operationId: approveSegment
+      summary: "Approve and store to TM (SRS §4.1; FR-24, FR-30, AC-07)"
+      description: |
+        Reviewer or admin only. Refused while `blocking.numbers` fails (`409 SEGMENT_BLOCKED`) or a flag is unresolved without a
+        note (`409 SEGMENT_FLAGGED`). On success the segment is written to `knowledge.tm_segment` once and linked.
+      parameters:
+        - { name: id, in: path, required: true, description: "Segment id", schema: { type: string, format: uuid } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApproveRequest'
+      responses:
+        '200':
+          description: Approved; tm_written_id set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Segment'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "SEGMENT_BLOCKED · SEGMENT_FLAGGED · APPROVER_ROLE · TM_CONFLICT · SEGMENT_APPROVED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  # ---------------------------------------------------------------- Platform path (API-00, verbatim)
+  /knowledge/translate:
+    post:
+      tags: [knowledge]
+      summary: Translate manufacturing text with structured interpretation
+      description: |
+        Returns the translation and, separately, an **inferred** interpretation
+        (process, message type, entities, items to check). The two are never
+        merged: users must be able to tell what was said from what the system
+        inferred.
+      operationId: translate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text, target_lang]
+              properties:
+                text: { type: string }
+                source_lang:
+                  $ref: '#/components/schemas/Language'
+                target_lang:
+                  $ref: '#/components/schemas/Language'
+                register:
+                  type: string
+                  enum: [report, shopfloor, customer]
+                  default: report
+      responses:
+        '200':
+          description: Translation with interpretation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TranslationResult'
+  # ---------------------------------------------------------------- Jobs
+  /jobs:
+    get:
+      tags: [jobs]
+      operationId: listJobs
+      summary: Jobs, newest first (the caller's own unless reviewer/admin)
+      parameters:
+        - { name: status, in: query, description: "queued | running | done | failed | cancelled", schema: { type: string } }
+        - { name: kind, in: query, description: "text | document | ocr | hmi | batch", schema: { type: string } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Job' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /jobs/{id}/segments:
+    get:
+      tags: [jobs, segments]
+      operationId: listJobSegments
+      summary: The segments of a job with checks, TM score and status (FR-27)
+      parameters:
+        - { name: id, in: path, required: true, description: "Job id", schema: { type: string, format: uuid } }
+        - { name: status, in: query, description: "machine | blocked | flagged | edited | needs_review | approved", schema: { type: string } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Segment' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /jobs/{id}/result:
+    get:
+      tags: [jobs]
+      operationId: getJobResult
+      summary: The translated document / side-by-side PDF / batch report (FR-16, FR-17, FR-20)
+      parameters:
+        - { name: id, in: path, required: true, description: "Job id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResult'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "JOB_NOT_DONE", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /jobs/{id}/files:
+    get:
+      tags: [jobs]
+      operationId: listJobFiles
+      summary: Batch items with their status and error (FR-20)
+      parameters:
+        - { name: id, in: path, required: true, description: "Job id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Files
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/JobFile' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /jobs/{id}/resume:
+    post:
+      tags: [jobs]
+      operationId: resumeJob
+      summary: Resume a failed job at the first unfinished item (NFR-07)
+      parameters:
+        - { name: id, in: path, required: true, description: "Job id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "JOB_NOT_FAILED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /jobs/{id}/cancel:
+    post:
+      tags: [jobs]
+      operationId: cancelJob
+      summary: Cancel a queued or running job
+      parameters:
+        - { name: id, in: path, required: true, description: "Job id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "JOB_FINISHED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /translate/batch:
+    post:
+      tags: [translate]
+      operationId: translateBatch
+      summary: Batch-translate a folder of documents with a progress and error report (FR-20)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobRequest'
+      responses:
+        '202':
+          description: Batch accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  # ---------------------------------------------------------------- Segments and review
+  /review:
+    get:
+      tags: [review]
+      operationId: reviewQueue
+      summary: The review queue — source, MT, TM match, glossary hits, badges (FR-27, FR-28)
+      parameters:
+        - { name: job_id, in: query, description: "Restrict to a job", schema: { type: string, format: uuid } }
+        - { name: status, in: query, description: "blocked | flagged | edited | needs_review", schema: { type: string } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ReviewItem' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /segments/{id}:
+    get:
+      tags: [segments]
+      operationId: getSegment
+      summary: A segment with its checks, matches, edits and interpretation
+      parameters:
+        - { name: id, in: path, required: true, description: "Segment id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SegmentDetail'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /segments/{id}/edit:
+    post:
+      tags: [segments]
+      operationId: editSegment
+      summary: A translator edits the target — recorded with its edit distance (FR-29, FR-30)
+      parameters:
+        - { name: id, in: path, required: true, description: "Segment id", schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EditRequest'
+      responses:
+        '200':
+          description: Edited; checks recomputed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Segment'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "EDITOR_ROLE · SEGMENT_APPROVED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /segments/{id}/ready:
+    post:
+      tags: [segments]
+      operationId: markSegmentReady
+      summary: Mark a clean or resolved segment ready for review (needs_review)
+      parameters:
+        - { name: id, in: path, required: true, description: "Segment id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Segment'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "SEGMENT_BLOCKED — a blocked segment cannot be marked ready", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /segments/{id}/checks:
+    get:
+      tags: [segments]
+      operationId: getSegmentChecks
+      summary: "The check object (IF-74) — blocking numbers, flags"
+      parameters:
+        - { name: id, in: path, required: true, description: "Segment id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SegmentChecks'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /segments/{id}/interpretation:
+    get:
+      tags: [segments]
+      operationId: getInterpretation
+      summary: "The interpretation (IF-75) — inferred, separate from the translation (FR-14, AC-08)"
+      parameters:
+        - { name: id, in: path, required: true, description: "Segment id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Interpretation'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [segments]
+      operationId: requestInterpretation
+      summary: Build the interpretation for a segment that was translated without one
+      parameters:
+        - { name: id, in: path, required: true, description: "Segment id", schema: { type: string, format: uuid } }
+      responses:
+        '201':
+          description: Built
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Interpretation'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "READINGS_REQUIRED — ambiguous source; readings are generated first", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /segments/{id}/readings:
+    get:
+      tags: [segments]
+      operationId: getReadings
+      summary: Alternative readings of an ambiguous source (FR-15, AC-05)
+      parameters:
+        - { name: id, in: path, required: true, description: "Segment id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Readings
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Reading' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /segments/{id}/matches:
+    get:
+      tags: [segments]
+      operationId: getSegmentMatches
+      summary: TM candidates offered for the segment with diffs (FR-03)
+      parameters:
+        - { name: id, in: path, required: true, description: "Segment id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Matches
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TmMatch' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /segments/{id}/edits:
+    get:
+      tags: [segments]
+      operationId: getSegmentEdits
+      summary: The edit history with distances (FR-29)
+      parameters:
+        - { name: id, in: path, required: true, description: "Segment id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Edits
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SegmentEdit' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /segments/{id}/render:
+    get:
+      tags: [segments]
+      operationId: renderSegment
+      summary: "The two-part text rendering — translation, then the ruled interpretation block (AC-08)"
+      parameters:
+        - { name: id, in: path, required: true, description: "Segment id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Rendered text
+          content:
+            text/plain:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  # ---------------------------------------------------------------- Glossary and memory management
+  /glossary/{id}:
+    get:
+      tags: [glossary]
+      operationId: getGlossaryTerm
+      summary: A term with its aliases and current version
+      parameters:
+        - { name: id, in: path, required: true, description: "Term id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GlossaryTerm'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /glossary/{id}/versions:
+    get:
+      tags: [glossary]
+      operationId: listTermVersions
+      summary: Version history with approver and effective date (NFR-08)
+      parameters:
+        - { name: id, in: path, required: true, description: "Term id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Versions
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TermVersion' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /glossary/{id}/aliases:
+    post:
+      tags: [glossary, admin]
+      operationId: addTermAlias
+      summary: Add an abbreviation, jargon, supplier or variant rendering (FR-22)
+      parameters:
+        - { name: id, in: path, required: true, description: "Term id", schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TermAliasInput'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TermAlias'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /glossary/candidates:
+    get:
+      tags: [glossary]
+      operationId: listTermCandidates
+      summary: Mined candidate terms awaiting a decision (FR-23)
+      parameters:
+        - { name: status, in: query, description: "proposed | accepted | rejected", schema: { type: string } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/TermCandidate' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /glossary/candidates/{id}/decide:
+    post:
+      tags: [glossary, admin]
+      operationId: decideTermCandidate
+      summary: Accept (creating the term) or reject a candidate — admin only
+      parameters:
+        - { name: id, in: path, required: true, description: "Candidate id", schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CandidateDecision'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TermCandidate'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "CANDIDATE_DECIDER", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /glossary/usage:
+    get:
+      tags: [glossary]
+      operationId: glossaryUsage
+      summary: Usage statistics and inconsistencies per term (FR-26)
+      parameters:
+        - { name: from, in: query, description: "From date", schema: { type: string, format: date } }
+        - { name: to, in: query, description: "To date", schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: Usage rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TermUsage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /glossary/consistency:
+    get:
+      tags: [glossary]
+      operationId: glossaryConsistency
+      summary: Terms whose mandated rendering is inconsistently present in the approved memory (FR-26)
+      responses:
+        '200':
+          description: Consistency rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TermConsistency' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /glossary/import:
+    post:
+      tags: [glossary, admin]
+      operationId: importGlossary
+      summary: "Import CSV or TBX (IF-73; FR-25) — admin only, every row versioned"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportRequest'
+      responses:
+        '201':
+          description: Imported
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportReport'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /glossary/export:
+    get:
+      tags: [glossary]
+      operationId: exportGlossary
+      summary: "Export CSV or TBX (IF-73; FR-25)"
+      parameters:
+        - { name: format, in: query, description: "csv | tbx", schema: { type: string } }
+      responses:
+        '200':
+          description: Export created with its sha256
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportJob'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /tm/import:
+    post:
+      tags: [tm, admin]
+      operationId: importTm
+      summary: "Import TMX or CSV (IF-73; FR-25) — reviewer/admin as approver; duplicates of an existing source are refused"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportRequest'
+      responses:
+        '201':
+          description: Imported
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportReport'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '409': { description: "TM_DUPLICATE_SOURCE — a source already has an approved target for this pair", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /tm/export:
+    get:
+      tags: [tm]
+      operationId: exportTm
+      summary: "Export TMX or CSV (IF-73; FR-25)"
+      parameters:
+        - { name: format, in: query, description: "tmx | csv", schema: { type: string } }
+        - { name: src_lang, in: query, description: "ja | th | en", schema: { type: string } }
+        - { name: tgt_lang, in: query, description: "ja | th | en", schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportJob'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /tm/stats:
+    get:
+      tags: [tm]
+      operationId: tmStats
+      summary: Memory size per pair, embedded rows, last approval (NFR-03)
+      responses:
+        '200':
+          description: Stats
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TmStats' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /tm/{id}:
+    get:
+      tags: [tm]
+      operationId: getTmSegment
+      summary: An approved memory segment with document reference, approver and date (FR-24)
+      parameters:
+        - { name: id, in: path, required: true, description: "TM segment id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TmSegment'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  # ---------------------------------------------------------------- OCR results
+  /ocr/{jobId}/pages:
+    get:
+      tags: [translate]
+      operationId: listOcrPages
+      summary: "OCR pages of a job (IF-76)"
+      parameters:
+        - { name: jobId, in: path, required: true, description: "Job id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Pages
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/OcrResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  # ---------------------------------------------------------------- IF-16 tools (provider)
+  /tools/glossary_lookup:
+    post:
+      tags: [tools]
+      operationId: toolGlossaryLookup
+      summary: "IF-16 read tool for 10 Copilot / 09 QE-Agent — mandated renderings for terms found in a text"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ToolGlossaryRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolGlossaryResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /tools/term_check:
+    post:
+      tags: [tools]
+      operationId: toolTermCheck
+      summary: "IF-16 read tool — forbidden renderings and missing mandated terms in a draft (QE-Agent IF-52)"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ToolTermCheckRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolTermCheckResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  # ---------------------------------------------------------------- Evaluation
+  /test-sets:
+    get:
+      tags: [evaluation]
+      operationId: listTestSets
+      summary: Versioned domain test sets (AI-03)
+      responses:
+        '200':
+          description: Test sets
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TestSet' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /test-sets/import:
+    post:
+      tags: [evaluation, admin]
+      operationId: importTestSet
+      summary: Import a new version of the test set (frozen once used)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportRequest'
+      responses:
+        '201':
+          description: Imported
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestSet'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /eval/runs:
+    get:
+      tags: [evaluation]
+      operationId: listEvalRuns
+      summary: Evaluation runs with metrics, gate and regression flag (AI-02, AI-05, AI-08)
+      parameters:
+        - { name: test_set_id, in: query, description: "Test set", schema: { type: string, format: uuid } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/EvalRun' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [evaluation]
+      operationId: startEvalRun
+      summary: Run the test set with the current model and prompts; pass/fail is computed by the database
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EvalRunRequest'
+      responses:
+        '202':
+          description: Run started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvalRun'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /eval/runs/{id}:
+    get:
+      tags: [evaluation]
+      operationId: getEvalRun
+      summary: A run with per-segment results
+      parameters:
+        - { name: id, in: path, required: true, description: "Run id", schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvalRunDetail'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  # ---------------------------------------------------------------- Admin, dashboard, system
+  /dashboard/quality:
+    get:
+      tags: [admin]
+      operationId: qualityDashboard
+      summary: Post-edit distance trend, glossary compliance, TM reuse, throughput per day and pair (FR-31)
+      parameters:
+        - { name: from, in: query, description: "From date", schema: { type: string, format: date } }
+        - { name: to, in: query, description: "To date", schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: Rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/DashboardRow' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /roles:
+    get:
+      tags: [admin]
+      operationId: listRoles
+      summary: GenbaGo roles on platform users (FR-30)
+      responses:
+        '200':
+          description: Roles
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/UserRole' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /roles/{userId}:
+    put:
+      tags: [admin]
+      operationId: setRole
+      summary: Grant translator / reviewer / admin — admin only, audited
+      parameters:
+        - { name: userId, in: path, required: true, description: "User id", schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserRoleInput'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserRole'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /config:
+    get:
+      tags: [admin]
+      operationId: getConfig
+      summary: Effective configuration (thresholds, gates, model, OCR, confidentiality) — secrets never included
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Config'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /healthz:
+    get:
+      tags: [system]
+      operationId: healthz
+      summary: Liveness
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /readyz:
+    get:
+      tags: [system]
+      operationId: readyz
+      summary: "Readiness — database, model, OCR engine, object store; the mode"
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+        '503': { description: "NOT_READY", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+  /metrics:
+    get:
+      tags: [system]
+      operationId: metrics
+      summary: Prometheus text (IF-14) — segments, TM hit rate, blocked/flagged, PED, latency per pair
+      security: []
+      responses:
+        '200':
+          description: Metrics
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Platform users; GenbaGo roles translator / reviewer / admin are rows (FR-30); viewers read.
+
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Opaque cursor from the previous page's `next_cursor`
+
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      schema: { type: string }
+      description: |
+        Client-generated key. Replaying a request with the same key returns the
+        original result instead of performing the operation twice.
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    Forbidden:
+      description: |
+        Authenticated but not permitted. For line-scoped resources the rows are
+        never retrieved in the first place — this is not response filtering.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    NotFound:
+      description: Resource does not exist
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    ValidationFailed:
+      description: Request was well-formed but semantically invalid
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 7807 problem details with a stable machine-readable `code`.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          description: Stable error code — see API-Specification.md §7
+        correlation_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+
+    Language:
+      type: string
+      enum: [th, ja, en]
+      default: th
+
+    TranslationResult:
+      type: object
+      properties:
+        source_text: { type: string }
+        source_lang:
+          $ref: '#/components/schemas/Language'
+        translation: { type: string }
+        target_lang:
+          $ref: '#/components/schemas/Language'
+        tm_match:
+          type: [object, 'null']
+          properties:
+            score: { type: number }
+            segment_id: { type: string, format: uuid }
+        glossary_applied:
+          type: array
+          items: { type: string }
+        checks:
+          type: object
+          properties:
+            numbers_preserved: { type: boolean }
+            glossary_compliant: { type: boolean }
+            omission_suspected: { type: boolean }
+        interpretation:
+          type: [object, 'null']
+          description: |
+            INFERRED, and kept separate from the translation itself so a reader
+            can always tell what was said from what the system deduced.
+          properties:
+            inferred: { type: boolean, enum: [true] }
+            confidence: { type: number }
+            process: { type: string }
+            message_type: { type: string }
+            entities: { type: object, additionalProperties: true }
+            suggested_checks:
+              type: array
+              items: { type: string }
+            related_documents:
+              type: array
+              items:
+                type: object
+                properties:
+                  title: { type: string }
+                  document_id: { type: string, format: uuid }
+            possible_readings:
+              type: array
+              items: { type: string }
+              description: Populated when the source is ambiguous, instead of choosing silently
+
+    TranslateRequest:
+      type: object
+      required: [text, target_lang]
+      properties:
+        text: { type: string, maxLength: 20000 }
+        source_lang: { $ref: '#/components/schemas/Language' }
+        target_lang: { $ref: '#/components/schemas/Language' }
+        register: { type: string, enum: [report, shopfloor, customer], default: report }
+        interpret: { type: boolean, default: true }
+        confidential: { type: boolean, default: true, description: "false only for texts that may leave the LAN (Discord)" }
+        domain: { type: string }
+
+    TranslateResponse:
+      allOf:
+        - { $ref: '#/components/schemas/TranslationResult' }
+        - type: object
+          properties:
+            job_id: { type: string, format: uuid }
+            segments:
+              type: array
+              items: { $ref: '#/components/schemas/Segment' }
+            interpretation_detail: { $ref: '#/components/schemas/Interpretation' }
+            rendered: { type: string, description: "The two-part text rendering (AC-08)" }
+
+    JobRequest:
+      type: object
+      description: "deploy/schemas/translation-job.schema.json (IF-77)"
+      required: [kind, source_lang, target_lang]
+      properties:
+        kind: { type: string, enum: [text, document, ocr, hmi, batch] }
+        source_lang: { $ref: '#/components/schemas/Language' }
+        target_lang: { $ref: '#/components/schemas/Language' }
+        register: { type: string, enum: [report, shopfloor, customer], default: report }
+        confidential: { type: boolean, default: true }
+        provider: { type: string, enum: [local, cloud], default: local }
+        channel: { type: string, enum: [web, api, discord, tool, batch], default: web }
+        format: { type: string, enum: [text, docx, xlsx, pptx, pdf, image] }
+        keep_layout: { type: boolean, default: true }
+        layout_mode: { type: string, enum: [side_by_side, overlay, keep_layout] }
+        file_uri: { type: string }
+        files:
+          type: array
+          items:
+            type: object
+            required: [name, uri, format]
+            properties:
+              name: { type: string }
+              uri: { type: string }
+              format: { type: string, enum: [docx, xlsx, pptx, pdf, image, text] }
+        text: { type: string }
+        interpret: { type: boolean, default: true }
+        domain: { type: string }
+
+    Job:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [text, document, ocr, hmi, batch] }
+        source_lang: { $ref: '#/components/schemas/Language' }
+        target_lang: { $ref: '#/components/schemas/Language' }
+        register: { type: string, enum: [report, shopfloor, customer] }
+        status: { type: string, enum: [queued, running, done, failed, cancelled] }
+        confidential: { type: boolean }
+        provider: { type: string, enum: [local, cloud] }
+        channel: { type: string, enum: [web, api, discord, tool, batch] }
+        format: { type: string }
+        keep_layout: { type: boolean }
+        file_uri: { type: [string, 'null'] }
+        result_uri: { type: [string, 'null'] }
+        created_by: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        segment_count: { type: integer }
+        done_count: { type: integer }
+        blocked: { type: integer }
+        flagged: { type: integer }
+        tm_exact: { type: integer }
+        files: { type: integer }
+        files_done: { type: integer }
+        files_failed: { type: integer }
+        resumed_from_ordinal: { type: [integer, 'null'] }
+        error: { type: [string, 'null'] }
+
+    JobFile:
+      type: object
+      properties:
+        ordinal: { type: integer }
+        name: { type: string }
+        uri: { type: string }
+        format: { type: string }
+        status: { type: string, enum: [queued, running, done, failed, cancelled] }
+        segment_count: { type: integer }
+        error: { type: [string, 'null'] }
+        result_uri: { type: [string, 'null'] }
+
+    JobResult:
+      type: object
+      properties:
+        job_id: { type: string, format: uuid }
+        result_uri: { type: [string, 'null'], description: "Translated document / side-by-side PDF / keep-layout image in the local store" }
+        report:
+          type: object
+          properties:
+            segments: { type: integer }
+            approved: { type: integer }
+            blocked: { type: integer }
+            flagged: { type: integer }
+            tm_exact: { type: integer }
+            files: { type: array, items: { $ref: '#/components/schemas/JobFile' } }
+
+    OcrRequest:
+      type: object
+      required: [image_uri]
+      properties:
+        image_uri: { type: string, description: "s3:// in the local store (IF-10)" }
+        layout_mode: { type: string, enum: [side_by_side, overlay, keep_layout], default: side_by_side }
+        translate: { type: boolean, default: false }
+        target_lang: { $ref: '#/components/schemas/Language' }
+        confidential: { type: boolean, default: true }
+
+    OcrResult:
+      type: object
+      description: "deploy/schemas/ocr-result.schema.json (IF-76)"
+      properties:
+        job_id: { type: string, format: uuid }
+        page_no: { type: integer }
+        image_uri: { type: string }
+        width_px: { type: integer }
+        height_px: { type: integer }
+        layout_mode: { type: string, enum: [side_by_side, overlay, keep_layout] }
+        engine: { type: string }
+        regions:
+          type: array
+          items:
+            type: object
+            properties:
+              ordinal: { type: integer }
+              bbox: { type: object, properties: { x: { type: integer }, y: { type: integer }, w: { type: integer }, h: { type: integer } } }
+              orientation: { type: string, enum: [horizontal, vertical] }
+              text: { type: string }
+              char_confidence: { type: number }
+              handwriting: { type: boolean }
+              low_confidence: { type: boolean, description: "handwriting or confidence below the gate — set by the database, cannot be cleared" }
+              segment_id: { type: [string, 'null'], format: uuid }
+
+    SegmentChecks:
+      type: object
+      description: "deploy/schemas/segment-checks.schema.json (IF-74)"
+      properties:
+        blocking:
+          type: object
+          properties:
+            numbers:
+              type: object
+              properties:
+                ok: { type: boolean }
+                source: { type: array, items: { type: string } }
+                missing: { type: array, items: { type: string } }
+                extra: { type: array, items: { type: string } }
+        flags:
+          type: object
+          properties:
+            glossary: { type: object, properties: { ok: { type: boolean }, missing: { type: array, items: { type: string } }, applied: { type: array, items: { type: string } } } }
+            forbidden: { type: object, properties: { ok: { type: boolean }, hits: { type: array, items: { type: object, properties: { term: { type: string }, rendering: { type: string }, mandated: { type: string } } } } } }
+            length_ratio: { type: object, properties: { ok: { type: boolean }, ratio: { type: [number, 'null'] }, min: { type: [number, 'null'] }, max: { type: [number, 'null'] } } }
+            untranslated: { type: object, properties: { ok: { type: boolean } } }
+            omission: { type: object, properties: { ok: { type: boolean }, src_sentences: { type: integer }, tgt_sentences: { type: integer } } }
+        blocked: { type: boolean }
+        flagged: { type: boolean }
+        clean: { type: boolean }
+
+    Segment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        job_id: { type: string, format: uuid }
+        ordinal: { type: integer }
+        anchor: { type: [string, 'null'] }
+        source_text: { type: string }
+        mt_text: { type: [string, 'null'] }
+        final_text: { type: [string, 'null'] }
+        status: { type: string, enum: [machine, blocked, flagged, edited, needs_review, approved] }
+        tm_score: { type: [number, 'null'], description: "1.000 = exact reuse" }
+        tm_match_id: { type: [string, 'null'], format: uuid }
+        checks: { $ref: '#/components/schemas/SegmentChecks' }
+        edit_distance: { type: [number, 'null'] }
+        reviewer_note: { type: [string, 'null'] }
+        approved_by: { type: [string, 'null'] }
+        approved_at: { type: [string, 'null'], format: date-time }
+        tm_written_id: { type: [string, 'null'], format: uuid }
+
+    SegmentDetail:
+      allOf:
+        - { $ref: '#/components/schemas/Segment' }
+        - type: object
+          properties:
+            matches: { type: array, items: { $ref: '#/components/schemas/TmMatch' } }
+            edits: { type: array, items: { $ref: '#/components/schemas/SegmentEdit' } }
+            interpretation: { oneOf: [ { $ref: '#/components/schemas/Interpretation' }, { type: 'null' } ] }
+            glossary_hits:
+              type: array
+              description: Terms found in the source with their mandated renderings, readings and usage notes (FR-07, FR-08)
+              items: { $ref: '#/components/schemas/GlossaryTerm' }
+
+    SegmentEdit:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        editor: { type: string }
+        before_text: { type: [string, 'null'] }
+        after_text: { type: string }
+        edit_distance: { type: number, description: Normalised Levenshtein }
+        ts: { type: string, format: date-time }
+
+    EditRequest:
+      type: object
+      required: [text]
+      properties:
+        text: { type: string }
+
+    ApproveRequest:
+      type: object
+      properties:
+        note: { type: string, description: Required when a flag is unresolved }
+
+    ReviewItem:
+      allOf:
+        - { $ref: '#/components/schemas/Segment' }
+        - type: object
+          properties:
+            kind: { type: string }
+            source_lang: { $ref: '#/components/schemas/Language' }
+            target_lang: { $ref: '#/components/schemas/Language' }
+            register: { type: string }
+            fuzzy_matches: { type: integer }
+            numbers_missing: { type: array, items: { type: string } }
+            numbers_extra: { type: array, items: { type: string } }
+            glossary_missing: { type: array, items: { type: string } }
+            forbidden_hits: { type: array, items: { type: object, additionalProperties: true } }
+
+    Interpretation:
+      type: object
+      description: "deploy/schemas/interpretation.schema.json (IF-75). Always inferred: true; never merged into the translation (C-05)."
+      required: [inferred, confidence, ambiguous]
+      properties:
+        inferred: { type: boolean, enum: [true] }
+        confidence: { type: number }
+        ambiguous: { type: boolean }
+        process: { type: [string, 'null'], enum: [injection_molding, press, welding, assembly, painting, inspection, logistics, maintenance, other, null] }
+        message_type: { type: [string, 'null'], enum: [problem_report, instruction, spec_change, audit_finding, schedule, request, information, null] }
+        entities: { type: object, additionalProperties: true }
+        timing_note: { type: [string, 'null'] }
+        suggested_checks:
+          type: array
+          items: { $ref: '#/components/schemas/CheckItem' }
+        related_documents:
+          type: array
+          description: Documents that exist in the index — never free text (AI-09)
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              title: { type: string }
+              kind: { type: string }
+              uri: { type: string }
+        readings:
+          type: array
+          items: { $ref: '#/components/schemas/Reading' }
+        model: { type: [string, 'null'] }
+        prompt_version: { type: [string, 'null'] }
+
+    CheckItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        process: { type: string }
+        message_type: { type: string }
+        ordinal: { type: integer }
+        ja: { type: string }
+        en: { type: string }
+        th: { type: string }
+        moldmind_param: { type: [string, 'null'], description: MoldMind parameter name when the item maps to one (SRS-11) }
+
+    Reading:
+      type: object
+      properties:
+        ordinal: { type: integer }
+        reading_ja: { type: string }
+        th: { type: string }
+        en: { type: string }
+        usage_note: { type: [string, 'null'] }
+
+    TmSearchRequest:
+      type: object
+      required: [text, source_lang, target_lang]
+      properties:
+        text: { type: string }
+        source_lang: { $ref: '#/components/schemas/Language' }
+        target_lang: { $ref: '#/components/schemas/Language' }
+        limit: { type: integer, default: 5, maximum: 20 }
+
+    TmMatch:
+      type: object
+      properties:
+        tm_segment_id: { type: string, format: uuid }
+        score: { type: number }
+        method: { type: string, enum: [exact, trigram, vector] }
+        source_text: { type: string }
+        target_text: { type: string }
+        diff:
+          type: object
+          additionalProperties: true
+          description: Query vs memory source (for fuzzy matches)
+        domain: { type: [string, 'null'] }
+        doc_ref: { type: [string, 'null'] }
+        approver: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+
+    TmSegment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        source_lang: { $ref: '#/components/schemas/Language' }
+        target_lang: { $ref: '#/components/schemas/Language' }
+        source_text: { type: string }
+        target_text: { type: string }
+        domain: { type: [string, 'null'] }
+        doc_ref: { type: [string, 'null'] }
+        approver: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        embedded: { type: boolean }
+
+    TmStats:
+      type: object
+      properties:
+        source_lang: { $ref: '#/components/schemas/Language' }
+        target_lang: { $ref: '#/components/schemas/Language' }
+        segments: { type: integer }
+        embedded: { type: integer }
+        last_approved: { type: [string, 'null'], format: date-time }
+
+    GlossaryTerm:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ja: { type: [string, 'null'] }
+        ja_reading: { type: [string, 'null'] }
+        th: { type: [string, 'null'] }
+        en: { type: [string, 'null'] }
+        domain: { type: [string, 'null'] }
+        notes: { type: [string, 'null'] }
+        forbidden:
+          type: array
+          items: { type: object, required: [lang, text], properties: { lang: { $ref: '#/components/schemas/Language' }, text: { type: string } } }
+        aliases: { type: array, items: { $ref: '#/components/schemas/TermAlias' } }
+        version_no: { type: integer }
+        effective_from: { type: string, format: date }
+        approved_by: { type: [string, 'null'] }
+        updated_at: { type: string, format: date-time }
+
+    GlossaryTermInput:
+      type: object
+      required: [ja, th, en, domain]
+      properties:
+        id: { type: string, format: uuid, description: Present for an update }
+        ja: { type: string }
+        ja_reading: { type: string }
+        th: { type: string }
+        en: { type: string }
+        domain: { type: string, enum: [parameter, metric, defect, document, process, action, material, general] }
+        notes: { type: string }
+        forbidden:
+          type: array
+          items: { type: object, required: [lang, text], properties: { lang: { $ref: '#/components/schemas/Language' }, text: { type: string } } }
+        effective_from: { type: string, format: date }
+        change_note: { type: string }
+
+    TermVersion:
+      type: object
+      properties:
+        version_no: { type: integer }
+        ja: { type: [string, 'null'] }
+        th: { type: [string, 'null'] }
+        en: { type: [string, 'null'] }
+        forbidden: { type: array, items: { type: object, additionalProperties: true } }
+        approved_by: { type: string }
+        effective_from: { type: string, format: date }
+        change_note: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+
+    TermAlias:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        alias: { type: string }
+        lang: { $ref: '#/components/schemas/Language' }
+        kind: { type: string, enum: [abbreviation, jargon, supplier, variant] }
+        note: { type: [string, 'null'] }
+
+    TermAliasInput:
+      type: object
+      required: [alias, lang, kind]
+      properties:
+        alias: { type: string }
+        lang: { $ref: '#/components/schemas/Language' }
+        kind: { type: string, enum: [abbreviation, jargon, supplier, variant] }
+        note: { type: string }
+
+    TermCandidate:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ja: { type: string }
+        th: { type: [string, 'null'] }
+        en: { type: [string, 'null'] }
+        occurrences: { type: integer }
+        source_job_id: { type: [string, 'null'], format: uuid }
+        status: { type: string, enum: [proposed, accepted, rejected] }
+        proposed_at: { type: string, format: date-time }
+        decided_by: { type: [string, 'null'] }
+        decided_at: { type: [string, 'null'], format: date-time }
+
+    CandidateDecision:
+      type: object
+      required: [decision]
+      properties:
+        decision: { type: string, enum: [accepted, rejected] }
+        term: { $ref: '#/components/schemas/GlossaryTermInput' }
+
+    TermUsage:
+      type: object
+      properties:
+        term_id: { type: string, format: uuid }
+        ja: { type: string }
+        date: { type: string, format: date }
+        count: { type: integer }
+        inconsistencies: { type: integer }
+
+    TermConsistency:
+      type: object
+      properties:
+        term_id: { type: string, format: uuid }
+        ja: { type: string }
+        segments: { type: integer }
+        consistent: { type: integer }
+        inconsistent: { type: integer }
+        consistency: { type: [number, 'null'] }
+
+    ImportRequest:
+      type: object
+      required: [format, file_uri]
+      properties:
+        format: { type: string, enum: [csv, tbx, tmx] }
+        file_uri: { type: string, description: "s3:// in the local store" }
+        approver_note: { type: string }
+
+    ImportReport:
+      type: object
+      properties:
+        rows: { type: integer }
+        inserted: { type: integer }
+        updated: { type: integer }
+        rejected: { type: integer }
+        errors: { type: array, items: { type: string } }
+
+    ExportJob:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [glossary_csv, glossary_tbx, tm_tmx, tm_csv, audit] }
+        uri: { type: string }
+        row_count: { type: integer }
+        sha256: { type: string }
+        created_at: { type: string, format: date-time }
+
+    ToolGlossaryRequest:
+      type: object
+      required: [text, target_lang]
+      properties:
+        text: { type: string }
+        source_lang: { $ref: '#/components/schemas/Language' }
+        target_lang: { $ref: '#/components/schemas/Language' }
+
+    ToolGlossaryResponse:
+      type: object
+      properties:
+        terms: { type: array, items: { $ref: '#/components/schemas/GlossaryTerm' } }
+
+    ToolTermCheckRequest:
+      type: object
+      required: [text, lang]
+      properties:
+        text: { type: string }
+        lang: { $ref: '#/components/schemas/Language' }
+        source_text: { type: string }
+        source_lang: { $ref: '#/components/schemas/Language' }
+
+    ToolTermCheckResponse:
+      type: object
+      properties:
+        forbidden: { type: array, items: { type: object, properties: { term: { type: string }, rendering: { type: string }, mandated: { type: string }, position: { type: integer } } } }
+        missing: { type: array, items: { type: string } }
+        applied: { type: array, items: { type: string } }
+
+    TestSet:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        version: { type: integer }
+        description: { type: [string, 'null'] }
+        frozen: { type: boolean }
+        segments: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    EvalRunRequest:
+      type: object
+      required: [test_set_id]
+      properties:
+        test_set_id: { type: string, format: uuid }
+        prompt_version: { type: string }
+        note: { type: string }
+
+    EvalRun:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        test_set: { type: string }
+        version: { type: integer }
+        run_at: { type: string, format: date-time }
+        model: { type: string }
+        prompt_version: { type: string }
+        glossary_compliance: { type: [number, 'null'] }
+        numbers_preserved: { type: [number, 'null'] }
+        mean_ped: { type: [number, 'null'] }
+        class_accuracy: { type: [number, 'null'] }
+        passed: { type: [boolean, 'null'], description: "Computed by the database from the gates (glossary ≥ 0.98, numbers = 1, PED ≤ 0.20, classification ≥ 0.90)" }
+        investigate: { type: boolean, description: "A metric regressed by more than 2 % against the previous run (AI-08)" }
+        gates: { type: object, properties: { glossary: { type: number }, numbers: { type: number }, ped: { type: number }, classification: { type: number } } }
+        note: { type: [string, 'null'] }
+
+    EvalRunDetail:
+      allOf:
+        - { $ref: '#/components/schemas/EvalRun' }
+        - type: object
+          properties:
+            results:
+              type: array
+              items:
+                type: object
+                properties:
+                  ordinal: { type: integer }
+                  source_text: { type: string }
+                  reference_text: { type: string }
+                  mt_text: { type: string }
+                  ped: { type: number }
+                  glossary_ok: { type: boolean }
+                  numbers_ok: { type: boolean }
+                  expected_process: { type: [string, 'null'] }
+                  process_pred: { type: [string, 'null'] }
+                  expected_message_type: { type: [string, 'null'] }
+                  message_pred: { type: [string, 'null'] }
+
+    DashboardRow:
+      type: object
+      properties:
+        day: { type: string, format: date }
+        source_lang: { $ref: '#/components/schemas/Language' }
+        target_lang: { $ref: '#/components/schemas/Language' }
+        approved_segments: { type: integer }
+        mean_ped: { type: number }
+        glossary_compliance: { type: number }
+        tm_exact_reused: { type: integer }
+        jobs: { type: integer }
+
+    UserRole:
+      type: object
+      properties:
+        user_id: { type: string, format: uuid }
+        display_name: { type: string }
+        role: { type: string, enum: [translator, reviewer, admin] }
+        granted_by: { type: [string, 'null'] }
+        granted_at: { type: string, format: date-time }
+
+    UserRoleInput:
+      type: object
+      required: [role]
+      properties:
+        role: { type: string, enum: [translator, reviewer, admin] }
+
+    Config:
+      type: object
+      properties:
+        languages: { type: array, items: { $ref: '#/components/schemas/Language' } }
+        registers: { type: array, items: { type: string } }
+        tm: { type: object, properties: { fuzzy_threshold: { type: number }, vector: { type: boolean } } }
+        checks: { type: object, properties: { numbers_blocking: { type: boolean, enum: [true] }, ratio_bounds: { type: object, additionalProperties: true } } }
+        interpretation: { type: object, properties: { separate: { type: boolean, enum: [true] }, ambiguity_threshold: { type: number }, max_readings: { type: integer } } }
+        llm: { type: object, properties: { model: { type: string }, max_params_b: { type: number }, temperature: { type: number } } }
+        ocr: { type: object, properties: { engine: { type: string }, vertical: { type: boolean }, char_accuracy_min: { type: number } } }
+        confidentiality: { type: object, properties: { default_confidential: { type: boolean, enum: [true] }, cloud_provider_enabled: { type: boolean } } }
+        gates: { type: object, properties: { glossary: { type: number }, numbers: { type: number }, ped: { type: number }, classification: { type: number }, regression_pct: { type: number } } }
+        retention_days: { type: integer }
+
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok] }
+        version: { type: string }
+
+    Readiness:
+      type: object
+      properties:
+        status: { type: string, enum: [ready, degraded, not_ready] }
+        mode: { type: string, enum: [normal, memory_only, no_ocr, no_store] }
+        checks:
+          type: object
+          additionalProperties: { type: string }

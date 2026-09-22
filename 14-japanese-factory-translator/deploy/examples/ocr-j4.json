@@ -1,0 +1,71 @@
+{
+  "job_id": "f0000000-0000-4000-8000-000000000005",
+  "page_no": 1,
+  "image_uri": "s3://genbago-docs/kensa-kijun-photo.jpg",
+  "width_px": 2480,
+  "height_px": 3508,
+  "layout_mode": "side_by_side",
+  "engine": "paddleocr-ja-vertical-2.7",
+  "regions": [
+    {
+      "ordinal": 1,
+      "bbox": {
+        "x": 2200,
+        "y": 120,
+        "w": 120,
+        "h": 1400
+      },
+      "orientation": "vertical",
+      "text": "検査基準書 RAD-500-A",
+      "char_confidence": 0.981,
+      "handwriting": false,
+      "low_confidence": false,
+      "segment_id": null
+    },
+    {
+      "ordinal": 2,
+      "bbox": {
+        "x": 2000,
+        "y": 120,
+        "w": 120,
+        "h": 2600
+      },
+      "orientation": "vertical",
+      "text": "外観検査: キズ、バリ、ヒケがないこと。",
+      "char_confidence": 0.972,
+      "handwriting": false,
+      "low_confidence": false,
+      "segment_id": null
+    },
+    {
+      "ordinal": 3,
+      "bbox": {
+        "x": 1800,
+        "y": 120,
+        "w": 120,
+        "h": 2600
+      },
+      "orientation": "vertical",
+      "text": "寸法検査: 厚さ 3.2 mm ±0.05 mm を測定すること。",
+      "char_confidence": 0.966,
+      "handwriting": false,
+      "low_confidence": false,
+      "segment_id": null
+    },
+    {
+      "ordinal": 4,
+      "bbox": {
+        "x": 300,
+        "y": 2900,
+        "w": 1400,
+        "h": 300
+      },
+      "orientation": "horizontal",
+      "text": "9/20 金型研磨済み",
+      "char_confidence": 0.712,
+      "handwriting": true,
+      "low_confidence": true,
+      "segment_id": null
+    }
+  ]
+}

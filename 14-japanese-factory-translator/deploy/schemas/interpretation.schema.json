@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.plant.local/schemas/genbago/interpretation.v1.json",
+  "title": "Interpretation (IF-75 · SRS-14 FR-09…FR-15, C-05, AI-09)",
+  "description": "What the system INFERRED about a segment — always separate from the translation. inferred is a constant true. An assertion (ambiguous = false) names the process and message type with confidence ≥ the ambiguity threshold, suggests only curated check items and cites only indexed documents. An ambiguous reading (ambiguous = true) lists 2–3 readings and asserts nothing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["inferred", "confidence", "ambiguous", "entities"],
+  "properties": {
+    "inferred": { "type": "boolean", "const": true },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "ambiguous": { "type": "boolean" },
+    "process": { "type": ["string", "null"], "enum": ["injection_molding", "press", "welding", "assembly", "painting", "inspection", "logistics", "maintenance", "other", null] },
+    "message_type": { "type": ["string", "null"], "enum": ["problem_report", "instruction", "spec_change", "audit_finding", "schedule", "request", "information", null] },
+    "entities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "line": { "type": "array", "items": { "type": "string" } },
+        "machine": { "type": "array", "items": { "type": "string" } },
+        "mould": { "type": "array", "items": { "type": "string" } },
+        "part_number": { "type": "array", "items": { "type": "string" } },
+        "lot": { "type": "array", "items": { "type": "string" } },
+        "defect_class": { "type": "array", "items": { "type": "string" } },
+        "parameter": { "type": "array", "items": { "type": "string" } },
+        "metric": { "type": "array", "items": { "type": "string" } },
+        "quantity": { "type": "array", "items": { "type": "string" } },
+        "date": { "type": "array", "items": { "type": "string" } },
+        "role": { "type": "array", "items": { "type": "string" } },
+        "direction": { "type": "string", "enum": ["up", "down"] }
+      }
+    },
+    "timing_note": { "type": ["string", "null"] },
+    "suggested_checks": {
+      "type": "array",
+      "items": { "type": "object", "required": ["id", "ja", "en"], "additionalProperties": false,
+                 "properties": { "id": { "type": "string", "format": "uuid" }, "ordinal": { "type": "integer" }, "ja": { "type": "string" }, "en": { "type": "string" }, "th": { "type": "string" }, "moldmind_param": { "type": ["string", "null"] } } }
+    },
+    "related_documents": {
+      "type": "array",
+      "items": { "type": "object", "required": ["id", "title"], "additionalProperties": false,
+                 "properties": { "id": { "type": "string", "format": "uuid", "description": "a knowledge.document id — never a free-text reference (AI-09)" }, "title": { "type": "string" }, "kind": { "type": "string" }, "uri": { "type": "string" } } }
+    },
+    "readings": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 3,
+      "items": { "type": "object", "required": ["ordinal", "reading_ja", "th", "en"], "additionalProperties": false,
+                 "properties": { "ordinal": { "type": "integer", "minimum": 1, "maximum": 3 }, "reading_ja": { "type": "string" }, "th": { "type": "string" }, "en": { "type": "string" }, "usage_note": { "type": ["string", "null"] } } }
+    },
+    "model": { "type": ["string", "null"] },
+    "prompt_version": { "type": ["string", "null"] }
+  },
+  "allOf": [
+    { "if": { "properties": { "ambiguous": { "const": false } } },
+      "then": { "required": ["process", "message_type", "suggested_checks", "related_documents"], "properties": { "process": { "type": "string" }, "message_type": { "type": "string" }, "confidence": { "minimum": 0.6 } } } },
+    { "if": { "properties": { "ambiguous": { "const": true } } },
+      "then": { "required": ["readings"], "properties": { "confidence": { "maximum": 0.6 }, "suggested_checks": { "maxItems": 0 }, "related_documents": { "maxItems": 0 } } } }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.plant.local/schemas/genbago/ocr-result.v1.json",
+  "title": "OCR result (IF-76 · SRS-14 FR-18, FR-19, AI-06)",
+  "description": "What worker-ocr returns for one image: regions with orientation (Japanese vertical text is linearised top-to-bottom, right-to-left), character confidence, and the handwriting flag. low_confidence is derived (handwriting or confidence below the gate) and cannot be cleared by hand.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["job_id", "page_no", "image_uri", "width_px", "height_px", "layout_mode", "regions"],
+  "properties": {
+    "job_id": { "type": "string", "format": "uuid" },
+    "page_no": { "type": "integer", "minimum": 1 },
+    "image_uri": { "type": "string", "pattern": "^s3://" },
+    "width_px": { "type": "integer", "minimum": 1 },
+    "height_px": { "type": "integer", "minimum": 1 },
+    "layout_mode": { "type": "string", "enum": ["side_by_side", "overlay", "keep_layout"] },
+    "engine": { "type": "string" },
+    "regions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ordinal", "bbox", "orientation", "text", "char_confidence", "handwriting", "low_confidence"],
+        "properties": {
+          "ordinal": { "type": "integer", "minimum": 1 },
+          "bbox": { "type": "object", "required": ["x", "y", "w", "h"], "additionalProperties": false,
+                    "properties": { "x": { "type": "integer", "minimum": 0 }, "y": { "type": "integer", "minimum": 0 }, "w": { "type": "integer", "minimum": 1 }, "h": { "type": "integer", "minimum": 1 } } },
+          "orientation": { "type": "string", "enum": ["horizontal", "vertical"] },
+          "text": { "type": "string", "minLength": 1 },
+          "char_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "handwriting": { "type": "boolean" },
+          "low_confidence": { "type": "boolean" },
+          "segment_id": { "type": ["string", "null"], "format": "uuid" }
+        },
+        "allOf": [
+          { "if": { "properties": { "handwriting": { "const": true } } }, "then": { "properties": { "low_confidence": { "const": true } } } },
+          { "if": { "properties": { "char_confidence": { "maximum": 0.9499 } } }, "then": { "properties": { "low_confidence": { "const": true } } } }
+        ]
+      }
+    }
+  }
+}

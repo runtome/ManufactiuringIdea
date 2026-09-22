@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.plant.local/schemas/genbago/translation-job.v1.json",
+  "title": "Translation job request (IF-77 · SRS-14 FR-16, FR-17, FR-19, FR-20, NFR-07, C-03)",
+  "description": "POST /translate/document and the batch form. A job is confidential unless stated otherwise; a confidential job is processed by the local provider only and cannot be delivered to Discord. Layout is preserved for DOCX/XLSX/PPTX; PDF and images produce side-by-side, overlay or keep-layout results.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "source_lang", "target_lang"],
+  "properties": {
+    "kind": { "type": "string", "enum": ["text", "document", "ocr", "hmi", "batch"] },
+    "source_lang": { "type": "string", "enum": ["ja", "th", "en"] },
+    "target_lang": { "type": "string", "enum": ["ja", "th", "en"] },
+    "register": { "type": "string", "enum": ["report", "shopfloor", "customer"], "default": "report" },
+    "confidential": { "type": "boolean", "default": true },
+    "provider": { "type": "string", "enum": ["local", "cloud"], "default": "local" },
+    "channel": { "type": "string", "enum": ["web", "api", "discord", "tool", "batch"], "default": "web" },
+    "format": { "type": "string", "enum": ["text", "docx", "xlsx", "pptx", "pdf", "image"], "default": "text" },
+    "keep_layout": { "type": "boolean", "default": true },
+    "layout_mode": { "type": "string", "enum": ["side_by_side", "overlay", "keep_layout"] },
+    "file_uri": { "type": "string", "pattern": "^s3://" },
+    "files": { "type": "array", "minItems": 1, "maxItems": 500, "items": { "type": "object", "required": ["name", "uri", "format"], "additionalProperties": false,
+               "properties": { "name": { "type": "string" }, "uri": { "type": "string", "pattern": "^s3://" }, "format": { "type": "string", "enum": ["docx", "xlsx", "pptx", "pdf", "image", "text"] } } } },
+    "text": { "type": "string", "maxLength": 20000 },
+    "interpret": { "type": "boolean", "default": true },
+    "domain": { "type": "string" }
+  },
+  "allOf": [
+    { "not": { "properties": { "source_lang": { "const": "ja" }, "target_lang": { "const": "ja" } } } },
+    { "not": { "properties": { "source_lang": { "const": "th" }, "target_lang": { "const": "th" } } } },
+    { "not": { "properties": { "source_lang": { "const": "en" }, "target_lang": { "const": "en" } } } },
+    { "if": { "properties": { "confidential": { "const": true } } }, "then": { "properties": { "provider": { "const": "local" }, "channel": { "not": { "const": "discord" } } } } },
+    { "if": { "not": { "required": ["confidential"] } }, "then": { "properties": { "provider": { "const": "local" }, "channel": { "not": { "const": "discord" } } } } },
+    { "if": { "properties": { "kind": { "const": "text" } }, "required": ["kind"] }, "then": { "required": ["text"] } },
+    { "if": { "properties": { "kind": { "enum": ["document", "ocr", "hmi"] } }, "required": ["kind"] }, "then": { "required": ["file_uri", "format"] } },
+    { "if": { "properties": { "kind": { "const": "batch" } }, "required": ["kind"] }, "then": { "required": ["files"] } },
+    { "if": { "properties": { "kind": { "enum": ["ocr", "hmi"] } }, "required": ["kind"] }, "then": { "properties": { "format": { "const": "image" } } } }
+  ]
+}

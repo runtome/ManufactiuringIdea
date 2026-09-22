@@ -1,0 +1,96 @@
+# GenbaGo curated check items (FR-12) — generated from the same source as db/seed_demo.sql
+version: 1
+note: FR-12 curated "standard items to check" per process and message type. Names in moldmind_param are MoldMind parameter names (SRS-11) — shared vocabulary, no FK across deployments. Equal to the seed
+  (TEST-14 TC-006).
+items:
+- process: injection_molding
+  message_type: problem_report
+  ordinal: 1
+  ja: 溶融温度・金型温度
+  en: Melt / mould temperature
+  th: อุณหภูมิหลอม・อุณหภูมิแม่พิมพ์
+  moldmind_param: melt_temp,mould_temp
+- process: injection_molding
+  message_type: problem_report
+  ordinal: 2
+  ja: 射出圧力・速度
+  en: Injection pressure & speed
+  th: แรงดันฉีด・ความเร็วฉีด
+  moldmind_param: inj_pressure,inj_speed
+- process: injection_molding
+  message_type: problem_report
+  ordinal: 3
+  ja: 保圧・保圧時間
+  en: Holding pressure & time
+  th: แรงดันย้ำ・เวลาย้ำ
+  moldmind_param: hold_pressure,hold_time
+- process: injection_molding
+  message_type: problem_report
+  ordinal: 4
+  ja: 冷却時間・サイクルタイム
+  en: Cooling / cycle time
+  th: เวลาหล่อเย็น・รอบเวลาการผลิต
+  moldmind_param: cooling_time,cycle_time
+- process: injection_molding
+  message_type: problem_report
+  ordinal: 5
+  ja: 材料ロット・乾燥・再生材比率
+  en: 'Material condition: lot, drying, regrind %'
+  th: ล็อตวัสดุ・การอบแห้ง・สัดส่วนวัสดุรีไซเคิล
+  moldmind_param: material_lot,drying,regrind_pct
+- process: injection_molding
+  message_type: spec_change
+  ordinal: 1
+  ja: 管理計画書の改訂
+  en: Control plan revision
+  th: การแก้ไขแผนควบคุม
+  moldmind_param: null
+- process: injection_molding
+  message_type: spec_change
+  ordinal: 2
+  ja: 初品検査
+  en: First-article inspection
+  th: การตรวจสอบชิ้นงานแรก
+  moldmind_param: null
+- process: press
+  message_type: problem_report
+  ordinal: 1
+  ja: 金型クリアランス
+  en: Die clearance
+  th: ระยะห่างแม่พิมพ์
+  moldmind_param: null
+- process: press
+  message_type: problem_report
+  ordinal: 2
+  ja: 材料板厚・ロット
+  en: Material thickness and lot
+  th: ความหนาวัสดุ・ล็อต
+  moldmind_param: null
+- process: press
+  message_type: problem_report
+  ordinal: 3
+  ja: プレス荷重・速度
+  en: Press tonnage and speed
+  th: แรงปั๊ม・ความเร็ว
+  moldmind_param: null
+- process: welding
+  message_type: problem_report
+  ordinal: 1
+  ja: 電流・電圧・送給速度
+  en: Current, voltage, wire feed
+  th: กระแส・แรงดัน・ความเร็วป้อนลวด
+  moldmind_param: null
+- process: welding
+  message_type: problem_report
+  ordinal: 2
+  ja: シールドガス流量
+  en: Shielding gas flow
+  th: อัตราการไหลของแก๊ส
+  moldmind_param: null
+- process: welding
+  message_type: problem_report
+  ordinal: 3
+  ja: 治具・位置決め
+  en: Fixture and positioning
+  th: จิ๊ก・การกำหนดตำแหน่ง
+  moldmind_param: null

@@ -1,0 +1,121 @@
+# GenbaGo configuration — validated by deploy/schemas/genbago-config.schema.json (TEST-14 TC-007).
+# Values that are also rows of genba.setting must be EQUAL to them (the database is the source of truth, SAD-14 P-4);
+# check_config14.py compares this file with db/seed_demo.sql. The const fields cannot be switched off by a deployment.
+version: 1
+
+languages:
+  supported: [ja, th, en]
+  pairs:                                  # = genba.ratio_bound (length-ratio flag, DDS-14 §4)
+    - { src: ja, tgt: th, ratio_min: 1.0,  ratio_max: 3.5 }
+    - { src: ja, tgt: en, ratio_min: 1.0,  ratio_max: 4.0 }
+    - { src: th, tgt: ja, ratio_min: 0.25, ratio_max: 1.0 }
+    - { src: th, tgt: en, ratio_min: 0.4,  ratio_max: 1.5 }
+    - { src: en, tgt: ja, ratio_min: 0.4,  ratio_max: 1.5 }
+    - { src: en, tgt: th, ratio_min: 0.6,  ratio_max: 2.0 }
+  registers: [report, shopfloor, customer]
+  ui: [th, ja, en]                        # NFR-06
+
+segmentation:
+  ja_terminators: "。！？\n"               # genba.sentence_count (JA)
+  th_mode: space_or_newline
+  en_mode: punctuation_or_newline
+  max_segment_chars: 800
+  batch_size: 12                          # segments per model call (IF-09)
+
+memory:                                   # FR-03, AI-07
+  exact_first: true                       # an exact normalised match is reused verbatim, no model call
+  fuzzy_threshold: 0.85                   # = genba.setting tm_fuzzy_threshold
+  fuzzy_max_matches: 3
+  fuzzy_engine: vector                    # runtime path; the trigram twin is the reference (DDS-14 §4)
+  write_back_on: approval                 # FR-24
+
+glossary:                                 # FR-21…FR-26
+  enforce: true                           # C-01 (const)
+  inject_only_found: true                 # SEC-J28: only entries present in the source go into the prompt
+  forbidden_is_flag: true
+  versioned: true                         # NFR-08
+  candidate_min_count: 3                  # FR-23 mining threshold
+
+checks:                                   # FR-05, FR-28, AI-04 — computed by the database (trg_segment_checks)
+  numbers:      { enabled: true, blocking: true }     # C-02, AC-02 (const)
+  glossary:     { enabled: true, blocking: false }    # C-01, AC-03 — flag
+  length_ratio: { enabled: true, blocking: false }
+  untranslated: { enabled: true, blocking: false }
+  omission:     { enabled: true, blocking: false }    # C-04
+
+interpretation:                           # FR-09…FR-15, C-05
+  separate: true                          # own table, own block (const)
+  labelled_inferred: true                 # (const)
+  ambiguity_threshold: 0.60               # = genba.setting ambiguity_threshold
+  max_readings: 3                         # = genba.setting max_readings
+  min_readings: 2
+  curated_checks_only: true               # FR-12
+  indexed_docs_only: true                 # AI-09
+  max_related_docs: 5
+
+llm:                                      # IF-09, AI-01
+  provider: ollama
+  model: qwen2.5:7b-instruct-q4_K_M       # = genba.setting model_name
+  max_params_b: 9                         # = genba.setting llm_max_params_b
+  temperature: 0.3                        # = genba.setting llm_temperature
+  json_output: true
+  timeout_s: 60
+  retries: 1
+  semaphore_slots: 1                      # one 8 GB GPU
+
+ocr:                                      # FR-18, FR-19, AI-06
+  engine: paddleocr-ja-vertical-2.7
+  vertical: true
+  handwriting_flag: true
+  char_confidence_min: 0.95               # region below → low_confidence (trg_ocr_flag)
+  char_accuracy_gate: 0.95                # = genba.setting ocr_char_accuracy_min
+  measured_accuracy: null                 # filled after the plant's sample-set measurement (OPS-14 §7); OCR jobs refused while null
+
+documents:                                # FR-16, FR-17, FR-20, NFR-02, NFR-07
+  formats: [docx, xlsx, pptx, pdf, image]
+  keep_layout: true
+  pdf_default_mode: side_by_side
+  max_file_mb: 50
+  batch_max_files: 500
+  resume: true
+
+confidentiality:                          # C-03, NFR-04
+  default_confidential: true              # = genba.setting confidential_default (const)
+  default_provider: local                 # (const)
+  cloud_provider_enabled: false           # (const in v1 — no cloud MT is configured by the compose file)
+  discord_confidential: false             # /jp is non-confidential only (SEC-J12)
+  signed_url_minutes: 15
+
+evaluation:                               # AI-02, AI-03, AI-05, AI-08
+  schedule: "0 6 1 * *"                   # monthly, 06:00 on the 1st
+  gate:
+    glossary_min: 0.98                    # = gate_glossary_min
+    numbers_min: 1                        # = gate_numbers_min
+    ped_max: 0.20                         # = gate_ped_max
+    class_min: 0.90                       # = gate_class_min
+  regression_pct: 2                       # = regression_pct
+  test_set_min_segments: 200              # AI-02 — the seed carries 40 (README-14 known gaps)
+  labelled_set_min_sentences: 300         # AI-05
+
+retention:                                # NFR-05
+  documents_days: 365                     # = genba.setting retention_days
+  results_days: 365
+  audit_days: 730
+  memory: forever
+  glossary_versions: forever
+
+roles:                                    # FR-30 — mirrored by the database guards
+  approve: [reviewer, admin]
+  glossary_edit: [admin]
+  tm_import: [reviewer, admin]
+  candidate_decide: [admin]
+
+prompts:                                  # deploy/prompts/*.md — front-matter must match llm.temperature / llm.max_params_b
+  translate: translate.v1
+  interpret: interpret.v1
+  readings: readings.v1
+
+notifications:                            # IF-13, IF-08
+  email:   { enabled: true, from: genbago@plant.local }
+  webhook: { enabled: false }
+  discord: { enabled: true, channel_ref: discord_channel_id }   # a reference to a secret file, never an id in this file

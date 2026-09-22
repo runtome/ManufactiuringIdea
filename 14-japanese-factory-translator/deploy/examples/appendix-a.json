@@ -1,0 +1,87 @@
+{
+  "inferred": true,
+  "confidence": 0.91,
+  "ambiguous": false,
+  "process": "injection_molding",
+  "message_type": "problem_report",
+  "entities": {
+    "direction": "up",
+    "metric": [
+      "不良率"
+    ],
+    "parameter": [
+      "成形条件"
+    ]
+  },
+  "timing_note": "sequence stated: the change precedes the increase (causal claim implied, not verified)",
+  "suggested_checks": [
+    {
+      "id": "c0000000-0000-4000-8000-000000000001",
+      "ordinal": 1,
+      "ja": "溶融温度・金型温度",
+      "en": "Melt / mould temperature",
+      "th": "อุณหภูมิหลอม・อุณหภูมิแม่พิมพ์",
+      "moldmind_param": "melt_temp,mould_temp"
+    },
+    {
+      "id": "c0000000-0000-4000-8000-000000000002",
+      "ordinal": 2,
+      "ja": "射出圧力・速度",
+      "en": "Injection pressure & speed",
+      "th": "แรงดันฉีด・ความเร็วฉีด",
+      "moldmind_param": "inj_pressure,inj_speed"
+    },
+    {
+      "id": "c0000000-0000-4000-8000-000000000003",
+      "ordinal": 3,
+      "ja": "保圧・保圧時間",
+      "en": "Holding pressure & time",
+      "th": "แรงดันย้ำ・เวลาย้ำ",
+      "moldmind_param": "hold_pressure,hold_time"
+    },
+    {
+      "id": "c0000000-0000-4000-8000-000000000004",
+      "ordinal": 4,
+      "ja": "冷却時間・サイクルタイム",
+      "en": "Cooling / cycle time",
+      "th": "เวลาหล่อเย็น・รอบเวลาการผลิต",
+      "moldmind_param": "cooling_time,cycle_time"
+    },
+    {
+      "id": "c0000000-0000-4000-8000-000000000005",
+      "ordinal": 5,
+      "ja": "材料ロット・乾燥・再生材比率",
+      "en": "Material condition: lot, drying, regrind %",
+      "th": "ล็อตวัสดุ・การอบแห้ง・สัดส่วนวัสดุรีไซเคิล",
+      "moldmind_param": "material_lot,drying,regrind_pct"
+    }
+  ],
+  "related_documents": [
+    {
+      "id": "a0000000-0000-4000-8000-000000000001",
+      "title": "Control plan — RAD-500-A rev.7",
+      "kind": "control_plan",
+      "uri": "s3://genbago-docs/index/001.pdf"
+    },
+    {
+      "id": "a0000000-0000-4000-8000-000000000002",
+      "title": "FMEA — RAD-500-A, process step 20",
+      "kind": "fmea",
+      "uri": "s3://genbago-docs/index/002.pdf"
+    },
+    {
+      "id": "a0000000-0000-4000-8000-000000000003",
+      "title": "Past case #178 — mould polish overdue → scratch increase",
+      "kind": "case",
+      "uri": "s3://genbago-docs/index/003.pdf"
+    },
+    {
+      "id": "a0000000-0000-4000-8000-000000000004",
+      "title": "SPC chart — Line 3 fin pitch (last 30 days)",
+      "kind": "spc",
+      "uri": "s3://genbago-docs/index/004.pdf"
+    }
+  ],
+  "model": "rules+qwen2.5:7b",
+  "prompt_version": "interpret.v1"
+}

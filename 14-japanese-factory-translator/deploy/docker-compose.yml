@@ -1,0 +1,266 @@
+# GenbaGo — docker-compose.yml (standalone; OPS-14 §1–§4). Platform mode reuses the platform's postgres, redis, minio, ollama and notifier (SAD-14 §9).
+# Profiles:  gpu (ollama on CUDA) | cpu (ollama-cpu — slower, for integration tests) | discord (discord-bot, the /jp command) | dev (mailpit)
+#   docker compose --profile gpu --profile discord up -d              plant
+#   docker compose --profile cpu --profile dev up -d                  integration tests (TEST-14 TS-1…TS-9)
+# Networks:  frontend (reverse proxy → web/api) · internal (no route out: postgres, redis, minio, ollama, workers, indexer, scheduler)
+#            · egress (discord-bot only — the only internet-facing service; no cloud MT is configured anywhere, C-03 / SEC-J11 / SEC-J13)
+# Secrets are FILES under ${SECRETS_DIR} (OPS-14 §4) — never in this file or in .env (TEST-14 TC-004).
+
+x-hardened: &hardened
+  user: "10001:10001"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp]
+  restart: unless-stopped
+  logging: { driver: json-file, options: { max-size: "20m", max-file: "5" } }
+
+x-app-env: &app-env
+  TZ: ${TZ}
+  REDIS_URL: redis://redis:6379/0
+  CONFIG_DIR: /etc/genbago
+  LOG_LEVEL: ${LOG_LEVEL}
+  METRICS_ENABLED: "true"
+
+x-s3-env: &s3-env
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+  S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+  S3_BUCKET_DOCS: ${S3_BUCKET_DOCS}
+  S3_BUCKET_RESULTS: ${S3_BUCKET_RESULTS}
+  S3_BUCKET_EXPORTS: ${S3_BUCKET_EXPORTS}
+  S3_BUCKET_INDEX: ${S3_BUCKET_INDEX}
+
+x-worker: &worker                                         # role worker_rw: segments, interpretations, OCR, job progress — no glossary / TM / check-item writes (SEC-J15)
+  <<: *hardened
+  image: ${GB_REGISTRY}/worker:${GB_VERSION}
+  environment:
+    <<: [*app-env, *s3-env]
+    DATABASE_URL_FILE: /run/secrets/worker_database_url
+    OLLAMA_URL: http://ollama:11434
+    LLM_SEMAPHORE_SLOTS: ${LLM_SEMAPHORE_SLOTS}
+  secrets: [worker_database_url, s3_access_key, s3_secret_key]
+  volumes:
+    - ${CONFIG_DIR}:/etc/genbago:ro                       # genbago.yaml, schemas/, prompts/, check-items
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    minio: { condition: service_healthy }
+  networks: [internal]
+
+services:
+  # ------------------------------------------------------------------ front
+  web:                                                    # review UI: side-by-side segments, checks, the ruled interpretation block, hover readings, glossary admin, dashboard (FR-27, FR-31, NFR-06)
+    <<: *hardened
+    image: ${GB_REGISTRY}/web:${GB_VERSION}
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL}
+      API_URL: http://api:8080
+      DEFAULT_LOCALE: ${DEFAULT_LOCALE}
+    ports: ["${BIND_ADDR}:${WEB_PORT}:3000"]
+    depends_on: [api]
+    networks: [frontend]
+
+  api:                                                    # API-14; role app_rw; enqueues jobs; signs URLs (≤ 15 min); serves IF-16 tools to Copilot / QE-Agent
+    <<: *hardened
+    image: ${GB_REGISTRY}/api:${GB_VERSION}
+    environment:
+      <<: [*app-env, *s3-env]
+      PUBLIC_URL: ${PUBLIC_URL}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      TOOL_TOKEN_FILE: /run/secrets/tool_token           # bearer for IF-16 consumers (10 Copilot, 09 QE-Agent)
+      SIGNED_URL_MINUTES: ${SIGNED_URL_MINUTES}
+      RATE_LIMIT_TRANSLATE_PER_MIN: ${RATE_LIMIT_TRANSLATE_PER_MIN}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_FROM: ${SMTP_FROM}
+    secrets: [database_url, jwt_secret, tool_token, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/genbago:ro
+    ports: ["${BIND_ADDR}:${API_PORT}:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    healthcheck: { test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"], interval: 15s, timeout: 5s, retries: 5 }
+    networks: [frontend, internal]
+
+  # ------------------------------------------------------------------ workers (internal only)
+  worker-translate:                                       # segmentation → TM lookup → glossary-constrained model call → segments (checks by trg_segment_checks); interpretation (rules + interpret.v1 / readings.v1)
+    <<: *worker
+    command: ["worker", "--queue", "translate,interpret", "--batch", "${TRANSLATE_BATCH}"]
+
+  worker-ocr:                                             # IF-76: JA vertical/horizontal OCR, regions, handwriting flag (trg_ocr_flag); refuses jobs while ocr.measured_accuracy is null
+    <<: *worker
+    command: ["worker", "--queue", "ocr"]
+    environment:
+      <<: [*app-env, *s3-env]
+      DATABASE_URL_FILE: /run/secrets/worker_database_url
+      OCR_ENGINE: ${OCR_ENGINE}
+      OCR_MODEL_DIR: /models/ocr
+    volumes:
+      - ${CONFIG_DIR}:/etc/genbago:ro
+      - ocr-models:/models/ocr:ro
+
+  worker-doc:                                             # IF-77: DOCX/XLSX/PPTX/PDF extraction with anchors, layout-preserving rebuild, batches, resume (NFR-07)
+    <<: *worker
+    command: ["worker", "--queue", "document,batch"]
+    environment:
+      <<: [*app-env, *s3-env]
+      DATABASE_URL_FILE: /run/secrets/worker_database_url
+      MAX_FILE_MB: ${MAX_FILE_MB}
+    tmpfs: [/tmp, /work]
+
+  indexer:                                                # TM embeddings (pgvector, the runtime fuzzy path), document tags for related_docs(), term mining (FR-23)
+    <<: *worker
+    command: ["indexer", "--interval", "${INDEX_INTERVAL_S}"]
+
+  scheduler:                                              # monthly evaluation run (AI-02/AI-05/AI-08, trg_eval_gate), term usage rollup (FR-26), retention (NFR-05), candidate mining
+    <<: *hardened
+    image: ${GB_REGISTRY}/scheduler:${GB_VERSION}
+    environment:
+      <<: [*app-env, *s3-env]
+      DATABASE_URL_FILE: /run/secrets/database_url
+      EVAL_SCHEDULE: ${EVAL_SCHEDULE}
+      RETENTION_DAYS: ${RETENTION_DAYS}
+    secrets: [database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/genbago:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [internal]
+
+  # ------------------------------------------------------------------ data
+  postgres:                                               # PostgreSQL 16 + pgvector + pg_trgm; db/schema.sql applied at first start; roles app_rw / worker_rw / app_ro / auditor_ro
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - ./initdb/20-roles.sh:/docker-entrypoint-initdb.d/20-roles.sh:ro   # role passwords from files (OPS-14 §4.2)
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"], interval: 10s, timeout: 5s, retries: 10 }
+    networks: [internal]
+
+  redis:                                                  # job queues, rate limits, the GPU semaphore
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--maxmemory", "${REDIS_MAXMEMORY}", "--maxmemory-policy", "noeviction"]
+    volumes: [redisdata:/data]
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 10s, timeout: 3s, retries: 5 }
+    networks: [internal]
+
+  minio:                                                  # IF-10: genbago-docs (versioned), genbago-results, genbago-exports (object lock), genbago-index
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/minio_root_user
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_password
+    secrets: [minio_root_user, minio_root_password]
+    volumes: [miniodata:/data]
+    healthcheck: { test: ["CMD", "mc", "ready", "local"], interval: 15s, timeout: 5s, retries: 5 }
+    networks: [internal]
+
+  minio-init:                                             # creates the four buckets, versioning on docs, object lock on exports, the app access key from files; exits
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio: { condition: service_healthy }
+    environment:
+      S3_BUCKET_DOCS: ${S3_BUCKET_DOCS}
+      S3_BUCKET_RESULTS: ${S3_BUCKET_RESULTS}
+      S3_BUCKET_EXPORTS: ${S3_BUCKET_EXPORTS}
+      S3_BUCKET_INDEX: ${S3_BUCKET_INDEX}
+    secrets: [minio_root_user, minio_root_password, s3_access_key, s3_secret_key]
+    entrypoint: ["/bin/sh", "/init/minio-init.sh"]
+    volumes:
+      - ./minio-init.sh:/init/minio-init.sh:ro
+    restart: "no"
+    networks: [internal]
+
+  ollama:                                                 # IF-09: one JA-capable model ≤ 9 B (qwen2.5:7b-instruct-q4_K_M); one 8 GB GPU; single parallel request
+    image: ollama/ollama:0.6.8
+    profiles: [gpu]
+    restart: unless-stopped
+    environment:
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE}
+    volumes: [ollama:/root/.ollama]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck: { test: ["CMD", "ollama", "list"], interval: 30s, timeout: 10s, retries: 5 }
+    networks: [internal]
+
+  ollama-cpu:                                             # CPU fallback for integration tests (profile cpu); same alias so workers need no change
+    image: ollama/ollama:0.6.8
+    profiles: [cpu]
+    restart: unless-stopped
+    environment:
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE}
+    volumes: [ollama:/root/.ollama]
+    networks:
+      internal:
+        aliases: [ollama]
+
+  # ------------------------------------------------------------------ optional
+  discord-bot:                                            # IF-08: /jp <text> → non-confidential text jobs only; attachments refused; viewer token to the API (SEC-J12); the only service with egress
+    <<: *hardened
+    image: ${GB_REGISTRY}/discord-bot:${GB_VERSION}
+    profiles: [discord]
+    environment:
+      TZ: ${TZ}
+      API_URL: http://api:8080
+      DISCORD_TOKEN_FILE: /run/secrets/discord_token
+      DISCORD_CHANNEL_ID_FILE: /run/secrets/discord_channel_id
+      BOT_API_TOKEN_FILE: /run/secrets/bot_api_token
+      LOG_LEVEL: ${LOG_LEVEL}
+    secrets: [discord_token, discord_channel_id, bot_api_token]
+    depends_on:
+      api: { condition: service_healthy }
+    networks: [internal, egress]
+
+  mailpit:                                                # dev SMTP sink (IF-13, TC-093)
+    image: axllent/mailpit:v1.24
+    profiles: [dev]
+    restart: unless-stopped
+    ports: ["${BIND_ADDR}:${MAILPIT_PORT}:8025"]
+    networks: [internal]
+
+networks:
+  frontend: {}
+  internal: { internal: true }
+  egress: {}
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  miniodata: {}
+  ollama: {}
+  ocr-models: {}
+
+secrets:                                                  # OPS-14 §4 — files under ${SECRETS_DIR}; rotate per SEC-00 §5
+  postgres_password:     { file: "${SECRETS_DIR}/postgres_password" }
+  database_url:          { file: "${SECRETS_DIR}/database_url" }            # postgresql://app_rw:…@postgres:5432/${POSTGRES_DB}
+  worker_database_url:   { file: "${SECRETS_DIR}/worker_database_url" }     # postgresql://worker_rw:…@postgres:5432/${POSTGRES_DB}
+  jwt_secret:            { file: "${SECRETS_DIR}/jwt_secret" }
+  tool_token:            { file: "${SECRETS_DIR}/tool_token" }
+  bot_api_token:         { file: "${SECRETS_DIR}/bot_api_token" }
+  minio_root_user:       { file: "${SECRETS_DIR}/minio_root_user" }
+  minio_root_password:   { file: "${SECRETS_DIR}/minio_root_password" }
+  s3_access_key:         { file: "${SECRETS_DIR}/s3_access_key" }
+  s3_secret_key:         { file: "${SECRETS_DIR}/s3_secret_key" }
+  discord_token:         { file: "${SECRETS_DIR}/discord_token" }
+  discord_channel_id:    { file: "${SECRETS_DIR}/discord_channel_id" }

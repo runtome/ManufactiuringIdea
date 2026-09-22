@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.plant.local/schemas/genbago/config.v1.json",
+  "title": "GenbaGo configuration (deploy/genbago.yaml — OPS-14 §3, TEST-14 TC-007)",
+  "description": "Values that are also rows of genba.setting must be equal to them (the database is the source of truth — SAD-14 P-4). The constants (glossary enforcement, numbers blocking, interpretation separate, confidential default, local provider default) are const in this schema so a deployment cannot switch them off.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "languages", "segmentation", "memory", "glossary", "checks", "interpretation", "llm", "ocr", "documents", "confidentiality", "evaluation", "retention", "roles", "prompts"],
+  "properties": {
+    "version": { "type": "integer", "const": 1 },
+    "languages": {
+      "type": "object", "additionalProperties": false, "required": ["supported", "pairs", "registers", "ui"],
+      "properties": {
+        "supported": { "type": "array", "minItems": 3, "uniqueItems": true, "items": { "type": "string", "enum": ["ja", "th", "en"] } },
+        "pairs": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "object", "additionalProperties": false, "required": ["src", "tgt", "ratio_min", "ratio_max"],
+                   "properties": { "src": { "type": "string", "enum": ["ja", "th", "en"] }, "tgt": { "type": "string", "enum": ["ja", "th", "en"] },
+                                   "ratio_min": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }, "ratio_max": { "type": "number", "minimum": 1, "maximum": 10 } } } },
+        "registers": { "type": "array", "const": ["report", "shopfloor", "customer"] },
+        "ui": { "type": "array", "const": ["th", "ja", "en"] }
+      }
+    },
+    "segmentation": {
+      "type": "object", "additionalProperties": false, "required": ["ja_terminators", "th_mode", "en_mode", "max_segment_chars", "batch_size"],
+      "properties": {
+        "ja_terminators": { "type": "string", "const": "。！？\n" },
+        "th_mode": { "type": "string", "const": "space_or_newline" },
+        "en_mode": { "type": "string", "const": "punctuation_or_newline" },
+        "max_segment_chars": { "type": "integer", "minimum": 200, "maximum": 2000 },
+        "batch_size": { "type": "integer", "minimum": 1, "maximum": 12 }
+      }
+    },
+    "memory": {
+      "type": "object", "additionalProperties": false, "required": ["exact_first", "fuzzy_threshold", "fuzzy_max_matches", "fuzzy_engine", "write_back_on"],
+      "properties": {
+        "exact_first": { "type": "boolean", "const": true },
+        "fuzzy_threshold": { "type": "number", "minimum": 0.85, "maximum": 1 },
+        "fuzzy_max_matches": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "fuzzy_engine": { "type": "string", "enum": ["trigram", "vector"] },
+        "write_back_on": { "type": "string", "const": "approval" }
+      }
+    },
+    "glossary": {
+      "type": "object", "additionalProperties": false, "required": ["enforce", "inject_only_found", "forbidden_is_flag", "versioned", "candidate_min_count"],
+      "properties": {
+        "enforce": { "type": "boolean", "const": true },
+        "inject_only_found": { "type": "boolean", "const": true },
+        "forbidden_is_flag": { "type": "boolean", "const": true },
+        "versioned": { "type": "boolean", "const": true },
+        "candidate_min_count": { "type": "integer", "minimum": 2, "maximum": 50 }
+      }
+    },
+    "checks": {
+      "type": "object", "additionalProperties": false, "required": ["numbers", "glossary", "length_ratio", "untranslated", "omission"],
+      "properties": {
+        "numbers": { "type": "object", "additionalProperties": false, "required": ["enabled", "blocking"], "properties": { "enabled": { "const": true }, "blocking": { "const": true } } },
+        "glossary": { "type": "object", "additionalProperties": false, "required": ["enabled", "blocking"], "properties": { "enabled": { "const": true }, "blocking": { "const": false } } },
+        "length_ratio": { "type": "object", "additionalProperties": false, "required": ["enabled", "blocking"], "properties": { "enabled": { "type": "boolean" }, "blocking": { "const": false } } },
+        "untranslated": { "type": "object", "additionalProperties": false, "required": ["enabled", "blocking"], "properties": { "enabled": { "const": true }, "blocking": { "const": false } } },
+        "omission": { "type": "object", "additionalProperties": false, "required": ["enabled", "blocking"], "properties": { "enabled": { "const": true }, "blocking": { "const": false } } }
+      }
+    },
+    "interpretation": {
+      "type": "object", "additionalProperties": false, "required": ["separate", "labelled_inferred", "ambiguity_threshold", "max_readings", "min_readings", "curated_checks_only", "indexed_docs_only", "max_related_docs"],
+      "properties": {
+        "separate": { "type": "boolean", "const": true },
+        "labelled_inferred": { "type": "boolean", "const": true },
+        "ambiguity_threshold": { "type": "number", "minimum": 0.5, "maximum": 0.8 },
+        "max_readings": { "type": "integer", "minimum": 2, "maximum": 3 },
+        "min_readings": { "type": "integer", "const": 2 },
+        "curated_checks_only": { "type": "boolean", "const": true },
+        "indexed_docs_only": { "type": "boolean", "const": true },
+        "max_related_docs": { "type": "integer", "minimum": 1, "maximum": 10 }
+      }
+    },
+    "llm": {
+      "type": "object", "additionalProperties": false, "required": ["provider", "model", "max_params_b", "temperature", "json_output", "timeout_s", "retries", "semaphore_slots"],
+      "properties": {
+        "provider": { "type": "string", "const": "ollama" },
+        "model": { "type": "string", "pattern": "^[a-z0-9._-]+:[A-Za-z0-9._-]+$" },
+        "max_params_b": { "type": "number", "minimum": 1, "maximum": 9 },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 0.3 },
+        "json_output": { "type": "boolean", "const": true },
+        "timeout_s": { "type": "integer", "minimum": 5, "maximum": 120 },
+        "retries": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "semaphore_slots": { "type": "integer", "minimum": 1, "maximum": 2 }
+      }
+    },
+    "ocr": {
+      "type": "object", "additionalProperties": false, "required": ["engine", "vertical", "handwriting_flag", "char_confidence_min", "char_accuracy_gate", "measured_accuracy"],
+      "properties": {
+        "engine": { "type": "string", "minLength": 3 },
+        "vertical": { "type": "boolean", "const": true },
+        "handwriting_flag": { "type": "boolean", "const": true },
+        "char_confidence_min": { "type": "number", "minimum": 0.95, "maximum": 1 },
+        "char_accuracy_gate": { "type": "number", "minimum": 0.95, "maximum": 1 },
+        "measured_accuracy": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+      }
+    },
+    "documents": {
+      "type": "object", "additionalProperties": false, "required": ["formats", "keep_layout", "pdf_default_mode", "max_file_mb", "batch_max_files", "resume"],
+      "properties": {
+        "formats": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "enum": ["docx", "xlsx", "pptx", "pdf", "image"] } },
+        "keep_layout": { "type": "boolean", "const": true },
+        "pdf_default_mode": { "type": "string", "enum": ["side_by_side", "overlay"] },
+        "max_file_mb": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "batch_max_files": { "type": "integer", "minimum": 1, "maximum": 500 },
+        "resume": { "type": "boolean", "const": true }
+      }
+    },
+    "confidentiality": {
+      "type": "object", "additionalProperties": false, "required": ["default_confidential", "default_provider", "cloud_provider_enabled", "discord_confidential", "signed_url_minutes"],
+      "properties": {
+        "default_confidential": { "type": "boolean", "const": true },
+        "default_provider": { "type": "string", "const": "local" },
+        "cloud_provider_enabled": { "type": "boolean", "const": false },
+        "discord_confidential": { "type": "boolean", "const": false },
+        "signed_url_minutes": { "type": "integer", "minimum": 1, "maximum": 15 }
+      }
+    },
+    "evaluation": {
+      "type": "object", "additionalProperties": false, "required": ["schedule", "gate", "regression_pct", "test_set_min_segments", "labelled_set_min_sentences"],
+      "properties": {
+        "schedule": { "type": "string", "pattern": "^([0-9*/,-]+\\s+){4}[0-9*/,-]+$" },
+        "gate": { "type": "object", "additionalProperties": false, "required": ["glossary_min", "numbers_min", "ped_max", "class_min"],
+                  "properties": { "glossary_min": { "type": "number", "minimum": 0.98, "maximum": 1 }, "numbers_min": { "type": "number", "const": 1 },
+                                  "ped_max": { "type": "number", "exclusiveMinimum": 0, "maximum": 0.20 }, "class_min": { "type": "number", "minimum": 0.90, "maximum": 1 } } },
+        "regression_pct": { "type": "number", "const": 2 },
+        "test_set_min_segments": { "type": "integer", "minimum": 200 },
+        "labelled_set_min_sentences": { "type": "integer", "minimum": 300 }
+      }
+    },
+    "retention": {
+      "type": "object", "additionalProperties": false, "required": ["documents_days", "results_days", "audit_days", "memory", "glossary_versions"],
+      "properties": {
+        "documents_days": { "type": "integer", "minimum": 365 },
+        "results_days": { "type": "integer", "minimum": 365 },
+        "audit_days": { "type": "integer", "minimum": 730 },
+        "memory": { "type": "string", "const": "forever" },
+        "glossary_versions": { "type": "string", "const": "forever" }
+      }
+    },
+    "roles": {
+      "type": "object", "additionalProperties": false, "required": ["approve", "glossary_edit", "tm_import", "candidate_decide"],
+      "properties": {
+        "approve": { "type": "array", "const": ["reviewer", "admin"] },
+        "glossary_edit": { "type": "array", "const": ["admin"] },
+        "tm_import": { "type": "array", "const": ["reviewer", "admin"] },
+        "candidate_decide": { "type": "array", "const": ["admin"] }
+      }
+    },
+    "prompts": {
+      "type": "object", "additionalProperties": false, "required": ["translate", "interpret", "readings"],
+      "properties": {
+        "translate": { "type": "string", "pattern": "^translate\\.v[0-9]+$" },
+        "interpret": { "type": "string", "pattern": "^interpret\\.v[0-9]+$" },
+        "readings": { "type": "string", "pattern": "^readings\\.v[0-9]+$" }
+      }
+    },
+    "notifications": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "email": { "type": "object", "additionalProperties": false, "properties": { "enabled": { "type": "boolean" }, "from": { "type": "string" } } },
+        "webhook": { "type": "object", "additionalProperties": false, "properties": { "enabled": { "type": "boolean" }, "url": { "type": "string", "pattern": "^https://" } } },
+        "discord": { "type": "object", "additionalProperties": false, "properties": { "enabled": { "type": "boolean" }, "channel_ref": { "type": "string" } } }
+      }
+    }
+  }
+}
