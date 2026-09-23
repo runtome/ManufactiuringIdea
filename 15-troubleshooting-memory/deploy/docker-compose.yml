@@ -1,0 +1,302 @@
+# Genba Memory — docker-compose.yml (standalone; OPS-15 §1–§4). Platform mode reuses the platform's postgres, redis, minio, ollama and notifier (SAD-15 §9).
+# Profiles:  gpu (ollama on CUDA) | cpu (ollama-cpu — slower, for integration tests) | discord (discord-bot, recurrence alerts) | dev (mailpit)
+#   docker compose --profile gpu --profile discord up -d              plant
+#   docker compose --profile cpu --profile dev up -d                  integration tests (TEST-15 TS-1…TS-9)
+# Networks:  frontend (reverse proxy → web/api) · internal (no route out: postgres, redis, minio, ollama, the workers, retriever, indexer, scheduler)
+#            · egress (discord-bot only — the one internet-facing service; no external model, embedding or translation endpoint exists anywhere, C-04 / SEC-H22 / SEC-H23)
+# Secrets are FILES under ${SECRETS_DIR} (OPS-15 §4) — never in this file or in .env (TEST-15 TC-004).
+
+x-hardened: &hardened
+  user: "10001:10001"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp]
+  restart: unless-stopped
+  logging: { driver: json-file, options: { max-size: "20m", max-file: "5" } }
+
+x-app-env: &app-env
+  TZ: ${TZ}
+  REDIS_URL: redis://redis:6379/0
+  CONFIG_DIR: /etc/genbamemory
+  LOG_LEVEL: ${LOG_LEVEL}
+  METRICS_ENABLED: "true"
+
+x-s3-env: &s3-env
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+  S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+  S3_BUCKET_ORIGINALS: ${S3_BUCKET_ORIGINALS}
+  S3_BUCKET_OCR: ${S3_BUCKET_OCR}
+  S3_BUCKET_EXPORTS: ${S3_BUCKET_EXPORTS}
+  S3_BUCKET_TMP: ${S3_BUCKET_TMP}
+
+x-worker: &worker                                         # role worker_rw: ingestion, extraction, entities, index, suggestions — never verification, never a merge, never GenbaGo's glossary or TM (SEC-H12)
+  <<: *hardened
+  image: ${GM_REGISTRY}/worker:${GM_VERSION}
+  environment:
+    <<: [*app-env, *s3-env]
+    DATABASE_URL_FILE: /run/secrets/worker_database_url
+    OLLAMA_URL: http://ollama:11434
+    LLM_SEMAPHORE_SLOTS: ${LLM_SEMAPHORE_SLOTS}
+  secrets: [worker_database_url, s3_access_key, s3_secret_key]
+  volumes:
+    - ${CONFIG_DIR}:/etc/genbamemory:ro                   # genbamemory.yaml, schemas/, prompts/
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    minio: { condition: service_healthy }
+  networks: [internal]
+
+services:
+  # ------------------------------------------------------------------ front
+  web:                                                    # search, the case card with its badge and sources, the curation queue, analytics, admin — TH/JA/EN (NFR-09)
+    <<: *hardened
+    image: ${GM_REGISTRY}/web:${GM_VERSION}
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL}
+      API_URL: http://api:8080
+      DEFAULT_LOCALE: ${DEFAULT_LOCALE}
+    ports: ["${BIND_ADDR}:${WEB_PORT}:3000"]
+    depends_on: [api]
+    networks: [frontend]
+
+  api:                                                    # API-15; role app_rw; signs original-download URLs (≤ 15 min); serves the four IF-16 tools
+    <<: *hardened
+    image: ${GM_REGISTRY}/api:${GM_VERSION}
+    environment:
+      <<: [*app-env, *s3-env]
+      PUBLIC_URL: ${PUBLIC_URL}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      TOOL_TOKEN_FILE: /run/secrets/tool_token           # bearer for the IF-16 consumers (10, 09, 06, 13, 01, 02)
+      SIGNED_URL_MINUTES: ${SIGNED_URL_MINUTES}
+      RATE_LIMIT_SEARCH_PER_MIN: ${RATE_LIMIT_SEARCH_PER_MIN}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_FROM: ${SMTP_FROM}
+    secrets: [database_url, jwt_secret, tool_token, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/genbamemory:ro
+    ports: ["${BIND_ADDR}:${API_PORT}:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    healthcheck: { test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"], interval: 15s, timeout: 5s, retries: 5 }
+    networks: [frontend, internal]
+
+  # ------------------------------------------------------------------ workers (internal only)
+  worker-ingest:                                          # fetch (IF-78), sha256, dedup, language detect, text extraction, chunking (IF-55)
+    <<: *worker
+    command: ["ingest"]
+    environment:
+      <<: [*app-env, *s3-env]
+      DATABASE_URL_FILE: /run/secrets/worker_database_url
+      OLLAMA_URL: http://ollama:11434
+      LLM_SEMAPHORE_SLOTS: ${LLM_SEMAPHORE_SLOTS}
+      SOURCE_CREDENTIALS_DIR: /run/secrets
+      INGEST_CONCURRENCY: ${INGEST_CONCURRENCY}
+    secrets: [worker_database_url, s3_access_key, s3_secret_key, source_mail_password, source_chat_token]
+
+  worker-ocr:                                             # scanned PDFs and photos; vertical Japanese and Thai; emits the IF-76 shape
+    <<: *worker
+    command: ["ocr"]
+    volumes:
+      - ${CONFIG_DIR}:/etc/genbamemory:ro
+      - ocr-models:/models/ocr:ro
+    environment:
+      <<: [*app-env, *s3-env]
+      DATABASE_URL_FILE: /run/secrets/worker_database_url
+      OLLAMA_URL: http://ollama:11434
+      LLM_SEMAPHORE_SLOTS: ${LLM_SEMAPHORE_SLOTS}
+      OCR_MODEL_DIR: /models/ocr
+      OCR_CONFIDENCE_GATE: ${OCR_CONFIDENCE_GATE}
+
+  worker-extract:                                         # schema-constrained case extraction (IF-79); one row per field with confidence and provenance
+    <<: *worker
+    command: ["extract"]
+
+  normaliser:                                             # entities → canonical ids (IF-80); unmapped values open a curation item
+    <<: *worker
+    command: ["normalise"]
+
+  indexer:                                                # embeddings, embedding_version, term_stat, background re-embed (IF-84)
+    <<: *worker
+    command: ["index"]
+    environment:
+      <<: [*app-env, *s3-env]
+      DATABASE_URL_FILE: /run/secrets/worker_database_url
+      OLLAMA_URL: http://ollama:11434
+      LLM_SEMAPHORE_SLOTS: ${LLM_SEMAPHORE_SLOTS}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL}
+      REEMBED_BATCH_SIZE: ${REEMBED_BATCH_SIZE}
+
+  retriever:                                              # BM25 + vector + RRF + rerank + the ACL predicate (IF-81); its own scale unit under load
+    <<: *worker
+    command: ["retrieve"]
+    environment:
+      <<: [*app-env, *s3-env]
+      DATABASE_URL_FILE: /run/secrets/worker_database_url
+      OLLAMA_URL: http://ollama:11434
+      LLM_SEMAPHORE_SLOTS: ${LLM_SEMAPHORE_SLOTS}
+      RERANK_MODEL: ${RERANK_MODEL}
+      RERANK_DEPTH: ${RERANK_DEPTH}
+
+  scheduler:                                              # case-open suggestions (FR-20), the recurrence sweep, analytics rollup, the monthly evaluation
+    <<: *hardened
+    image: ${GM_REGISTRY}/worker:${GM_VERSION}
+    command: ["schedule"]
+    environment:
+      <<: [*app-env, *s3-env]
+      DATABASE_URL_FILE: /run/secrets/database_url       # app_rw: the scheduler writes suggestions and evaluation runs
+      EVAL_SCHEDULE: ${EVAL_SCHEDULE}
+    secrets: [database_url, s3_access_key, s3_secret_key]
+    volumes:
+      - ${CONFIG_DIR}:/etc/genbamemory:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    networks: [internal]
+
+  # ------------------------------------------------------------------ data
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      TZ: ${TZ}
+    secrets: [postgres_password, app_rw_password, worker_rw_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - ./initdb/20-roles.sh:/docker-entrypoint-initdb.d/20-roles.sh:ro
+    command: ["postgres", "-c", "shared_buffers=1GB", "-c", "work_mem=32MB",
+              "-c", "maintenance_work_mem=512MB", "-c", "max_parallel_workers_per_gather=2"]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"], interval: 10s, timeout: 5s, retries: 10 }
+    restart: unless-stopped
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "512mb",
+              "--maxmemory-policy", "allkeys-lru"]
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 10s, timeout: 3s, retries: 5 }
+    restart: unless-stopped
+    networks: [internal]
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/minio_root_user
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_password
+    secrets: [minio_root_user, minio_root_password]
+    volumes: [miniodata:/data]
+    healthcheck: { test: ["CMD", "mc", "ready", "local"], interval: 15s, timeout: 5s, retries: 10 }
+    restart: unless-stopped
+    networks: [internal]
+
+  minio-init:                                             # buckets, versioning, OBJECT LOCK on the originals (C-01, FR-05), the app policy
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    entrypoint: ["/bin/sh", "/init/minio-init.sh"]
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET_ORIGINALS: ${S3_BUCKET_ORIGINALS}
+      S3_BUCKET_OCR: ${S3_BUCKET_OCR}
+      S3_BUCKET_EXPORTS: ${S3_BUCKET_EXPORTS}
+      S3_BUCKET_TMP: ${S3_BUCKET_TMP}
+      RETENTION_DAYS_ORIGINALS: ${RETENTION_DAYS_ORIGINALS}
+    secrets: [minio_root_user, minio_root_password, s3_access_key, s3_secret_key]
+    volumes: [./minio-init.sh:/init/minio-init.sh:ro]
+    depends_on:
+      minio: { condition: service_healthy }
+    restart: "no"
+    networks: [internal]
+
+  # ------------------------------------------------------------------ models
+  ollama:                                                 # extraction ≤ 9 B, bge-m3 embeddings, the cross-encoder reranker — in-cluster only
+    profiles: [gpu]
+    image: ollama/ollama:0.6.6
+    environment:
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE}
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "2"
+    volumes: [ollama:/root/.ollama]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks: [internal]
+
+  ollama-cpu:                                             # same models, no GPU: integration tests and small plants
+    profiles: [cpu]
+    image: ollama/ollama:0.6.6
+    environment:
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE}
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "2"
+    volumes: [ollama:/root/.ollama]
+    restart: unless-stopped
+    networks:
+      internal:
+        aliases: [ollama]
+
+  # ------------------------------------------------------------------ notifications
+  discord-bot:                                            # recurrence proposals and queue warnings — titles and links, never a snippet (SEC-H21)
+    <<: *hardened
+    profiles: [discord]
+    image: ${GM_REGISTRY}/discord-bot:${GM_VERSION}
+    environment:
+      TZ: ${TZ}
+      API_URL: http://api:8080
+      BOT_API_TOKEN_FILE: /run/secrets/bot_api_token
+      DISCORD_TOKEN_FILE: /run/secrets/discord_token
+      DISCORD_CHANNEL_ID_FILE: /run/secrets/discord_channel_id
+      ALERT_MIN_SEVERITY: ${ALERT_MIN_SEVERITY}
+    secrets: [bot_api_token, discord_token, discord_channel_id]
+    depends_on:
+      api: { condition: service_healthy }
+    networks: [internal, egress]
+
+  mailpit:                                                # dev only: catches the curation and evaluation mails
+    profiles: [dev]
+    image: axllent/mailpit:v1.22
+    ports: ["${BIND_ADDR}:${MAILPIT_PORT}:8025"]
+    restart: unless-stopped
+    networks: [internal]
+
+networks:
+  frontend: {}
+  internal:
+    internal: true                                        # no route out: the workers, the models and the data never reach the internet (C-04, NFR-06)
+  egress: {}
+
+volumes:
+  pgdata: {}
+  miniodata: {}
+  ollama: {}
+  ocr-models: {}
+
+secrets:
+  postgres_password:      { file: "${SECRETS_DIR}/postgres_password" }
+  app_rw_password:        { file: "${SECRETS_DIR}/app_rw_password" }
+  worker_rw_password:     { file: "${SECRETS_DIR}/worker_rw_password" }
+  database_url:           { file: "${SECRETS_DIR}/database_url" }
+  worker_database_url:    { file: "${SECRETS_DIR}/worker_database_url" }
+  jwt_secret:             { file: "${SECRETS_DIR}/jwt_secret" }
+  tool_token:             { file: "${SECRETS_DIR}/tool_token" }
+  s3_access_key:          { file: "${SECRETS_DIR}/s3_access_key" }
+  s3_secret_key:          { file: "${SECRETS_DIR}/s3_secret_key" }
+  minio_root_user:        { file: "${SECRETS_DIR}/minio_root_user" }
+  minio_root_password:    { file: "${SECRETS_DIR}/minio_root_password" }
+  bot_api_token:          { file: "${SECRETS_DIR}/bot_api_token" }
+  discord_token:          { file: "${SECRETS_DIR}/discord_token" }
+  discord_channel_id:     { file: "${SECRETS_DIR}/discord_channel_id" }
+  source_mail_password:   { file: "${SECRETS_DIR}/source_mail_password" }
+  source_chat_token:      { file: "${SECRETS_DIR}/source_chat_token" }

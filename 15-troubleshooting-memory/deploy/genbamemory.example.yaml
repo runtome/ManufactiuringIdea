@@ -1,0 +1,145 @@
+# Genba Memory — example configuration
+#
+# Validated against schemas/genbamemory-config.schema.json (TEST-15 TC-007).
+# Every value here equals the corresponding row in memory.setting / memory.rank_weight
+# in db/seed_demo.sql; the checker compares the two, because a configuration file that
+# disagrees with the database is a configuration file nobody can trust.
+#
+# The database is the source of truth at run time. This file is what an operator edits
+# before the first boot and what OPS-15 §4 walks through.
+
+languages:
+  supported: [th, ja, en]
+  ui_default: th
+  # Cross-language snippets come from GenbaGo (14) when it is deployed. Off does not
+  # hide a result; it shows it in the language it was written in (NFR-09).
+  translate_snippets: true
+
+ingestion:
+  formats: [pdf, docx, xlsx, pptx, txt, md, eml, msg, png, jpg]
+  max_bytes: 67108864                # 64 MiB
+  throughput_target_docs_per_hour: 500   # NFR-03, excluding OCR-heavy scans
+  ocr:
+    enabled: true
+    vertical_japanese: true
+    thai: true
+    confidence_gate: 0.95
+    handwriting_always_low_confidence: true
+    # Refused until it has been measured on this plant's own scans (README known gaps).
+    measured_accuracy: null
+  dedup:
+    by_hash: true
+    near_duplicate_threshold: 0.92
+    auto_merge: false                # a person merges, never a score (FR-04)
+  failure:
+    record_reason: true
+    blocks_retrieval: false          # NFR-07
+    notify_after_failures: 10
+
+extraction:
+  model: "qwen2.5:7b-instruct-q4_K_M"
+  model_max_params_b: 9
+  schema_version: "case-extract-1.0"
+  prompt_version: "extract-case.v1"
+  temperature: 0.1
+  schema_constrained: true
+  record_provenance: true
+  low_confidence_threshold: 0.70     # below this a field goes to the curation queue
+  document_text_is_data: true        # AI-08
+
+retrieval:
+  lexical:
+    algorithm: bm25
+    k1: 1.2
+    b: 0.75
+    tokenizer: word+cjk_thai_bigram
+  vector:
+    index: hnsw
+    metric: cosine
+    m: 16
+    ef_construction: 64
+    top_k: 50
+  fusion:
+    method: rrf
+    k: 60
+  rerank:
+    enabled: true
+    depth: 30                        # AI-05
+    kind: cross_encoder
+    model: "bge-reranker-v2-m3"
+  # FR-18. These five sum to 1.000 and the database enforces it.
+  weights:
+    similarity: 0.65
+    entity_overlap: 0.10
+    recency: 0.05
+    outcome: 0.12
+    verified: 0.08
+  recency_halflife_days: 900
+  verified_only_default: true        # C-03
+  acl:
+    enforcement: query_predicate     # C-05, NFR-05 — there is no post-filter mode
+    inherit_strictest: true
+  latency_p95_ms: 1000               # NFR-01
+  exclude_suspicious_chunks: true    # AI-08
+
+recurrence:
+  threshold: 0.72                    # tuned for recall (AI-06); see OPS-15 §10
+  require_human_confirmation: true
+  interval_source: computed          # AC-07
+  suggestion_latency_ms: 3000        # NFR-02
+  horizontal_deployment: true        # FR-22
+
+curation:
+  verification_roles: [curator, admin]
+  flag_suppresses_field: true        # FR-30, AC-06
+  feedback_affects_ranking: false    # ADR-H08
+  queue_age_warning_hours: 72
+
+evaluation:
+  retrieval:
+    recall_at_5_min: 0.80            # AI-04
+    mrr_min: 0.60                    # AI-04
+    eval_set: retrieval-2026-09
+    min_queries: 12                  # the SRS asks for 50; this deployment ships 12
+  extraction:
+    narrative_accuracy_min: 0.85     # AI-02
+    factual_accuracy_min: 0.95       # AI-02
+    label_set: labelled-2026-09
+    min_documents: 12                # the SRS asks for 100; this deployment ships 12
+  schedule: "0 3 1 * *"              # monthly, 03:00 on the 1st
+  gate_computed: true
+
+embeddings:
+  model: bge-m3
+  dim: 1024
+  active_version: "bge-m3@1"
+  reembed:
+    background: true
+    keep_search_available: true      # AC-09
+    batch_size: 1000
+
+confidentiality:
+  local_only: true                   # C-04, NFR-06
+  external_endpoints_allowed: false  # there is no external endpoint to configure
+  originals_object_lock: true        # C-01, FR-05
+  discord:
+    enabled: true
+    restricted_records: false
+    snippets: false                  # titles and links only (SEC-H21)
+
+retention:
+  originals_days: 730
+  query_log_days: 365
+  audit_days: 730
+
+roles:
+  ladder: [viewer, engineer, curator, admin]
+  verify: [curator, admin]
+  confirm_recurrence: [engineer, curator, admin]
+  curate: [curator, admin]
+  administer: [admin]
+
+prompts:
+  extract_case: extract-case.v1
+  classify_document: classify-document.v1
+  rerank: rerank.v1

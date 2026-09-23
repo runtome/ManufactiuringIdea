@@ -1,0 +1,361 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.local/schemas/genbamemory/config-1.0.json",
+  "title": "Genba Memory configuration",
+  "description": "Validates deploy/genbamemory.example.yaml. Keys expressed with `const` are not preferences: they are the SRS constraints, and a deployment that wants a different value wants a different product. Bounded numerics carry the SRS thresholds as their limits, so a configuration cannot quietly lower a gate.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["languages", "ingestion", "extraction", "retrieval", "recurrence",
+               "curation", "evaluation", "embeddings", "confidentiality", "retention", "roles"],
+  "properties": {
+    "languages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported", "ui_default"],
+      "properties": {
+        "supported": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["th", "ja", "en"] },
+          "minItems": 3,
+          "uniqueItems": true,
+          "description": "NFR-09. All three, always: a memory that cannot read one of the plant's languages has a hole in it."
+        },
+        "ui_default": { "type": "string", "enum": ["th", "ja", "en"] },
+        "translate_snippets": {
+          "type": "boolean",
+          "description": "Uses GenbaGo (14) when it is deployed. Off does not hide results, it only shows them in the original language."
+        }
+      }
+    },
+
+    "ingestion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["formats", "ocr", "dedup", "failure"],
+      "properties": {
+        "formats": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "enum": ["pdf", "docx", "xlsx", "pptx", "txt", "md", "eml", "msg", "png", "jpg", "csv", "json"]
+          }
+        },
+        "max_bytes": { "type": "integer", "minimum": 1048576, "maximum": 268435456 },
+        "throughput_target_docs_per_hour": { "type": "integer", "minimum": 500 },
+        "ocr": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "vertical_japanese", "confidence_gate", "handwriting_always_low_confidence"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "vertical_japanese": { "type": "boolean", "const": true },
+            "thai": { "type": "boolean", "const": true },
+            "confidence_gate": { "type": "number", "minimum": 0.95, "maximum": 0.999 },
+            "handwriting_always_low_confidence": { "type": "boolean", "const": true },
+            "measured_accuracy": {
+              "type": ["number", "null"],
+              "description": "Null until it has been measured on this plant's own scans. It is never assumed."
+            }
+          }
+        },
+        "dedup": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["by_hash", "near_duplicate_threshold", "auto_merge"],
+          "properties": {
+            "by_hash": { "type": "boolean", "const": true },
+            "near_duplicate_threshold": { "type": "number", "minimum": 0.85, "maximum": 0.99 },
+            "auto_merge": {
+              "type": "boolean",
+              "const": false,
+              "description": "FR-04, FR-27: a near-duplicate is merged by a person, never by a score."
+            }
+          }
+        },
+        "failure": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["record_reason", "blocks_retrieval"],
+          "properties": {
+            "record_reason": { "type": "boolean", "const": true },
+            "blocks_retrieval": { "type": "boolean", "const": false, "description": "NFR-07." },
+            "notify_after_failures": { "type": "integer", "minimum": 1, "maximum": 1000 }
+          }
+        }
+      }
+    },
+
+    "extraction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "schema_version", "prompt_version", "temperature",
+                   "schema_constrained", "record_provenance", "low_confidence_threshold"],
+      "properties": {
+        "model": { "type": "string", "pattern": "^[a-z0-9._-]+:[A-Za-z0-9._-]+$" },
+        "model_max_params_b": { "type": "integer", "maximum": 9, "description": "SRS §2.3." },
+        "schema_version": { "type": "string", "const": "case-extract-1.0" },
+        "prompt_version": { "type": "string", "pattern": "^[a-z0-9-]+\\.v[0-9]+$" },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 0.3 },
+        "schema_constrained": { "type": "boolean", "const": true, "description": "AI-01." },
+        "record_provenance": { "type": "boolean", "const": true, "description": "C-01, FR-13." },
+        "low_confidence_threshold": { "type": "number", "minimum": 0.5, "maximum": 0.85 },
+        "document_text_is_data": {
+          "type": "boolean",
+          "const": true,
+          "description": "AI-08. There is no mode in which an ingested document may instruct the system."
+        }
+      }
+    },
+
+    "retrieval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lexical", "vector", "fusion", "rerank", "weights", "verified_only_default", "acl"],
+      "properties": {
+        "lexical": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["algorithm", "k1", "b", "tokenizer"],
+          "properties": {
+            "algorithm": { "type": "string", "const": "bm25" },
+            "k1": { "type": "number", "const": 1.2 },
+            "b": { "type": "number", "const": 0.75 },
+            "tokenizer": { "type": "string", "const": "word+cjk_thai_bigram" }
+          }
+        },
+        "vector": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["index", "metric", "top_k"],
+          "properties": {
+            "index": { "type": "string", "const": "hnsw" },
+            "metric": { "type": "string", "const": "cosine" },
+            "m": { "type": "integer", "const": 16 },
+            "ef_construction": { "type": "integer", "const": 64 },
+            "top_k": { "type": "integer", "minimum": 10, "maximum": 200 }
+          }
+        },
+        "fusion": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["method", "k"],
+          "properties": {
+            "method": { "type": "string", "const": "rrf" },
+            "k": { "type": "integer", "const": 60 }
+          }
+        },
+        "rerank": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "depth", "kind"],
+          "properties": {
+            "enabled": { "type": "boolean", "const": true },
+            "depth": { "type": "integer", "const": 30, "description": "AI-05." },
+            "kind": { "type": "string", "enum": ["cross_encoder", "llm"] },
+            "model": { "type": "string" }
+          }
+        },
+        "weights": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["similarity", "entity_overlap", "recency", "outcome", "verified"],
+          "description": "FR-18. They must sum to 1.000; the database enforces it with a constraint trigger.",
+          "properties": {
+            "similarity": { "type": "number", "minimum": 0.4, "maximum": 0.9 },
+            "entity_overlap": { "type": "number", "minimum": 0, "maximum": 0.4 },
+            "recency": { "type": "number", "minimum": 0, "maximum": 0.2 },
+            "outcome": { "type": "number", "minimum": 0.05, "maximum": 0.4 },
+            "verified": { "type": "number", "minimum": 0.05, "maximum": 0.3 }
+          }
+        },
+        "recency_halflife_days": { "type": "integer", "minimum": 180, "maximum": 3650 },
+        "verified_only_default": {
+          "type": "boolean",
+          "const": true,
+          "description": "C-03. Unverified cases are reachable on request and always badged."
+        },
+        "acl": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enforcement", "inherit_strictest"],
+          "properties": {
+            "enforcement": {
+              "type": "string",
+              "const": "query_predicate",
+              "description": "C-05, NFR-05, AC-05. There is no post-filter mode."
+            },
+            "inherit_strictest": { "type": "boolean", "const": true }
+          }
+        },
+        "latency_p95_ms": { "type": "integer", "minimum": 100, "maximum": 1000, "description": "NFR-01." },
+        "exclude_suspicious_chunks": { "type": "boolean", "const": true, "description": "AI-08." }
+      }
+    },
+
+    "recurrence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["threshold", "require_human_confirmation", "interval_source", "suggestion_latency_ms"],
+      "properties": {
+        "threshold": { "type": "number", "minimum": 0.5, "maximum": 0.95 },
+        "require_human_confirmation": { "type": "boolean", "const": true, "description": "AI-06." },
+        "interval_source": {
+          "type": "string",
+          "const": "computed",
+          "description": "AC-07. The elapsed interval is derived from the two cases; it cannot be entered."
+        },
+        "suggestion_latency_ms": { "type": "integer", "minimum": 100, "maximum": 3000, "description": "NFR-02." },
+        "horizontal_deployment": {
+          "type": "boolean",
+          "description": "FR-22: scope narrows the ranking rather than filtering, so other machines still surface."
+        }
+      }
+    },
+
+    "curation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verification_roles", "flag_suppresses_field", "feedback_affects_ranking", "queue_age_warning_hours"],
+      "properties": {
+        "verification_roles": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["curator", "admin"] },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "FR-28. Engineers and viewers are not on this list."
+        },
+        "flag_suppresses_field": { "type": "boolean", "const": true, "description": "FR-30, AC-06." },
+        "feedback_affects_ranking": {
+          "type": "boolean",
+          "const": false,
+          "description": "ADR-H08. Feedback feeds evaluation and curation, never a live score."
+        },
+        "queue_age_warning_hours": { "type": "integer", "minimum": 1, "maximum": 720 }
+      }
+    },
+
+    "evaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["retrieval", "extraction", "schedule", "gate_computed"],
+      "properties": {
+        "retrieval": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["recall_at_5_min", "mrr_min", "eval_set"],
+          "properties": {
+            "recall_at_5_min": { "type": "number", "minimum": 0.8, "maximum": 1, "description": "AI-04." },
+            "mrr_min": { "type": "number", "minimum": 0.6, "maximum": 1, "description": "AI-04." },
+            "eval_set": { "type": "string" },
+            "min_queries": { "type": "integer", "minimum": 10 }
+          }
+        },
+        "extraction": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["narrative_accuracy_min", "factual_accuracy_min", "label_set"],
+          "properties": {
+            "narrative_accuracy_min": { "type": "number", "minimum": 0.85, "maximum": 1, "description": "AI-02." },
+            "factual_accuracy_min": { "type": "number", "minimum": 0.95, "maximum": 1, "description": "AI-02." },
+            "label_set": { "type": "string" },
+            "min_documents": { "type": "integer", "minimum": 10 }
+          }
+        },
+        "schedule": { "type": "string", "pattern": "^[-0-9*,/ ]{9,}$" },
+        "gate_computed": {
+          "type": "boolean",
+          "const": true,
+          "description": "AI-02, AI-04: `passed` is derived from the metrics and cannot be asserted."
+        }
+      }
+    },
+
+    "embeddings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "dim", "active_version", "reembed"],
+      "properties": {
+        "model": { "type": "string", "pattern": "^[a-z0-9._/-]+$" },
+        "dim": { "type": "integer", "const": 1024, "description": "knowledge.chunk.embedding is vector(1024)." },
+        "active_version": { "type": "string" },
+        "reembed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["background", "keep_search_available", "batch_size"],
+          "properties": {
+            "background": { "type": "boolean", "const": true },
+            "keep_search_available": { "type": "boolean", "const": true, "description": "AC-09." },
+            "batch_size": { "type": "integer", "minimum": 100, "maximum": 10000 }
+          }
+        }
+      }
+    },
+
+    "confidentiality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["local_only", "external_endpoints_allowed", "originals_object_lock", "discord"],
+      "properties": {
+        "local_only": { "type": "boolean", "const": true, "description": "C-04, NFR-06." },
+        "external_endpoints_allowed": {
+          "type": "boolean",
+          "const": false,
+          "description": "There is no external model, embedding or translation endpoint to configure."
+        },
+        "originals_object_lock": { "type": "boolean", "const": true, "description": "C-01, FR-05." },
+        "discord": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "restricted_records", "snippets"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "restricted_records": { "type": "boolean", "const": false },
+            "snippets": { "type": "boolean", "const": false, "description": "SEC-H21: links and titles only." }
+          }
+        }
+      }
+    },
+
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["originals_days", "query_log_days", "audit_days"],
+      "properties": {
+        "originals_days": { "type": "integer", "minimum": 730 },
+        "query_log_days": { "type": "integer", "minimum": 365 },
+        "audit_days": { "type": "integer", "minimum": 730 }
+      }
+    },
+
+    "roles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ladder", "verify", "confirm_recurrence", "curate", "administer"],
+      "properties": {
+        "ladder": {
+          "type": "array",
+          "items": { "type": "string" },
+          "const": ["viewer", "engineer", "curator", "admin"]
+        },
+        "verify": { "type": "array", "items": { "type": "string" }, "const": ["curator", "admin"] },
+        "confirm_recurrence": {
+          "type": "array", "items": { "type": "string" },
+          "const": ["engineer", "curator", "admin"]
+        },
+        "curate": { "type": "array", "items": { "type": "string" }, "const": ["curator", "admin"] },
+        "administer": { "type": "array", "items": { "type": "string" }, "const": ["admin"] }
+      }
+    },
+
+    "prompts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "extract_case": { "type": "string", "pattern": "^[a-z0-9-]+\\.v[0-9]+$" },
+        "classify_document": { "type": "string", "pattern": "^[a-z0-9-]+\\.v[0-9]+$" },
+        "rerank": { "type": "string", "pattern": "^[a-z0-9-]+\\.v[0-9]+$" }
+      }
+    }
+  }
+}

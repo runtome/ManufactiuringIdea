@@ -1,0 +1,2071 @@
+openapi: 3.1.0
+
+info:
+  title: Genba Memory API
+  version: 1.0.0
+  summary: Institutional memory of factory problems — ingest, structure, retrieve, curate
+  description: |
+    REST API for Genba Memory (SRS-15), the FactoryBrain module that owns the
+    platform's `knowledge` schema.
+
+    Companion documents:
+      * [SRS-15](../SRS-GenbaMemory-Troubleshooting-RAG.md) — requirements
+      * [SAD-15](../docs/SAD-GenbaMemory-Software-Architecture.md) — architecture
+      * [DDS-15](../docs/DDS-GenbaMemory-Database-Design.md) — data model
+      * [API-Specification.md](./API-Specification.md) — conventions, error catalogue
+      * [ICD-15](../docs/ICD-GenbaMemory-Interface-Control.md) — IF-78…IF-84
+      * [SEC-15](../docs/SEC-GenbaMemory-Security-Requirements.md) — security
+
+    ## Four rules that shape this API
+
+    1. **Every answer names a real case and a retrievable original.** There is no
+       combined case, no synthesised precedent, and no hit without a `sources`
+       array (AI-07, AC-08).
+    2. **Extracted is not verified.** Every case carries a `badge`, `verified_only`
+       defaults to `true`, and a flagged field is absent from a card rather than
+       stale (C-02, C-03, FR-30).
+    3. **The ACL is a predicate inside the query.** A restricted document leaves a
+       count in `n_acl_filtered` and nothing else — no row, no snippet, no total
+       (C-05, NFR-05, AC-05).
+    4. **Ranking is arithmetic you can ask about.** Every hit carries its component
+       scores and `why`; `POST /search/explain` returns the weights in force
+       (FR-18, FR-19).
+
+    `/knowledge/search` and `/knowledge/documents` are served verbatim from
+    [API-00](../../00-factorybrain-platform/api/openapi.yaml) in platform mode; the
+    rest is served under `/memory/` by the gateway and at the root standalone.
+
+    All errors use RFC 7807 `application/problem+json`.
+  contact:
+    name: Platform owner
+    email: platform@factorybrain.local
+  license:
+    name: Proprietary — internal use
+
+servers:
+  - url: https://factorybrain.local/api/v1
+    description: On-premise production (factory LAN)
+  - url: http://localhost:8010/api/v1
+    description: Standalone development
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: ingestion
+    description: Sources, jobs and failures (FR-01…FR-07)
+  - name: documents
+    description: The originals and their provenance (C-01, FR-05)
+  - name: cases
+    description: The case model, field by field (FR-08…FR-14)
+  - name: retrieval
+    description: Symptom search, similar cases and the explanation (FR-15…FR-19)
+  - name: recurrence
+    description: Proposals and confirmations (FR-20…FR-22, AI-06)
+  - name: analytics
+    description: Recurring problems, effectiveness, gaps, coverage (FR-23…FR-26, FR-31)
+  - name: curation
+    description: The queue, verification, entity maps, feedback (FR-27…FR-31)
+  - name: evaluation
+    description: Labelled and query sets, runs and gates (AI-02, AI-04)
+  - name: embeddings
+    description: The version registry and background re-embedding (AI-09)
+  - name: knowledge
+    description: The two platform paths, served verbatim
+  - name: tools
+    description: The IF-16 tools this module provides to its siblings
+  - name: system
+    description: Configuration, roles and health
+
+paths:
+
+  # ------------------------------------------------------------------
+  # SOURCES AND INGESTION  (IF-78, FR-01…FR-07)
+  # ------------------------------------------------------------------
+  /sources:
+    get:
+      tags: [ingestion]
+      summary: List the watched sources
+      operationId: listSources
+      responses:
+        '200':
+          description: Sources
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Source' }
+    post:
+      tags: [ingestion]
+      summary: Define a source
+      description: |
+        The body is validated against `deploy/schemas/source-connector.schema.json`
+        (IF-78). A credential is never inline: `credentials_ref` names a file under
+        the secrets directory, and anything else is refused with
+        `SOURCE_CREDENTIAL_INLINE`.
+      operationId: createSource
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Source' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Source' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /sources/{sourceId}/sync:
+    post:
+      tags: [ingestion]
+      summary: Run an incremental sync now
+      operationId: syncSource
+      parameters:
+        - $ref: '#/components/parameters/SourceId'
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queued: { type: integer }
+                  skipped_unchanged: { type: integer }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /ingest/jobs:
+    get:
+      tags: [ingestion]
+      summary: Ingestion jobs
+      operationId: listIngestJobs
+      parameters:
+        - name: state
+          in: query
+          schema: { type: string, enum: [queued, running, done, failed, skipped] }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Jobs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/IngestJob' }
+                  next_cursor: { type: [string, 'null'] }
+
+  /ingest/errors:
+    get:
+      tags: [ingestion]
+      summary: Ingestion failures with actionable reasons
+      description: |
+        FR-07. Every failure names a closed reason and what a person should do
+        about it. A failure never blocks retrieval (NFR-07).
+      operationId: listIngestErrors
+      parameters:
+        - name: reason
+          in: query
+          schema: { $ref: '#/components/schemas/IngestFailureReason' }
+      responses:
+        '200':
+          description: Failures
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/IngestError' }
+
+  # ------------------------------------------------------------------
+  # DOCUMENTS  (SRS §4.1 POST /documents; C-01, FR-05)
+  # ------------------------------------------------------------------
+  /documents:
+    post:
+      tags: [documents]
+      summary: Ingest a document
+      description: |
+        SRS-15 §4.1. The original is stored immutably with its provenance and is
+        reachable from every result that ever cites it (C-01, AC-08). A repeated
+        `sha256` is not an error: the job is `skipped` and the existing document id
+        comes back.
+      operationId: ingestMemoryDocument
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                source: { type: string }
+                kind: { $ref: '#/components/schemas/DocClass' }
+                acl: { $ref: '#/components/schemas/Acl' }
+      responses:
+        '202':
+          description: Accepted for processing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document_id: { type: string, format: uuid }
+                  job_id: { type: string, format: uuid }
+                  state: { type: string, enum: [queued, skipped] }
+        '413': { $ref: '#/components/responses/ValidationFailed' }
+    get:
+      tags: [documents]
+      summary: List documents visible to the caller
+      description: Rows the caller may not see are never retrieved (C-05).
+      operationId: listDocuments
+      parameters:
+        - name: kind
+          in: query
+          schema: { $ref: '#/components/schemas/DocClass' }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Documents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Document' }
+                  next_cursor: { type: [string, 'null'] }
+
+  /documents/{documentId}:
+    get:
+      tags: [documents]
+      summary: Document metadata and provenance
+      operationId: getDocument
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      responses:
+        '200':
+          description: Document
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /documents/{documentId}/original:
+    get:
+      tags: [documents]
+      summary: Download the original file
+      description: |
+        AC-08. The link every result carries. The ACL is checked here exactly as it
+        is inside a query — a document that is invisible in search is invisible here.
+      operationId: getDocumentOriginal
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      responses:
+        '200':
+          description: The stored original
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /documents/{documentId}/acl:
+    put:
+      tags: [documents]
+      summary: Change a document's access control
+      operationId: setDocumentAcl
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Acl' }
+      responses:
+        '200':
+          description: Updated; cases sourced from it inherit the change
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /documents/{documentId}/ocr:
+    get:
+      tags: [documents]
+      summary: OCR pages and regions
+      description: The IF-76 shape GenbaGo defines; handwriting is always low confidence.
+      operationId: getDocumentOcr
+      parameters:
+        - $ref: '#/components/parameters/DocumentId'
+      responses:
+        '200':
+          description: OCR result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OcrResult' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /documents/near-duplicates:
+    get:
+      tags: [documents]
+      summary: Near-duplicate pairs awaiting a decision
+      operationId: listNearDuplicates
+      responses:
+        '200':
+          description: Pairs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/NearDuplicate' }
+
+  # ------------------------------------------------------------------
+  # CASES  (SRS §4.1 GET /cases/{id}, POST /cases/{id}/verify)
+  # ------------------------------------------------------------------
+  /cases:
+    get:
+      tags: [cases]
+      summary: Browse cases
+      operationId: listCases
+      parameters:
+        - name: machine
+          in: query
+          schema: { type: string }
+        - $ref: '#/components/parameters/LineFilter'
+        - name: defect_class
+          in: query
+          schema: { type: string }
+        - name: verified
+          in: query
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Cases
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/CaseCard' }
+                  next_cursor: { type: [string, 'null'] }
+    post:
+      tags: [cases]
+      summary: Enter a case by hand
+      description: |
+        FR-14 — knowledge that exists only in someone's head. A manual case is
+        `human` on every field it carries and still needs at least one source
+        before it can be verified (AI-07); attach a photo or a note first.
+      operationId: createCase
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CaseInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaseDetail' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /cases/{caseId}:
+    get:
+      tags: [cases]
+      summary: Case detail with source links
+      description: |
+        SRS-15 §4.1. Flagged fields are absent, not stale (FR-30, AC-06), and the
+        `badge` says whether a human ever confirmed this case (C-02).
+      operationId: getCase
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      responses:
+        '200':
+          description: Case
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaseDetail' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [cases]
+      summary: Correct a case
+      operationId: patchCase
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CaseInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaseDetail' }
+
+  /cases/{caseId}/verify:
+    post:
+      tags: [curation]
+      summary: Curator verification
+      description: |
+        SRS-15 §4.1. Turns an extraction into established fact. Refused when the
+        case has no source (`SOURCE_REQUIRED`), still has a flagged field
+        (`FLAGGED_FIELD_PRESENT`) or the caller is not a curator
+        (`VERIFY_NEEDS_CURATOR`). The event is append-only.
+      operationId: verifyCase
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string }
+                scope: { type: string, enum: [case, field], default: case }
+                field: { $ref: '#/components/schemas/FieldName' }
+      responses:
+        '200':
+          description: Verified
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Verification' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/ValidationFailed' }
+
+  /cases/{caseId}/fields:
+    get:
+      tags: [cases]
+      summary: Every field with its confidence and provenance
+      description: ADR-H03 — a case can be half-trustworthy, and this is where you see it.
+      operationId: listCaseFields
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      responses:
+        '200':
+          description: Fields
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/CaseField' }
+
+  /cases/{caseId}/fields/{field}/flag:
+    post:
+      tags: [curation]
+      summary: Report a field as incorrect
+      description: |
+        FR-30, AC-06. The field is suppressed from every rendering immediately and
+        queued for curation. It is not deleted: a wrong value is evidence about the
+        extractor.
+      operationId: flagCaseField
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - $ref: '#/components/parameters/FieldNameParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 3 }
+      responses:
+        '200':
+          description: Suppressed and queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaseField' }
+
+  /cases/{caseId}/merge:
+    post:
+      tags: [curation]
+      summary: Merge this case into another
+      description: |
+        Sources move; no document is deleted; the event is append-only so the merge
+        can be read back or reversed (THR-H06).
+      operationId: mergeCase
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [keep_case_id, reason]
+              properties:
+                keep_case_id: { type: string, format: uuid }
+                reason: { type: string }
+      responses:
+        '200':
+          description: Merged
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MergeEvent' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /cases/{caseId}/recurrences:
+    get:
+      tags: [recurrence]
+      summary: Recurrence links for this case
+      operationId: listRecurrences
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      responses:
+        '200':
+          description: Links, confirmed and proposed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Recurrence' }
+
+  /cases/{caseId}/recurrences/{priorCaseId}/confirm:
+    post:
+      tags: [recurrence]
+      summary: Confirm or reject a proposed recurrence
+      description: |
+        AI-06, ADR-H07. Until this call the link is a proposal and does not appear in
+        any analytic. The interval is computed from the two cases; it cannot be sent.
+      operationId: confirmRecurrence
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - name: priorCaseId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rejected: { type: boolean, default: false }
+                note: { type: string }
+      responses:
+        '200':
+          description: Decided
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Recurrence' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ------------------------------------------------------------------
+  # RETRIEVAL  (SRS §4.1 POST /search, POST /similar; IF-81)
+  # ------------------------------------------------------------------
+  /search:
+    post:
+      tags: [retrieval]
+      summary: Symptom search
+      description: |
+        SRS-15 §4.1. Hybrid BM25 + vector retrieval, fused with RRF, reranked over
+        the top 30 and scored explicitly (ADR-H04, ADR-H05). `scope` narrows the
+        ranking; `require` removes rows. `verified_only` defaults to **true**: an
+        unverified extraction is not an established fact (C-03). The ACL is applied
+        inside the query, so a restricted document leaves only a count in
+        `n_acl_filtered` (C-05, AC-05).
+      operationId: searchMemory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SearchRequest' }
+      responses:
+        '200':
+          description: Ranked cases
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetrievalResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ModelUnavailable' }
+
+  /similar:
+    post:
+      tags: [retrieval]
+      summary: Similar cases for a case or an alert
+      description: |
+        SRS-15 §4.1, FR-20. What is pushed when a quality case or a maintenance alert
+        opens, within the NFR-02 budget of 3 s. The response is the IF-82 shape and
+        carries a recurrence block when one crosses the threshold.
+      operationId: similarCases
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                case_id: { type: string, format: uuid }
+                quality_case_id: { type: string, format: uuid }
+                alert_id: { type: string, format: uuid }
+                symptom: { type: string }
+                scope: { $ref: '#/components/schemas/EntityFilter' }
+                top_k: { type: integer, default: 5, maximum: 20 }
+      responses:
+        '200':
+          description: Precedent, with a recurrence proposal when one applies
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuggestionAlert' }
+
+  /search/explain:
+    post:
+      tags: [retrieval]
+      summary: Why did this case rank here
+      description: |
+        FR-19 in its fullest form: the component scores, the matched terms, the
+        entity and descriptor hits, and the weights in force at the time.
+      operationId: explainRanking
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query_id, case_id]
+              properties:
+                query_id: { type: string, format: uuid }
+                case_id: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The arithmetic
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Explanation' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /queries/{queryId}:
+    get:
+      tags: [retrieval]
+      summary: A stored retrieval and its results
+      operationId: getQuery
+      parameters:
+        - name: queryId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Retrieval
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetrievalResult' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------
+  # ANALYTICS  (SRS §4.1 GET /analytics/recurring; FR-23…FR-26, FR-31)
+  # ------------------------------------------------------------------
+  /analytics/recurring:
+    get:
+      tags: [analytics]
+      summary: Recurring problems by scope
+      description: |
+        SRS-15 §4.1, FR-23. Only **confirmed** recurrences are counted (AI-06), so
+        the number is smaller than the number of proposals — deliberately.
+      operationId: recurringReport
+      parameters:
+        - name: scope
+          in: query
+          required: true
+          schema: { type: string, enum: [machine, line, sku, defect_class] }
+        - $ref: '#/components/parameters/DateFrom'
+        - $ref: '#/components/parameters/DateTo'
+      responses:
+        '200':
+          description: Report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/RecurringRow' }
+
+  /analytics/effectiveness:
+    get:
+      tags: [analytics]
+      summary: Which corrective actions were followed by a recurrence
+      description: FR-24. A join over confirmed recurrences, not an opinion.
+      operationId: effectivenessReport
+      parameters:
+        - name: defect_class
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/EffectivenessRow' }
+
+  /analytics/mtbr:
+    get:
+      tags: [analytics]
+      summary: Mean time between recurrences
+      operationId: mtbrReport
+      parameters:
+        - name: defect_class
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Months
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  defect_class: { type: string }
+                  months: { type: [number, 'null'] }
+                  n_recurrences: { type: integer }
+
+  /analytics/gaps:
+    get:
+      tags: [analytics]
+      summary: Cases closed without a cause or a verification
+      description: FR-26. The gap is counted so it can be closed.
+      operationId: gapsReport
+      responses:
+        '200':
+          description: Gaps
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        case_id: { type: string, format: uuid }
+                        title: { type: string }
+                        missing: { type: string, enum: [cause, verification, 'cause+verification'] }
+
+  /analytics/coverage:
+    get:
+      tags: [analytics]
+      summary: Coverage of the memory itself
+      description: FR-31 — the share of cases with a cause, with a verification and with a human verification.
+      operationId: coverageReport
+      responses:
+        '200':
+          description: Coverage
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Coverage' }
+
+  # ------------------------------------------------------------------
+  # CURATION AND FEEDBACK  (SRS §4.1 POST /feedback; IF-83)
+  # ------------------------------------------------------------------
+  /feedback:
+    post:
+      tags: [curation]
+      summary: Helpful, not helpful, or incorrect
+      description: |
+        SRS-15 §4.1, FR-29, FR-30. `incorrect` is not a downvote: it names a field,
+        suppresses it and opens a curation item. Feedback feeds evaluation, never the
+        live ranking (ADR-H08).
+      operationId: submitFeedback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FeedbackInput' }
+      responses:
+        '201':
+          description: Recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Feedback' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /curation:
+    get:
+      tags: [curation]
+      summary: The curation queue
+      description: FR-27. Low-confidence fields, unmapped entities, near-duplicates, flagged fields and suspicious chunks, oldest first.
+      operationId: listCuration
+      parameters:
+        - name: kind
+          in: query
+          schema: { $ref: '#/components/schemas/CurationKind' }
+        - name: state
+          in: query
+          schema: { type: string, enum: [open, in_review, resolved, dismissed] }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Queue
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/CurationItem' }
+                  next_cursor: { type: [string, 'null'] }
+
+  /curation/{itemId}/decide:
+    post:
+      tags: [curation]
+      summary: Decide a curation item
+      operationId: decideCuration
+      parameters:
+        - name: itemId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [verified, corrected, mapped, merged, distinct, suppressed, dismissed]
+                value: { type: string }
+                note: { type: string }
+      responses:
+        '200':
+          description: Decided
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CurationItem' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /entity-map:
+    get:
+      tags: [curation]
+      summary: The canonical entity map
+      operationId: listEntityMap
+      parameters:
+        - name: kind
+          in: query
+          schema: { $ref: '#/components/schemas/EntityKind' }
+      responses:
+        '200':
+          description: Mappings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/EntityMapping' }
+    post:
+      tags: [curation]
+      summary: Map a raw value to a canonical id
+      operationId: createEntityMapping
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EntityMapping' }
+      responses:
+        '201':
+          description: Mapped; the affected cases are re-normalised
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EntityMapping' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /entity-map/export:
+    get:
+      tags: [curation]
+      summary: Export the entity map as CSV
+      description: The format of `deploy/entity-map.example.csv` (IF-80).
+      operationId: exportEntityMap
+      responses:
+        '200':
+          description: CSV
+          content:
+            text/csv:
+              schema: { type: string }
+
+  /entity-map/import:
+    post:
+      tags: [curation]
+      summary: Import an entity map
+      operationId: importEntityMap
+      requestBody:
+        required: true
+        content:
+          text/csv:
+            schema: { type: string }
+      responses:
+        '200':
+          description: Imported
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  created: { type: integer }
+                  unchanged: { type: integer }
+                  rejected:
+                    type: array
+                    items: { type: string }
+
+  # ------------------------------------------------------------------
+  # EVALUATION  (AI-02, AI-04, AC-01, AC-02)
+  # ------------------------------------------------------------------
+  /eval/sets:
+    get:
+      tags: [evaluation]
+      summary: Evaluation and labelled sets
+      operationId: listEvalSets
+      responses:
+        '200':
+          description: Sets
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  eval_sets:
+                    type: array
+                    items: { $ref: '#/components/schemas/EvalSet' }
+                  label_sets:
+                    type: array
+                    items: { $ref: '#/components/schemas/EvalSet' }
+
+  /eval/runs:
+    get:
+      tags: [evaluation]
+      summary: Evaluation history
+      operationId: listEvalRuns
+      responses:
+        '200':
+          description: Runs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/EvalRun' }
+    post:
+      tags: [evaluation]
+      summary: Run an evaluation
+      description: |
+        `passed` is computed from the SRS thresholds — Recall@5 ≥ 0.80 and MRR ≥ 0.60
+        for retrieval, ≥ 0.85 narrative and ≥ 0.95 factual for extraction. It cannot
+        be supplied (AI-02, AI-04).
+      operationId: createEvalRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                kind: { type: string, enum: [retrieval, extraction] }
+                eval_set: { type: string }
+                label_set: { type: string }
+                embedding_version: { type: string }
+      responses:
+        '202':
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: { type: string, format: uuid }
+
+  /eval/runs/{runId}:
+    get:
+      tags: [evaluation]
+      summary: One evaluation run
+      operationId: getEvalRun
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Run
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EvalRun' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------
+  # EMBEDDINGS  (IF-84, AI-09, AC-09)
+  # ------------------------------------------------------------------
+  /embeddings/models:
+    get:
+      tags: [embeddings]
+      summary: Registered embedding models
+      operationId: listEmbeddingModels
+      responses:
+        '200':
+          description: Models
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/EmbeddingModel' }
+
+  /embeddings/reembed:
+    post:
+      tags: [embeddings]
+      summary: Re-embed the corpus in the background
+      description: |
+        AC-09. Queries stay pinned to the active version for the whole job; the
+        switch is one row at the end. A version a running job still serves cannot be
+        retired (`VERSION_IN_USE`).
+      operationId: startReembed
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_version]
+              properties:
+                to_version: { type: string }
+                batch_size: { type: integer, minimum: 100, maximum: 10000, default: 1000 }
+      responses:
+        '202':
+          description: Started
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReembedJob' }
+        '409': { $ref: '#/components/responses/ValidationFailed' }
+
+  /embeddings/reembed/{jobId}:
+    get:
+      tags: [embeddings]
+      summary: Re-embed progress
+      operationId: getReembedJob
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Job
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReembedJob' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------
+  # TOOLS, CONFIG, SYSTEM
+  # ------------------------------------------------------------------
+  /tools:
+    get:
+      tags: [tools]
+      summary: The IF-16 tools this module provides
+      description: |
+        `search_memory`, `get_case`, `similar_cases` and `recurrence_check`. All four
+        are read-only, all four enforce the caller's ACL, and all four return case ids
+        with sources rather than prose (AI-07).
+      operationId: listMemoryTools
+      responses:
+        '200':
+          description: Tools
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/MemoryTool' }
+
+  /tools/search_memory:
+    post:
+      tags: [tools]
+      summary: The search_memory tool
+      description: |
+        The call every sibling makes (01, 02, 06, 09, 10, 13). Identical ranking and
+        identical ACL to `POST /search`; the caller's identity is carried, never
+        assumed.
+      operationId: toolSearchMemory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string }
+                top_k: { type: integer, default: 5, maximum: 20 }
+                scope: { $ref: '#/components/schemas/EntityFilter' }
+                verified_only: { type: boolean, default: true }
+      responses:
+        '200':
+          description: Ranked cases
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetrievalResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /config:
+    get:
+      tags: [system]
+      summary: Effective configuration
+      description: Locked keys are constraints and are reported as such.
+      operationId: getMemoryConfig
+      responses:
+        '200':
+          description: Configuration
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        key: { type: string }
+                        value: {}
+                        locked: { type: boolean }
+                        description: { type: string }
+
+  /roles:
+    get:
+      tags: [system]
+      summary: Roles in force
+      operationId: listMemoryRoles
+      responses:
+        '200':
+          description: Roles
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        user: { type: string }
+                        roles:
+                          type: array
+                          items: { type: string, enum: [viewer, engineer, curator, admin] }
+
+  /healthz:
+    get:
+      tags: [system]
+      summary: Liveness
+      operationId: memoryHealthz
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+
+  /readyz:
+    get:
+      tags: [system]
+      summary: Readiness
+      description: |
+        Retrieval readiness only. Ingestion being down does not make the service
+        unready — that is NFR-07 expressed as a health check.
+      operationId: memoryReadyz
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ready, degraded] }
+                  database: { type: boolean }
+                  index: { type: boolean }
+                  embedding_version: { type: string }
+                  ingestion: { type: string, enum: [ok, degraded, down] }
+        '503':
+          description: Not ready
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  # ------------------------------------------------------------------
+  # KNOWLEDGE  [API-00, verbatim — the gateway serves these in platform mode]
+  # ------------------------------------------------------------------
+  /knowledge/search:
+    post:
+      tags: [knowledge]
+      summary: Hybrid search over documents and past cases
+      description: |
+        Combines lexical (trigram) and vector retrieval with reranking, and
+        supports cross-language retrieval — a Thai query can surface a Japanese
+        8D report.
+
+        Results are filtered by the caller's document ACL at query time, not
+        after retrieval.
+      operationId: searchKnowledge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string }
+                top_k: { type: integer, default: 5, maximum: 50 }
+                filters:
+                  type: object
+                  properties:
+                    machine: { type: string }
+                    line: { type: string }
+                    sku: { type: string }
+                    verified_only:
+                      type: boolean
+                      default: true
+                      description: >-
+                        When true (default) only human-verified case records are
+                        returned. Unverified LLM extractions are never presented
+                        as established fact.
+      responses:
+        '200':
+          description: Ranked results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/KnowledgeHit'
+
+  /knowledge/documents:
+    post:
+      tags: [knowledge]
+      summary: Ingest a document into the knowledge base
+      operationId: ingestDocument
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                kind: { type: string }
+      responses:
+        '202':
+          description: Accepted for processing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document_id: { type: string, format: uuid }
+
+components:
+
+  securitySchemes:   # [API-00, verbatim]
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Short-lived access token (default 15 min) from `/auth/login`.
+        Refresh via `/auth/refresh`.
+    edgeApiKey:
+      type: apiKey
+      in: header
+      name: X-Edge-Key
+      description: |
+        Per-node key for edge sync endpoints. mTLS client certificates are the
+        preferred alternative where the network supports them; the key exists
+        for devices that cannot manage certificates. An edge credential grants
+        insert-only access to inspection data for its own node and nothing else.
+  parameters:        # [API-00, verbatim, plus this module's own]
+    DateFrom:
+      name: from
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive start date (plant timezone)
+    DateTo:
+      name: to
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive end date (plant timezone)
+    LineFilter:
+      name: line
+      in: query
+      schema: { type: string }
+      description: Line code. Restricted users only see lines in their scope.
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Opaque cursor from the previous page's `next_cursor`
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      schema: { type: string }
+      description: |
+        Client-generated key. Replaying a request with the same key returns the
+        original result instead of performing the operation twice.
+    CaseId:
+      name: caseId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    DocumentId:
+      name: documentId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SourceId:
+      name: sourceId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    FieldNameParam:
+      name: field
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/FieldName'
+
+  responses:         # [API-00, verbatim]
+    BadRequest:
+      description: Malformed request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: |
+        Authenticated but not permitted. For line-scoped resources the rows are
+        never retrieved in the first place — this is not response filtering.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Resource does not exist
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ValidationFailed:
+      description: Request was well-formed but semantically invalid
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ModelUnavailable:
+      description: |
+        The language model is unavailable. Deterministic features (charts,
+        statistics, queues) remain available.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+
+    # --- [API-00, verbatim] ---
+    Problem:
+      type: object
+      description: RFC 7807 problem details with a stable machine-readable `code`.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          description: Stable error code — see API-Specification.md §7
+        correlation_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+
+
+    Language:
+      type: string
+      enum: [th, ja, en]
+      default: th
+
+    KnowledgeHit:
+      type: object
+      properties:
+        kind: { type: string, enum: [case, document_chunk] }
+        case_id: { type: [string, 'null'], format: uuid }
+        document_id: { type: [string, 'null'], format: uuid }
+        title: { type: string }
+        snippet: { type: string }
+        lang:
+          $ref: '#/components/schemas/Language'
+        score: { type: number }
+        verified:
+          type: boolean
+          description: False means LLM-extracted and not human-confirmed
+        outcome: { type: [string, 'null'] }
+        matched_on:
+          type: array
+          items: { type: string }
+          description: Why this result matched — shown to the user
+        source_url: { type: [string, 'null'] }
+
+    # --- Genba Memory ---
+
+    DocClass:
+      type: string
+      enum: [eight_d, rca, maintenance_log, work_order, handover, complaint, other]
+
+    FieldName:
+      type: string
+      enum: [title, opened_at, closed_at, scope, symptom, investigation, cause,
+             containment, corrective_action, verification, outcome, status]
+
+    EntityKind:
+      type: string
+      enum: [machine, line, sku, mould, defect_class, alarm_code]
+
+    CurationKind:
+      type: string
+      enum: [low_confidence, unmapped_entity, near_duplicate, flagged_field,
+             unverified_case, suspicious_chunk]
+
+    Badge:
+      type: string
+      enum: [verified, extracted_not_verified]
+      description: |
+        C-02 / C-03. `extracted_not_verified` means a model wrote this and no human
+        ever confirmed it. It is never omitted and never softened.
+
+    IngestFailureReason:
+      type: string
+      enum: [unreadable_scan, password_protected, unsupported_format, empty_document,
+             ocr_failed, extract_failed, too_large, source_unreachable, duplicate]
+
+    Acl:
+      type: object
+      description: |
+        Applied as a predicate inside every query, never as a filter afterwards
+        (C-05, NFR-05, AC-05). A case inherits the strictest ACL of its sources.
+      properties:
+        min_role:
+          type: string
+          enum: [viewer, inspector, engineer, curator, manager, admin]
+        groups:
+          type: array
+          items: { type: string }
+        embargoed: { type: boolean }
+
+    EntityFilter:
+      type: object
+      description: |
+        As `scope` it narrows the ranking through entity overlap; as `require` it
+        removes rows. Appendix A uses it as a scope, which is why a case on another
+        machine can still appear — FR-22, horizontal deployment.
+      properties:
+        machine: { type: string }
+        line: { type: string }
+        sku: { type: string }
+        mould: { type: string }
+        defect_class: { type: string }
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        outcome: { type: string, enum: [resolved, not_resolved, unknown] }
+
+    Source:
+      type: object
+      description: IF-78. `credentials_ref` names a secret file; a credential is never inline.
+      required: [code, kind, location]
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        kind: { type: string, enum: [folder, mail, chat, ticket, upload, manual] }
+        location: { type: string }
+        credentials_ref: { type: string, pattern: '^file:/run/secrets/[a-z0-9_]+$' }
+        default_acl: { $ref: '#/components/schemas/Acl' }
+        ocr_enabled: { type: boolean }
+        incremental: { type: boolean }
+        enabled: { type: boolean }
+        last_sync_at: { type: [string, 'null'], format: date-time }
+
+    IngestJob:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        source: { type: [string, 'null'] }
+        document_id: { type: [string, 'null'], format: uuid }
+        original_name: { type: string }
+        state: { type: string, enum: [queued, running, done, failed, skipped] }
+        stage: { type: string, enum: [fetch, text, ocr, classify, extract, normalise, index, done] }
+        bytes: { type: [integer, 'null'] }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+
+    IngestError:
+      type: object
+      description: FR-07 — the actionable part is a field, not a convention.
+      properties:
+        job_id: { type: string, format: uuid }
+        stage: { type: string }
+        reason: { $ref: '#/components/schemas/IngestFailureReason' }
+        detail: { type: string }
+        action: { type: string }
+        ts: { type: string, format: date-time }
+
+    Document:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        sha256: { type: string }
+        kind: { $ref: '#/components/schemas/DocClass' }
+        title: { type: [string, 'null'] }
+        lang: { $ref: '#/components/schemas/Language' }
+        original_name: { type: string }
+        source_system: { type: [string, 'null'] }
+        page_count: { type: [integer, 'null'] }
+        acl: { $ref: '#/components/schemas/Acl' }
+        ingested_at: { type: string, format: date-time }
+        original_url: { type: string }
+
+    NearDuplicate:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        document_id: { type: string, format: uuid }
+        other_id: { type: string, format: uuid }
+        score: { type: number }
+        resolution: { type: string, enum: [pending, merged, distinct] }
+
+    OcrResult:
+      type: object
+      description: The IF-76 contract GenbaGo defines, reused rather than re-invented.
+      properties:
+        document_id: { type: string, format: uuid }
+        pages:
+          type: array
+          items:
+            type: object
+            properties:
+              page: { type: integer }
+              engine: { type: string }
+              mean_confidence: { type: number }
+              regions:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    ordinal: { type: integer }
+                    orientation: { type: string, enum: [horizontal, vertical] }
+                    lang: { $ref: '#/components/schemas/Language' }
+                    text: { type: string }
+                    char_confidence: { type: number }
+                    handwriting: { type: boolean }
+                    low_confidence: { type: boolean }
+
+    Provenance:
+      type: object
+      description: C-01 — where in the original this value came from.
+      required: [document_id, page]
+      properties:
+        document_id: { type: string, format: uuid }
+        page: { type: integer, minimum: 1 }
+        section: { type: string }
+        char_start: { type: integer }
+        char_end: { type: integer }
+
+    CaseField:
+      type: object
+      description: ADR-H03 — one row per field, each with its own confidence.
+      required: [field, human, flagged]
+      properties:
+        field: { $ref: '#/components/schemas/FieldName' }
+        value: { type: [string, 'null'] }
+        confidence: { type: [number, 'null'], minimum: 0, maximum: 1 }
+        provenance: { $ref: '#/components/schemas/Provenance' }
+        extraction:
+          type: object
+          description: NFR-08 — model, prompt version and schema version.
+          properties:
+            model: { type: string }
+            prompt_version: { type: string }
+            schema_version: { type: string }
+            ts: { type: string, format: date-time }
+        human: { type: boolean }
+        flagged: { type: boolean }
+        flagged_reason: { type: [string, 'null'] }
+
+    CaseSource:
+      type: object
+      required: [document_id, original_name]
+      properties:
+        document_id: { type: string, format: uuid }
+        original_name: { type: string }
+        page_range: { type: [string, 'null'] }
+        url: { type: string }
+
+    CaseCard:
+      type: object
+      description: |
+        What a result row shows. A flagged field is `null` here, not stale (FR-30).
+      required: [case_id, title, badge, sources]
+      properties:
+        case_id: { type: string, format: uuid }
+        title: { type: string }
+        opened_at: { type: [string, 'null'], format: date-time }
+        closed_at: { type: [string, 'null'], format: date-time }
+        symptom: { type: [string, 'null'] }
+        cause: { type: [string, 'null'] }
+        action: { type: [string, 'null'] }
+        outcome: { type: [string, 'null'], enum: [resolved, not_resolved, unknown, null] }
+        badge: { $ref: '#/components/schemas/Badge' }
+        scope: { $ref: '#/components/schemas/EntityFilter' }
+        sources:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/CaseSource' }
+
+    CaseDetail:
+      allOf:
+        - $ref: '#/components/schemas/CaseCard'
+        - type: object
+          properties:
+            verification_text: { type: [string, 'null'] }
+            verified_at: { type: [string, 'null'], format: date-time }
+            verified_by: { type: [string, 'null'] }
+            fields:
+              type: array
+              items: { $ref: '#/components/schemas/CaseField' }
+            entities:
+              type: array
+              items: { $ref: '#/components/schemas/CaseEntity' }
+            descriptors:
+              type: object
+              properties:
+                defect_class: { type: [string, 'null'] }
+                failure_mode: { type: [string, 'null'] }
+                alarm_code: { type: [string, 'null'] }
+                deviation: { type: object }
+            recurrences:
+              type: array
+              items: { $ref: '#/components/schemas/Recurrence' }
+
+    CaseInput:
+      type: object
+      description: FR-14 — manual entry. Every field supplied here is `human`.
+      required: [title]
+      properties:
+        title: { type: string }
+        opened_at: { type: string, format: date-time }
+        closed_at: { type: [string, 'null'], format: date-time }
+        scope: { $ref: '#/components/schemas/EntityFilter' }
+        symptom: { type: string }
+        cause: { type: [string, 'null'] }
+        action: { type: [string, 'null'] }
+        verification: { type: [string, 'null'] }
+        outcome: { type: [string, 'null'], enum: [resolved, not_resolved, unknown, null] }
+        sources:
+          type: array
+          items: { type: string, format: uuid }
+
+    CaseEntity:
+      type: object
+      properties:
+        kind: { $ref: '#/components/schemas/EntityKind' }
+        raw_value: { type: string }
+        canonical_id: { type: [string, 'null'] }
+        mapped: { type: boolean }
+
+    EntityMapping:
+      type: object
+      required: [kind, raw_value, canonical_id]
+      properties:
+        kind: { $ref: '#/components/schemas/EntityKind' }
+        raw_value: { type: string }
+        canonical_id: { type: string }
+        approved_by: { type: [string, 'null'] }
+        approved_at: { type: [string, 'null'], format: date-time }
+
+    SearchRequest:
+      type: object
+      required: [query]
+      properties:
+        query: { type: string, minLength: 1 }
+        lang: { $ref: '#/components/schemas/Language' }
+        scope: { $ref: '#/components/schemas/EntityFilter' }
+        require: { $ref: '#/components/schemas/EntityFilter' }
+        verified_only:
+          type: boolean
+          default: true
+          description: >-
+            When true (the default) only human-verified cases are returned. An
+            unverified extraction is never presented as established fact (C-03).
+        top_k: { type: integer, default: 5, maximum: 50 }
+
+    RetrievalResult:
+      type: object
+      description: |
+        IF-81. `n_acl_filtered` is a count and only a count: the rows the ACL removed
+        never leave the database (AC-05).
+      required: [query, verified_only, n_candidates, n_results, n_acl_filtered, hits]
+      properties:
+        query_id: { type: string, format: uuid }
+        query: { type: string }
+        query_lang: { $ref: '#/components/schemas/Language' }
+        scope: { $ref: '#/components/schemas/EntityFilter' }
+        require: { $ref: '#/components/schemas/EntityFilter' }
+        verified_only: { type: boolean }
+        top_k: { type: integer }
+        n_candidates: { type: integer }
+        n_results: { type: integer }
+        n_acl_filtered: { type: integer, minimum: 0 }
+        latency_ms: { type: integer }
+        embedding_version: { type: string }
+        hits:
+          type: array
+          items: { $ref: '#/components/schemas/Hit' }
+        excluded:
+          type: array
+          description: Chunks left out because they read as instructions (AI-08) — reported, not silently dropped.
+          items:
+            type: object
+            properties:
+              chunk_id: { type: string, format: uuid }
+              reason: { type: string, enum: [suspicious, embargoed] }
+
+    Hit:
+      allOf:
+        - $ref: '#/components/schemas/CaseCard'
+        - type: object
+          required: [rank, scores, why]
+          properties:
+            rank: { type: integer, minimum: 1 }
+            scores: { $ref: '#/components/schemas/HitScores' }
+            why: { $ref: '#/components/schemas/WhyMatched' }
+
+    HitScores:
+      type: object
+      required: [similarity, entity_overlap, recency, outcome, verified, final]
+      properties:
+        similarity: { type: number, minimum: 0, maximum: 1 }
+        entity_overlap: { type: number, minimum: 0, maximum: 1 }
+        recency: { type: number, minimum: 0, maximum: 1 }
+        outcome: { type: number, minimum: 0, maximum: 1 }
+        verified: { type: boolean }
+        final: { type: number, minimum: 0, maximum: 1 }
+        lex_score: { type: number }
+        lex_rank: { type: integer }
+        vec_rank: { type: [integer, 'null'] }
+        rrf: { type: number }
+
+    WhyMatched:
+      type: object
+      description: FR-19 — a ranking a user cannot interrogate cannot be trusted.
+      required: [matched_terms, matched_entities, matched_descriptors]
+      properties:
+        matched_terms:
+          type: array
+          items: { type: string }
+        matched_entities:
+          type: array
+          items: { type: string }
+        matched_descriptors:
+          type: array
+          items: { type: string }
+
+    Explanation:
+      type: object
+      properties:
+        query_id: { type: string, format: uuid }
+        case_id: { type: string, format: uuid }
+        scores: { $ref: '#/components/schemas/HitScores' }
+        why: { $ref: '#/components/schemas/WhyMatched' }
+        weights:
+          type: object
+          description: The five FR-18 weights in force when the query ran; they sum to 1.000.
+          properties:
+            similarity: { type: number }
+            entity_overlap: { type: number }
+            recency: { type: number }
+            outcome: { type: number }
+            verified: { type: number }
+
+    Recurrence:
+      type: object
+      description: |
+        A proposal until someone confirms it. `counted_in_analytics` is false while
+        `confirmed_at` is null (AI-06, ADR-H07).
+      properties:
+        case_id: { type: string, format: uuid }
+        prior_case_id: { type: string, format: uuid }
+        prior_title: { type: string }
+        score: { type: number }
+        threshold: { type: number }
+        interval_months:
+          type: integer
+          description: Whole months between the two cases. Computed, never supplied (AC-07).
+        detected_at: { type: string, format: date-time }
+        confirmed_at: { type: [string, 'null'], format: date-time }
+        confirmed_by: { type: [string, 'null'] }
+        rejected: { type: boolean }
+        counted_in_analytics: { type: boolean }
+
+    SuggestionAlert:
+      type: object
+      description: IF-82 — what is pushed when a case or an alert opens.
+      required: [kind, trigger, results]
+      properties:
+        kind: { type: string, enum: [suggestion, recurrence] }
+        trigger:
+          type: object
+          properties:
+            kind: { type: string, enum: [quality_case, alert, manual] }
+            quality_case_id: { type: [string, 'null'], format: uuid }
+            alert_id: { type: [string, 'null'], format: uuid }
+            reference: { type: [string, 'null'] }
+        case_id: { type: [string, 'null'], format: uuid }
+        created_at: { type: string, format: date-time }
+        latency_ms: { type: integer, maximum: 3000 }
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/Hit' }
+        recurrence: { $ref: '#/components/schemas/Recurrence' }
+
+    FeedbackInput:
+      type: object
+      required: [case_id, rating]
+      properties:
+        query_id: { type: string, format: uuid }
+        case_id: { type: string, format: uuid }
+        rating: { type: string, enum: [helpful, not_helpful, incorrect] }
+        field:
+          $ref: '#/components/schemas/FieldName'
+          description: Required when rating is `incorrect` — a flag names what is wrong.
+        reason: { type: string }
+
+    Feedback:
+      allOf:
+        - $ref: '#/components/schemas/FeedbackInput'
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            ts: { type: string, format: date-time }
+            suppressed_field: { type: [string, 'null'] }
+            curation_item_id: { type: [string, 'null'], format: uuid }
+
+    CurationItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/CurationKind' }
+        state: { type: string, enum: [open, in_review, resolved, dismissed] }
+        detail: { type: string }
+        opened_at: { type: string, format: date-time }
+        age_hours: { type: number }
+        case_id: { type: [string, 'null'], format: uuid }
+        document_id: { type: [string, 'null'], format: uuid }
+        decision: { type: [string, 'null'] }
+        decided_by: { type: [string, 'null'] }
+        decided_at: { type: [string, 'null'], format: date-time }
+
+    Verification:
+      type: object
+      description: Append-only. knowledge.case_record.verified_at is its denormalised answer.
+      properties:
+        case_id: { type: string, format: uuid }
+        verified_by: { type: string }
+        verified_at: { type: string, format: date-time }
+        scope: { type: string, enum: [case, field] }
+        field: { type: [string, 'null'] }
+        note: { type: [string, 'null'] }
+
+    MergeEvent:
+      type: object
+      properties:
+        kept_case_id: { type: string, format: uuid }
+        merged_case_id: { type: string, format: uuid }
+        reason: { type: string }
+        decided_by: { type: string }
+        decided_at: { type: string, format: date-time }
+        sources_moved: { type: integer }
+
+    RecurringRow:
+      type: object
+      properties:
+        canonical_id: { type: string }
+        defect_class: { type: [string, 'null'] }
+        n_cases: { type: integer }
+        n_recurrences:
+          type: integer
+          description: Confirmed links only (AI-06).
+        last_seen: { type: [string, 'null'], format: date-time }
+
+    EffectivenessRow:
+      type: object
+      properties:
+        case_id: { type: string, format: uuid }
+        action: { type: string }
+        opened_at: { type: string, format: date-time }
+        recurred: { type: boolean }
+
+    Coverage:
+      type: object
+      description: FR-31 — the gaps are a number on a dashboard rather than a silence.
+      properties:
+        cases: { type: integer }
+        with_cause: { type: number }
+        with_verification: { type: number }
+        human_verified: { type: number }
+
+    EvalSet:
+      type: object
+      properties:
+        code: { type: string }
+        version: { type: integer }
+        n_queries: { type: [integer, 'null'] }
+        n_documents: { type: [integer, 'null'] }
+        note: { type: [string, 'null'] }
+
+    EvalRun:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [retrieval, extraction] }
+        ts: { type: string, format: date-time }
+        model: { type: string }
+        embedding_version: { type: [string, 'null'] }
+        prompt_version: { type: [string, 'null'] }
+        recall_at_5: { type: [number, 'null'] }
+        mrr: { type: [number, 'null'] }
+        narrative_accuracy: { type: [number, 'null'] }
+        factual_accuracy: { type: [number, 'null'] }
+        passed:
+          type: [boolean, 'null']
+          description: Computed from the AI-02 / AI-04 thresholds; it cannot be supplied.
+        investigate: { type: boolean }
+        note: { type: [string, 'null'] }
+
+    EmbeddingModel:
+      type: object
+      properties:
+        version: { type: string }
+        model: { type: string }
+        dim: { type: integer, const: 1024 }
+        state: { type: string, enum: [registering, active, retired] }
+        chunks: { type: integer }
+
+    ReembedJob:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        from_version: { type: [string, 'null'] }
+        to_version: { type: string }
+        state: { type: string, enum: [queued, running, done, failed, skipped] }
+        total_chunks: { type: integer }
+        done_chunks: { type: integer }
+        search_available:
+          type: boolean
+          description: AC-09 — search is served from the active version throughout.
+
+    MemoryTool:
+      type: object
+      properties:
+        name: { type: string, enum: [search_memory, get_case, similar_cases, recurrence_check] }
+        kind: { type: string, const: read }
+        min_role: { type: string }
+        schema: { type: object }

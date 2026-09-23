@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.local/schemas/genbamemory/retrieval-result-1.0.json",
+  "title": "IF-81 — Retrieval and ranking contract (SRS-15 FR-15…FR-19, AI-03…AI-05, AI-07)",
+  "description": "What a search, a similar-case lookup or the search_memory tool returns. Three properties of this shape are the requirements themselves: every hit names one real case and at least one retrievable source (AI-07, AC-08); every hit carries a badge saying whether a human ever confirmed it (C-02, C-03); and the ACL removes rows before ranking, so the only trace of a restricted document is a count (C-05, AC-05).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["query", "query_lang", "verified_only", "n_candidates", "n_results",
+               "n_acl_filtered", "hits"],
+  "properties": {
+    "query_id": { "$ref": "#/$defs/uuid" },
+    "query": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "query_lang": { "type": "string", "enum": ["th", "ja", "en"] },
+    "scope": {
+      "$ref": "#/$defs/entity_filter",
+      "description": "Narrows the ranking through entity overlap. A case outside the scope can still appear — that is FR-22, horizontal deployment."
+    },
+    "require": {
+      "$ref": "#/$defs/entity_filter",
+      "description": "Removes rows outright."
+    },
+    "verified_only": { "type": "boolean" },
+    "top_k": { "type": "integer", "minimum": 1, "maximum": 50 },
+    "n_candidates": { "type": "integer", "minimum": 0 },
+    "n_results": { "type": "integer", "minimum": 0 },
+    "n_acl_filtered": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many rows the ACL predicate removed. A count, never the rows (SEC-15 THR-H07)."
+    },
+    "latency_ms": { "type": "integer", "minimum": 0 },
+    "embedding_version": { "type": "string" },
+    "hits": { "type": "array", "items": { "$ref": "#/$defs/hit" } },
+    "excluded": {
+      "type": "array",
+      "description": "Chunks left out of the evidence because they read as instructions (AI-08). Reported, not silently dropped.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["chunk_id", "reason"],
+        "properties": {
+          "chunk_id": { "$ref": "#/$defs/uuid" },
+          "reason": { "type": "string", "enum": ["suspicious", "embargoed"] }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "entity_filter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "machine": { "type": "string" },
+        "line": { "type": "string" },
+        "sku": { "type": "string" },
+        "mould": { "type": "string" },
+        "defect_class": { "type": "string" },
+        "from": { "type": "string", "format": "date" },
+        "to": { "type": "string", "format": "date" },
+        "outcome": { "type": "string", "enum": ["resolved", "not_resolved", "unknown"] }
+      }
+    },
+    "hit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rank", "case_id", "title", "badge", "sources", "scores", "why"],
+      "properties": {
+        "rank": { "type": "integer", "minimum": 1 },
+        "case_id": {
+          "$ref": "#/$defs/uuid",
+          "description": "One real case record. There is no combined or synthesised case (AI-07)."
+        },
+        "title": { "type": "string" },
+        "opened_at": { "type": ["string", "null"], "format": "date-time" },
+        "symptom": { "type": ["string", "null"] },
+        "cause": {
+          "type": ["string", "null"],
+          "description": "NULL when the field is absent OR suppressed by a flag (FR-30, AC-06)."
+        },
+        "action": { "type": ["string", "null"] },
+        "outcome": { "type": ["string", "null"], "enum": ["resolved", "not_resolved", "unknown", null] },
+        "badge": {
+          "type": "string",
+          "enum": ["verified", "extracted_not_verified"],
+          "description": "C-02/C-03. An unverified extraction is always marked as one."
+        },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "description": "AC-08: every result links to a retrievable original.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["document_id", "original_name"],
+            "properties": {
+              "document_id": { "$ref": "#/$defs/uuid" },
+              "original_name": { "type": "string" },
+              "page_range": { "type": "string" },
+              "uri": { "type": "string" }
+            }
+          }
+        },
+        "scores": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["similarity", "entity_overlap", "recency", "outcome", "verified", "final"],
+          "properties": {
+            "similarity": { "type": "number", "minimum": 0, "maximum": 1 },
+            "entity_overlap": { "type": "number", "minimum": 0, "maximum": 1 },
+            "recency": { "type": "number", "minimum": 0, "maximum": 1 },
+            "outcome": { "type": "number", "minimum": 0, "maximum": 1 },
+            "verified": { "type": "boolean" },
+            "final": { "type": "number", "minimum": 0, "maximum": 1 },
+            "lex_score": { "type": "number", "minimum": 0 },
+            "lex_rank": { "type": "integer", "minimum": 1 },
+            "vec_rank": { "type": ["integer", "null"], "minimum": 1 },
+            "rrf": { "type": "number", "minimum": 0 }
+          }
+        },
+        "why": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["matched_terms", "matched_entities", "matched_descriptors"],
+          "description": "FR-19: a ranking a user cannot interrogate cannot be trusted.",
+          "properties": {
+            "matched_terms": { "type": "array", "items": { "type": "string" } },
+            "matched_entities": { "type": "array", "items": { "type": "string" } },
+            "matched_descriptors": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    }
+  }
+}

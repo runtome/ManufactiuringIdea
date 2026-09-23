@@ -1,0 +1,14 @@
+kind,raw_value,canonical_id,approved_by,approved_at
+machine,"M07",M-07,suda,2026-06-01
+machine,"7号機",M-07,suda,2026-06-01
+machine,"เครื่อง 7",M-07,suda,2026-06-01
+machine,"M04",M-04,suda,2026-06-01
+machine,"4号機",M-04,suda,2026-06-01
+machine,"M09",M-09,suda,2026-06-01
+machine,"M12",M-12,suda,2026-06-01
+line,"LINE 3",L3,suda,2026-06-01
+line,"ไลน์ 3",L3,suda,2026-06-01
+line,"第3ライン",L3,suda,2026-06-01
+line,"LINE 1",L1,suda,2026-06-01
+sku,"RAD500A",RAD-500-A,suda,2026-06-01
+sku,"RAD-500A",RAD-500-A,suda,2026-06-01

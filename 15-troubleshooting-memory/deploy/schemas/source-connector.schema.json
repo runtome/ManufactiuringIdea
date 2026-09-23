@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.local/schemas/genbamemory/source-connector-1.0.json",
+  "title": "IF-78 — Source connector definition (SRS-15 FR-01, FR-06, FR-07)",
+  "description": "One watched source of historical records. Two rules are in the shape: a source never carries a credential inline — only a reference to a file under the secrets directory — and its default ACL travels with everything it ingests, so a restricted share cannot quietly produce unrestricted cases (C-04, C-05).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["code", "kind", "location"],
+  "properties": {
+    "code": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,40}$" },
+    "kind": {
+      "type": "string",
+      "enum": ["folder", "mail", "chat", "ticket", "upload", "manual"]
+    },
+    "location": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "description": "A path, mailbox or export name. Never a credential."
+    },
+    "credentials_ref": {
+      "type": "string",
+      "pattern": "^file:/run/secrets/[a-z0-9_]+$",
+      "description": "A reference to a secret file, resolved at run time. Anything else is refused."
+    },
+    "enabled": { "type": "boolean", "default": true },
+    "incremental": { "type": "boolean", "default": true },
+    "ocr_enabled": { "type": "boolean", "default": true },
+    "schedule_cron": { "type": "string", "pattern": "^[-0-9*,/ ]{9,}$" },
+    "default_acl": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "min_role": {
+          "type": "string",
+          "enum": ["viewer", "inspector", "engineer", "curator", "manager", "admin"]
+        },
+        "groups": { "type": "array", "items": { "type": "string" } },
+        "embargoed": { "type": "boolean" }
+      }
+    },
+    "include": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Glob patterns. Ingest in waves rather than drowning the curation queue (OPS-15 §5)."
+    },
+    "exclude": { "type": "array", "items": { "type": "string" } },
+    "kinds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["eight_d", "rca", "maintenance_log", "work_order", "handover", "complaint", "other"]
+      }
+    },
+    "date_from": { "type": "string", "format": "date" },
+    "date_to": { "type": "string", "format": "date" },
+    "max_bytes": { "type": "integer", "minimum": 1024, "maximum": 268435456 },
+    "on_failure": {
+      "type": "string",
+      "enum": ["record", "retry", "record_and_notify"],
+      "default": "record",
+      "description": "FR-07 / NFR-07: a failure is always recorded with an actionable reason; it never stops retrieval."
+    }
+  },
+  "allOf": [
+    {
+      "description": "Remote sources need a credential reference; a watched folder and a manual entry do not.",
+      "if": { "properties": { "kind": { "enum": ["mail", "chat", "ticket"] } }, "required": ["kind"] },
+      "then": { "required": ["credentials_ref"] }
+    }
+  ]
+}

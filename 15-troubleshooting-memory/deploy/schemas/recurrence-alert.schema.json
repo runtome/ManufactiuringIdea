@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factorybrain.local/schemas/genbamemory/recurrence-alert-1.0.json",
+  "title": "IF-82 — Suggestion and recurrence alert (SRS-15 FR-20…FR-22, AI-06, AC-04, AC-07)",
+  "description": "What Genba Memory pushes when a quality case or a maintenance alert opens. A recurrence is a proposal, not a fact: the threshold favours recall, so `counted_in_analytics` can only be true once a person has confirmed the link (ADR-H07).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "trigger", "case_id", "created_at", "results"],
+  "properties": {
+    "kind": { "type": "string", "enum": ["suggestion", "recurrence"] },
+    "trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["quality_case", "alert", "manual"] },
+        "quality_case_id": { "$ref": "#/$defs/uuid" },
+        "alert_id": { "$ref": "#/$defs/uuid" },
+        "reference": { "type": "string" }
+      }
+    },
+    "case_id": { "$ref": "#/$defs/uuid" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "latency_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3000,
+      "description": "NFR-02: a suggestion that arrives after the engineer has moved on is not a suggestion."
+    },
+    "query_id": { "$ref": "#/$defs/uuid" },
+    "results": {
+      "type": "array",
+      "description": "The ranked precedent, in the same shape as a search hit (IF-81).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["case_id", "title", "badge", "final_score", "sources"],
+        "properties": {
+          "case_id": { "$ref": "#/$defs/uuid" },
+          "title": { "type": "string" },
+          "badge": { "type": "string", "enum": ["verified", "extracted_not_verified"] },
+          "final_score": { "type": "number", "minimum": 0, "maximum": 1 },
+          "outcome": { "type": ["string", "null"], "enum": ["resolved", "not_resolved", "unknown", null] },
+          "sources": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+        }
+      }
+    },
+    "recurrence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prior_case_id", "score", "threshold", "interval_months",
+                   "confirmed", "counted_in_analytics"],
+      "properties": {
+        "prior_case_id": { "$ref": "#/$defs/uuid" },
+        "score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "threshold": { "type": "number", "minimum": 0.5, "maximum": 0.95 },
+        "interval_months": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Whole months between the two cases' opened_at. Computed, never entered (AC-07)."
+        },
+        "confirmed": { "type": "boolean" },
+        "confirmed_by": { "type": ["string", "null"] },
+        "counted_in_analytics": { "type": "boolean" },
+        "suggested_first_checks": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Taken from the prior case's own action text — never invented."
+        }
+      },
+      "allOf": [
+        {
+          "description": "AI-06: an unconfirmed detection never reaches the analytics.",
+          "if": { "properties": { "confirmed": { "const": false } }, "required": ["confirmed"] },
+          "then": { "properties": { "counted_in_analytics": { "const": false } } }
+        },
+        {
+          "description": "A confirmed recurrence names who confirmed it.",
+          "if": { "properties": { "confirmed": { "const": true } }, "required": ["confirmed"] },
+          "then": { "required": ["confirmed_by"], "properties": { "confirmed_by": { "type": "string", "minLength": 1 } } }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "description": "A recurrence alert must carry the recurrence block.",
+      "if": { "properties": { "kind": { "const": "recurrence" } }, "required": ["kind"] },
+      "then": { "required": ["recurrence"] }
+    }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    }
+  }
+}

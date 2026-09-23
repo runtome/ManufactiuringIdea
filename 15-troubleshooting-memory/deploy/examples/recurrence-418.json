@@ -1,0 +1,58 @@
+{
+  "kind": "recurrence",
+  "trigger": {
+    "kind": "quality_case",
+    "quality_case_id": "00000000-0000-7000-8000-000000009002",
+    "reference": "QC-2026-0912"
+  },
+  "case_id": "00000000-0000-7000-8000-000000006733",
+  "created_at": "2026-09-21T09:36:00+07:00",
+  "latency_ms": 1912,
+  "query_id": "00000000-0000-7000-8000-000000007003",
+  "results": [
+    {
+      "case_id": "00000000-0000-7000-8000-000000006418",
+      "title": "#418 M-07 overload alarm, motor not rotating",
+      "badge": "verified",
+      "final_score": 0.87,
+      "outcome": "resolved",
+      "sources": [
+        "8D_M07_2024-08.pdf"
+      ]
+    },
+    {
+      "case_id": "00000000-0000-7000-8000-000000006602",
+      "title": "#602 M-04 overload trip after continuous running",
+      "badge": "verified",
+      "final_score": 0.74,
+      "outcome": "resolved",
+      "sources": [
+        "maintenance_log_2025-06.xlsx",
+        "8D_M04_2025-06.pdf"
+      ]
+    },
+    {
+      "case_id": "00000000-0000-7000-8000-000000006655",
+      "title": "#655 M-04 overload trip again after changeover",
+      "badge": "verified",
+      "final_score": 0.598,
+      "outcome": "resolved",
+      "sources": [
+        "rca_M04_2025-11.pdf"
+      ]
+    }
+  ],
+  "recurrence": {
+    "prior_case_id": "00000000-0000-7000-8000-000000006418",
+    "score": 0.87,
+    "threshold": 0.72,
+    "interval_months": 25,
+    "confirmed": false,
+    "confirmed_by": null,
+    "counted_in_analytics": false,
+    "suggested_first_checks": [
+      "Proximity sensor condition and temperature drift (from the action of case #418).",
+      "Whether the sensor is on the 6-month PM list for this machine."
+    ]
+  }
+}

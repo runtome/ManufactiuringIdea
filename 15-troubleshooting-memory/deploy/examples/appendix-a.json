@@ -1,0 +1,159 @@
+{
+  "query_id": "00000000-0000-7000-8000-000000007001",
+  "query": "เครื่องจักร overload บ่อย มอเตอร์ไม่หมุน",
+  "query_lang": "th",
+  "scope": {
+    "machine": "M-07"
+  },
+  "verified_only": false,
+  "top_k": 3,
+  "n_candidates": 7,
+  "n_results": 3,
+  "n_acl_filtered": 0,
+  "latency_ms": 450,
+  "embedding_version": "bge-m3@1",
+  "hits": [
+    {
+      "rank": 1,
+      "case_id": "00000000-0000-7000-8000-000000006418",
+      "title": "#418 M-07 overload alarm, motor not rotating",
+      "opened_at": "2024-08-21T08:00:00+07:00",
+      "symptom": "Machine overload alarm, motor not rotating, intermittent.",
+      "cause": "Proximity sensor abnormal (drifting output when hot).",
+      "action": "Replaced proximity sensor, added to 6-month PM list.",
+      "outcome": "resolved",
+      "badge": "verified",
+      "sources": [
+        {
+          "document_id": "00000000-0000-7000-8000-000000005001",
+          "original_name": "8D_M07_2024-08.pdf",
+          "page_range": "p.1-6"
+        }
+      ],
+      "scores": {
+        "similarity": 0.8342,
+        "entity_overlap": 1.0,
+        "recency": 0.556,
+        "outcome": 1.0,
+        "verified": true,
+        "final": 0.87,
+        "lex_score": 1.1323,
+        "lex_rank": 6,
+        "vec_rank": 1,
+        "rrf": 0.031545
+      },
+      "why": {
+        "matched_terms": [
+          "overload"
+        ],
+        "matched_entities": [
+          "machine:M-07"
+        ],
+        "matched_descriptors": [
+          "overload",
+          "no_rotation"
+        ]
+      }
+    },
+    {
+      "rank": 2,
+      "case_id": "00000000-0000-7000-8000-000000006602",
+      "title": "#602 M-04 overload trip after continuous running",
+      "opened_at": "2025-06-03T08:00:00+07:00",
+      "symptom": "Overload trip after 2 h of continuous running.",
+      "cause": "Coupling misalignment after mould change.",
+      "action": "Realignment, added alignment check to the changeover checklist.",
+      "outcome": "resolved",
+      "badge": "verified",
+      "sources": [
+        {
+          "document_id": "00000000-0000-7000-8000-000000005003",
+          "original_name": "maintenance_log_2025-06.xlsx",
+          "page_range": "p.1-1"
+        },
+        {
+          "document_id": "00000000-0000-7000-8000-000000005007",
+          "original_name": "8D_M04_2025-06.pdf",
+          "page_range": "p.1-5"
+        }
+      ],
+      "scores": {
+        "similarity": 0.7815,
+        "entity_overlap": 0.333,
+        "recency": 0.694,
+        "outcome": 0.7,
+        "verified": true,
+        "final": 0.74,
+        "lex_score": 12.6645,
+        "lex_rank": 2,
+        "vec_rank": 2,
+        "rrf": 0.032258
+      },
+      "why": {
+        "matched_terms": [
+          "overload",
+          "คร",
+          "ม่",
+          "รื",
+          "ร์",
+          "อง",
+          "อร",
+          "อเ"
+        ],
+        "matched_entities": [],
+        "matched_descriptors": [
+          "overload"
+        ]
+      }
+    },
+    {
+      "rank": 3,
+      "case_id": "00000000-0000-7000-8000-000000006331",
+      "title": "#331 Motor stop on M-07, no alarm recorded",
+      "opened_at": "2023-12-11T08:00:00+07:00",
+      "symptom": "Motor stop, no alarm recorded. Restarted by the night shift.",
+      "cause": null,
+      "action": "Reset and restart.",
+      "outcome": "unknown",
+      "badge": "extracted_not_verified",
+      "sources": [
+        {
+          "document_id": "00000000-0000-7000-8000-000000005004",
+          "original_name": "handover_note_2023-12-11.docx",
+          "page_range": "p.1-1"
+        }
+      ],
+      "scores": {
+        "similarity": 0.7637,
+        "entity_overlap": 0.667,
+        "recency": 0.458,
+        "outcome": 0.2,
+        "verified": false,
+        "final": 0.61,
+        "lex_score": 16.9755,
+        "lex_rank": 1,
+        "vec_rank": 5,
+        "rrf": 0.031778
+      },
+      "why": {
+        "matched_terms": [
+          "คร",
+          "ตอ",
+          "มอ",
+          "ม่",
+          "รื",
+          "ร์",
+          "อง",
+          "อร"
+        ],
+        "matched_entities": [
+          "machine:M-07"
+        ],
+        "matched_descriptors": [
+          "no_rotation"
+        ]
+      }
+    }
+  ],
+  "excluded": []
+}

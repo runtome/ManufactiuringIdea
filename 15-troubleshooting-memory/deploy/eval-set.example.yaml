@@ -1,0 +1,96 @@
+# IF-81 / AI-04 — the retrieval evaluation set (SRS-15 AC-02).
+# Identical to memory.eval_set / eval_query / eval_qrel in db/seed_demo.sql.
+# The SRS asks for 50 queries; this is the reduced set that ships with the demo
+# data — the real one is a plant asset (README "Known gaps").
+code: retrieval-2026-09
+version: 1
+queries:
+  - ordinal: 1
+    query: "overload trip motor not rotating M-07"
+    lang: en
+    scope: {machine: M-07}
+    relevant:
+      - case: "#418"
+        relevance: 2
+      - case: "#331"
+        relevance: 1
+  - ordinal: 2
+    query: "มอเตอร์ไม่หมุน M-07"
+    lang: th
+    scope: {machine: M-07}
+    relevant:
+      - case: "#418"
+        relevance: 2
+      - case: "#331"
+        relevance: 1
+  - ordinal: 3
+    query: "過負荷 アラーム モーター回転しない"
+    lang: ja
+    relevant:
+      - case: "#418"
+        relevance: 2
+  - ordinal: 4
+    query: "coupling misalignment after mould change"
+    lang: en
+    relevant:
+      - case: "#602"
+        relevance: 2
+      - case: "#655"
+        relevance: 1
+  - ordinal: 5
+    query: "สั่นสะเทือนหลังเปลี่ยนโมลด์"
+    lang: th
+    scope: {machine: M-04}
+    relevant:
+      - case: "#602"
+        relevance: 2
+      - case: "#655"
+        relevance: 1
+  - ordinal: 6
+    query: "short shot after regrind supplier change"
+    lang: en
+    scope: {line: L3}
+    relevant:
+      - case: "#178"
+        relevance: 2
+  - ordinal: 7
+    query: "AL-214 overload on start-up"
+    lang: en
+    relevant:
+      - case: "#275"
+        relevance: 2
+  - ordinal: 8
+    query: "scratch marks packing station"
+    lang: en
+    scope: {line: L1}
+    relevant:
+      - case: "#506"
+        relevance: 2
+  - ordinal: 9
+    query: "fin pitch out of tolerance"
+    lang: en
+    scope: {line: L3}
+    relevant:
+      - case: "#688"
+        relevance: 2
+  - ordinal: 10
+    query: "flash along the parting line after tool change"
+    lang: en
+    scope: {line: L3}
+    relevant:
+      - case: "#722"
+        relevance: 2
+  - ordinal: 11
+    query: "พบจุดดำบนชิ้นงานประกอบ"
+    lang: th
+    scope: {machine: M-09}
+    relevant:
+      - case: "#710"
+        relevance: 2
+  - ordinal: 12
+    query: "hydraulic pressure drop after warm-up"
+    lang: en
+    scope: {machine: M-07}
+    relevant:
+      - case: "#96"
+        relevance: 2

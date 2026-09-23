@@ -1,0 +1,103 @@
+{
+  "document_id": "00000000-0000-7000-8000-000000005001",
+  "model": "qwen2.5:7b-instruct-q4_K_M",
+  "prompt_version": "extract-case.v1",
+  "schema_version": "case-extract-1.0",
+  "temperature": 0.1,
+  "doc_class": "eight_d",
+  "lang": "ja",
+  "case": {
+    "title": "M-07 overload alarm, motor not rotating",
+    "opened_at": "2024-08-21T08:00:00+07:00",
+    "closed_at": "2024-08-28T08:00:00+07:00",
+    "status": "closed",
+    "outcome": "resolved",
+    "scope": {
+      "machine": "M-07",
+      "line": "L3",
+      "sku": null,
+      "mould": null
+    }
+  },
+  "fields": [
+    {
+      "field": "symptom",
+      "value": "Machine overload alarm, motor not rotating, intermittent.",
+      "confidence": 0.96,
+      "provenance": {
+        "document_id": "00000000-0000-7000-8000-000000005001",
+        "page": 2,
+        "section": "D2 問題の記述"
+      }
+    },
+    {
+      "field": "cause",
+      "value": "Proximity sensor abnormal (drifting output when hot).",
+      "confidence": 0.94,
+      "provenance": {
+        "document_id": "00000000-0000-7000-8000-000000005001",
+        "page": 3,
+        "section": "D4 原因"
+      }
+    },
+    {
+      "field": "corrective_action",
+      "value": "Replaced proximity sensor, added to 6-month PM list.",
+      "confidence": 0.95,
+      "provenance": {
+        "document_id": "00000000-0000-7000-8000-000000005001",
+        "page": 4,
+        "section": "D5 是正処置"
+      }
+    },
+    {
+      "field": "verification",
+      "value": "No recurrence for 14 months after replacement.",
+      "confidence": 0.9,
+      "provenance": {
+        "document_id": "00000000-0000-7000-8000-000000005001",
+        "page": 5,
+        "section": "D6 有効性確認"
+      }
+    },
+    {
+      "field": "opened_at",
+      "value": "2024-08-21",
+      "confidence": 0.99,
+      "provenance": {
+        "document_id": "00000000-0000-7000-8000-000000005001",
+        "page": 1,
+        "section": "表紙"
+      }
+    }
+  ],
+  "entities": [
+    {
+      "kind": "machine",
+      "raw_value": "M-07",
+      "canonical_id": "M-07",
+      "mapped": true,
+      "confidence": 0.99
+    },
+    {
+      "kind": "line",
+      "raw_value": "第3ライン",
+      "canonical_id": "L3",
+      "mapped": true,
+      "confidence": 0.95
+    },
+    {
+      "kind": "alarm_code",
+      "raw_value": "AL-102",
+      "canonical_id": "AL-102",
+      "mapped": true,
+      "confidence": 0.99
+    }
+  ],
+  "descriptors": {
+    "defect_class": "overload",
+    "failure_mode": "no_rotation",
+    "alarm_code": "AL-102"
+  },
+  "notes": "Two of the six pages are a scan; the handwritten note on page 2 was read at 0.706 and is flagged low confidence (IF-76)."
+}
